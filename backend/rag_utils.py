@@ -50,8 +50,9 @@ BASE_URL = os.getenv("BASE_URL")
 RERANK_MODEL = os.getenv("RERANK_MODEL")
 RERANK_BINDING_HOST = os.getenv("RERANK_BINDING_HOST")
 RERANK_API_KEY = os.getenv("RERANK_API_KEY")
+RERANK_TIMEOUT_SECONDS = max(1.0, float(os.getenv("RERANK_TIMEOUT_SECONDS", "5")))
 
-AUTO_MERGE_ENABLED = os.getenv("AUTO_MERGE_ENABLED", "true").lower() != "false"
+AUTO_MERGE_ENABLED = os.getenv("AUTO_MERGE_ENABLED", "false").lower() == "true"
 AUTO_MERGE_THRESHOLD = int(os.getenv("AUTO_MERGE_THRESHOLD", "2"))
 LEAF_RETRIEVE_LEVEL = int(os.getenv("LEAF_RETRIEVE_LEVEL", "3"))
 
@@ -75,6 +76,14 @@ _document_page_store = DocumentPageStore()
 _table_store = TableStore()
 
 _stepback_model = None
+
+
+def _get_hybrid_query_embeddings(query: str) -> tuple[list[float], dict | None]:
+    """Avoid application-side sparse state when the collection uses Milvus BM25."""
+    if getattr(_milvus_manager, "uses_builtin_bm25", False):
+        return _embedding_service.get_embeddings([query])[0], None
+    dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+    return dense_embeddings[0], sparse_embeddings[0]
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -111,22 +120,22 @@ def _parse_table_aware_retrieval_mode(value: str | None) -> str:
 
 def get_finance_rag_config() -> Dict[str, Any]:
     retrieval_mode = _parse_retrieval_mode(os.getenv("RAG_RETRIEVAL_MODE"))
-    candidate_k = max(1, _parse_int(os.getenv("FINANCE_RAG_CANDIDATE_K"), 50))
-    final_top_k = max(1, _parse_int(os.getenv("FINANCE_RAG_FINAL_TOP_K"), 10))
+    candidate_k = max(1, _parse_int(os.getenv("FINANCE_RAG_CANDIDATE_K"), 40))
+    final_top_k = max(1, _parse_int(os.getenv("FINANCE_RAG_FINAL_TOP_K"), 5))
     experimental_two_stage = _parse_bool(os.getenv("FINANCE_RAG_TWO_STAGE_RETRIEVAL"), True)
     return {
         "retrieval_mode": retrieval_mode,
         "candidate_k": max(candidate_k, final_top_k),
         "final_top_k": final_top_k,
         "enable_step_back": _parse_bool(os.getenv("FINANCE_RAG_ENABLE_STEP_BACK"), False),
-        "enable_page_merge": _parse_bool(os.getenv("FINANCE_RAG_ENABLE_PAGE_MERGE"), True),
+        "enable_page_merge": _parse_bool(os.getenv("FINANCE_RAG_ENABLE_PAGE_MERGE"), False),
         "adjacent_page_window": max(0, _parse_int(os.getenv("FINANCE_RAG_ADJACENT_PAGE_WINDOW"), 1)),
         "adjacent_chunk_window": max(0, _parse_int(os.getenv("FINANCE_RAG_ADJACENT_CHUNK_WINDOW"), 1)),
         "two_stage_retrieval": retrieval_mode == "finance_experimental" and experimental_two_stage,
         "doc_stage_top_n": max(1, _parse_int(os.getenv("FINANCE_RAG_DOC_STAGE_TOP_N"), 5)),
         "page_stage_top_n": max(1, _parse_int(os.getenv("FINANCE_RAG_PAGE_STAGE_TOP_N"), 10)),
-        "max_evidence_pack_used": max(1, _parse_int(os.getenv("FINANCE_RAG_MAX_EVIDENCE_PACK_USED"), 10)),
-        "min_evidence_pack_used": max(1, _parse_int(os.getenv("FINANCE_RAG_MIN_EVIDENCE_PACK_USED"), 6)),
+        "max_evidence_pack_used": max(1, _parse_int(os.getenv("FINANCE_RAG_MAX_EVIDENCE_PACK_USED"), 5)),
+        "min_evidence_pack_used": max(1, _parse_int(os.getenv("FINANCE_RAG_MIN_EVIDENCE_PACK_USED"), 3)),
         "max_page_text_chars": max(200, _parse_int(os.getenv("FINANCE_RAG_MAX_PAGE_TEXT_CHARS"), 2500)),
         "max_table_text_chars": max(200, _parse_int(os.getenv("FINANCE_RAG_MAX_TABLE_TEXT_CHARS"), 2500)),
         "w_dense": float(os.getenv("FINANCE_RAG_W_DENSE", "0.35")),
@@ -153,8 +162,9 @@ def get_table_aware_retrieval_config() -> Dict[str, Any]:
 
 
 def get_evidence_group_config() -> Dict[str, Any]:
+    table_mode_enabled = _parse_table_aware_retrieval_mode(os.getenv("TABLE_AWARE_RETRIEVAL")) != "off"
     return {
-        "enabled": _parse_bool(os.getenv("RAG_EVIDENCE_GROUPING_ENABLED"), True),
+        "enabled": _parse_bool(os.getenv("RAG_EVIDENCE_GROUPING_ENABLED"), table_mode_enabled),
         "max_groups": max(1, _parse_int(os.getenv("RAG_MAX_EVIDENCE_GROUPS"), 5)),
         "max_snippets_per_group": max(1, _parse_int(os.getenv("RAG_MAX_SNIPPETS_PER_GROUP"), 3)),
         "max_table_rows_per_group": max(1, _parse_int(os.getenv("RAG_MAX_TABLE_ROWS_PER_GROUP"), 5)),
@@ -1032,12 +1042,13 @@ def _build_evidence_groups(
     if not any_table_attached and (table_config["mode"] == "force" or (table_config["mode"] == "auto" and should_enable)):
         if candidate_filenames or table_config.get("global_fallback"):
             filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
-            dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+            dense_embedding, sparse_embedding = _get_hybrid_query_embeddings(query)
             search_hits = _milvus_manager.hybrid_retrieve(
-                dense_embedding=dense_embeddings[0],
-                sparse_embedding=sparse_embeddings[0],
+                dense_embedding=dense_embedding,
+                sparse_embedding=sparse_embedding,
                 top_k=table_config["top_k"],
                 filter_expr=filter_expr,
+                query_text=query,
             )
             search_table_ids = _dedupe_table_ids_for_context(search_hits)[: table_config["max_tables"]]
             candidate_tables = _table_store.get_tables_by_ids(search_table_ids) if search_table_ids else []
@@ -1254,12 +1265,13 @@ def _build_evidence_units(
             allow_global_fallback = bool(config.get("global_fallback")) and not candidate_filenames
             if candidate_filenames or allow_global_fallback:
                 filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
-                dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+                dense_embedding, sparse_embedding = _get_hybrid_query_embeddings(query)
                 search_hits = _milvus_manager.hybrid_retrieve(
-                    dense_embedding=dense_embeddings[0],
-                    sparse_embedding=sparse_embeddings[0],
+                    dense_embedding=dense_embedding,
+                    sparse_embedding=sparse_embedding,
                     top_k=config["top_k"],
                     filter_expr=filter_expr,
+                    query_text=query,
                 )
                 search_table_ids = _dedupe_table_ids_for_context(search_hits)[: config["max_tables"]]
                 candidate_tables = _table_store.get_tables_by_ids(search_table_ids) if search_table_ids else []
@@ -1867,7 +1879,7 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
             meta["rerank_endpoint"],
             headers=headers,
             json=payload,
-            timeout=15,
+            timeout=RERANK_TIMEOUT_SECONDS,
         )
         if response.status_code >= 400:
             meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
@@ -1973,14 +1985,13 @@ def _retrieve_leaf_chunks(
         "retrieve_error": None,
     }
     try:
-        dense_embeddings = _embedding_service.get_embeddings([query])
-        dense_embedding = dense_embeddings[0]
-        sparse_embedding = _embedding_service.get_sparse_embedding(query)
+        dense_embedding, sparse_embedding = _get_hybrid_query_embeddings(query)
         retrieved = _milvus_manager.hybrid_retrieve(
             dense_embedding=dense_embedding,
             sparse_embedding=sparse_embedding,
             top_k=top_k,
             filter_expr=filter_expr,
+            query_text=query,
         )
         meta["retrieval_mode"] = "hybrid"
         meta["candidate_count"] = len(retrieved)
@@ -3237,12 +3248,13 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
 
         if not table_ids and (config["mode"] == "force" or (config["mode"] == "auto" and query_triggered)):
             filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
-            dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+            dense_embedding, sparse_embedding = _get_hybrid_query_embeddings(query)
             search_hits = _milvus_manager.hybrid_retrieve(
-                dense_embedding=dense_embeddings[0],
-                sparse_embedding=sparse_embeddings[0],
+                dense_embedding=dense_embedding,
+                sparse_embedding=sparse_embedding,
                 top_k=config["top_k"],
                 filter_expr=filter_expr,
+                query_text=query,
             )
             search_table_ids = _dedupe_table_ids_for_context(search_hits)[: config["max_tables"]]
             selected_hits = [hit for hit in search_hits if (hit.get("table_id") or "") in set(search_table_ids)]

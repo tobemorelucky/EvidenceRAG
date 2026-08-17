@@ -34,7 +34,13 @@ createApp({
                 role: 'user',
                 admin_code: ''
             },
-            authLoading: false
+            authLoading: false,
+            ragProfile: localStorage.getItem('ragProfile') || 'finance',
+            executionMode: localStorage.getItem('ragExecutionMode') || 'auto',
+            serviceStatus: 'ready',
+            inspectorOpen: false,
+            inspectedMessage: null,
+            selectedCitation: null
         };
     },
     computed: {
@@ -50,6 +56,31 @@ createApp({
         allSelectableDocumentsSelected() {
             const selectable = this.documents.filter(doc => !this.isDeleteActionLocked(doc.filename));
             return selectable.length > 0 && selectable.every(doc => this.selectedDocumentFilenames.includes(doc.filename));
+        },
+        activeAssistantMessage() {
+            if (this.inspectedMessage) return this.inspectedMessage;
+            return [...this.messages].reverse().find(message => !message.isUser) || null;
+        },
+        activeTrace() {
+            return this.activeAssistantMessage?.ragTrace || null;
+        },
+        activeCitations() {
+            return this.activeAssistantMessage?.citations || [];
+        },
+        activeSteps() {
+            return this.activeAssistantMessage?.ragSteps || [];
+        },
+        debugTrace() {
+            const trace = this.activeTrace || {};
+            return {
+                candidate_k: trace.candidate_k ?? '—',
+                final_top_k: trace.final_top_k ?? '—',
+                rrf_candidates: trace.rrf_fused_candidate_count ?? '—',
+                rerank_applied: trace.rerank_applied ?? false,
+                tool_calls: trace.agent_tool_call_count ?? 0,
+                route_reason: trace.route_reason || '—',
+                latency_ms: trace.latency_breakdown?.total_latency_ms ?? trace.latency_breakdown?.total_retrieval_ms ?? '—'
+            };
         }
     },
     async mounted() {
@@ -82,6 +113,45 @@ createApp({
 
         parseMarkdown(text) {
             return marked.parse(text);
+        },
+
+        useExample(question) {
+            this.userInput = question;
+            this.$nextTick(() => this.$refs.textarea?.focus());
+        },
+
+        evidenceStatusLabel(status) {
+            return ({ sufficient: '证据充分', limited: '证据有限', insufficient: '证据不足' })[status] || '等待检索';
+        },
+
+        citationsFromTrace(trace) {
+            if (!trace) return [];
+            const chunks = trace.final_evidence_pack_used || trace.final_retrieved_chunks || [];
+            const seen = new Set();
+            return chunks.reduce((items, chunk) => {
+                const key = `${chunk.filename || ''}:${chunk.page_number ?? ''}`;
+                if (!chunk.filename || seen.has(key)) return items;
+                seen.add(key);
+                items.push({
+                    id: `history-evidence-${items.length + 1}`,
+                    filename: chunk.filename,
+                    page_number: chunk.page_number,
+                    text: chunk.text || '',
+                    score: chunk.rerank_score ?? chunk.score
+                });
+                return items;
+            }, []);
+        },
+
+        selectCitation(citation) {
+            this.selectedCitation = citation;
+            this.inspectorOpen = true;
+        },
+
+        inspectMessage(message) {
+            this.inspectedMessage = message;
+            this.selectedCitation = message.citations?.[0] || null;
+            this.inspectorOpen = true;
         },
 
         escapeHtml(text) {
@@ -223,7 +293,8 @@ createApp({
                 isUser: false,
                 isThinking: true,
                 ragTrace: null,
-                ragSteps: []
+                ragSteps: [],
+                citations: []
             });
             const botMsgIdx = this.messages.length - 1;
 
@@ -235,7 +306,9 @@ createApp({
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         message: text,
-                        session_id: this.sessionId
+                        session_id: this.sessionId,
+                        profile: this.ragProfile,
+                        execution_mode: this.executionMode
                     }),
                     signal: this.abortController.signal,
                 });
@@ -269,14 +342,22 @@ createApp({
                                     this.messages[botMsgIdx].text += data.content;
                                 } else if (data.type === 'trace') {
                                     this.messages[botMsgIdx].ragTrace = data.rag_trace;
-                                } else if (data.type === 'rag_step') {
+                                    this.messages[botMsgIdx].citations = data.citations || this.messages[botMsgIdx].citations;
+                                    this.serviceStatus = 'ready';
+                                } else if (data.type === 'citation') {
+                                    const citation = data.citation;
+                                    if (citation && !this.messages[botMsgIdx].citations.some(item => item.id === citation.id)) {
+                                        this.messages[botMsgIdx].citations.push(citation);
+                                    }
+                                } else if (data.type === 'status' || data.type === 'rag_step') {
                                     if (!this.messages[botMsgIdx].ragSteps) {
                                         this.messages[botMsgIdx].ragSteps = [];
                                     }
-                                    this.messages[botMsgIdx].ragSteps.push(data.step);
+                                    this.messages[botMsgIdx].ragSteps.push(data.step || { label: data.label, detail: data.detail });
                                 } else if (data.type === 'error') {
                                     this.messages[botMsgIdx].isThinking = false;
-                                    this.messages[botMsgIdx].text += `\n[Error: ${data.content}]`;
+                                    this.messages[botMsgIdx].text += `\n\n检索或回答服务异常：${data.content}`;
+                                    this.serviceStatus = '异常';
                                 }
                             } catch (e) {
                                 console.warn('SSE parse error:', e);
@@ -296,7 +377,8 @@ createApp({
                     }
                 } else {
                     this.messages[botMsgIdx].isThinking = false;
-                    this.messages[botMsgIdx].text = `喵喵开小差了：${error.message}`;
+                    this.messages[botMsgIdx].text = `回答生成服务暂不可用：${error.message}`;
+                    this.serviceStatus = '异常';
                 }
             } finally {
                 this.isLoading = false;
@@ -329,6 +411,8 @@ createApp({
             this.sessionId = 'session_' + Date.now();
             this.activeNav = 'newChat';
             this.showHistorySidebar = false;
+            this.inspectedMessage = null;
+            this.selectedCitation = null;
         },
 
         handleClearChat() {
@@ -367,7 +451,9 @@ createApp({
                 this.messages = data.messages.map(msg => ({
                     text: msg.content,
                     isUser: msg.type === 'human',
-                    ragTrace: msg.rag_trace || null
+                    ragTrace: msg.rag_trace || null,
+                    ragSteps: [],
+                    citations: this.citationsFromTrace(msg.rag_trace)
                 }));
 
                 this.$nextTick(() => {
@@ -750,7 +836,7 @@ createApp({
         createDeleteSteps() {
             return [
                 { key: 'prepare', label: '准备删除', percent: 0, status: 'pending', message: '' },
-                { key: 'bm25', label: '同步 BM25 统计', percent: 0, status: 'pending', message: '' },
+                { key: 'bm25', label: '更新稀疏索引', percent: 0, status: 'pending', message: '' },
                 { key: 'milvus', label: '删除向量数据', percent: 0, status: 'pending', message: '' },
                 { key: 'parent_store', label: '删除父级分块', percent: 0, status: 'pending', message: '' },
             ];
@@ -1008,6 +1094,12 @@ createApp({
         }
     },
     watch: {
+        ragProfile(value) {
+            localStorage.setItem('ragProfile', value);
+        },
+        executionMode(value) {
+            localStorage.setItem('ragExecutionMode', value);
+        },
         messages: {
             handler() {
                 this.$nextTick(() => {

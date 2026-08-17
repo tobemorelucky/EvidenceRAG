@@ -1,434 +1,155 @@
-from dotenv import load_dotenv
-import os
-import json
+"""EvidenceRAG chat service.
+
+The public function names are retained for API compatibility. Retrieval routing,
+answer generation, and conversation persistence are implemented by dedicated
+modules.
+"""
+
 import asyncio
+import json
 import time
-from langchain.chat_models import init_chat_model
-from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, SystemMessage
-from tools import get_current_weather, search_knowledge_base, get_last_rag_context, reset_tool_call_guards, set_rag_step_queue
-from datetime import datetime
-from cache import cache
-from database import SessionLocal
-from models import User, ChatSession, ChatMessage
 
-load_dotenv()
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-API_KEY = os.getenv("ARK_API_KEY")
-MODEL = os.getenv("MODEL")
-BASE_URL = os.getenv("BASE_URL")
+from answer_generator import generate_answer, stream_answer, summarize_messages
+from conversation_service import storage
+from rag_orchestrator import RetrievalServiceError, prepare_rag_response
+from tools import set_rag_step_queue
 
-class ConversationStorage:
-    """对话存储（PostgreSQL + Redis）。"""
 
-    @staticmethod
-    def _messages_cache_key(user_id: str, session_id: str) -> str:
-        return f"chat_messages:{user_id}:{session_id}"
+INSUFFICIENT_EVIDENCE_MESSAGE = "未检索到足够证据，无法基于当前知识库可靠回答。"
 
-    @staticmethod
-    def _sessions_cache_key(user_id: str) -> str:
-        return f"chat_sessions:{user_id}"
 
-    @staticmethod
-    def _to_langchain_messages(records: list[dict]) -> list:
-        messages = []
-        for msg_data in records:
-            msg_type = msg_data.get("type")
-            content = msg_data.get("content", "")
-            if msg_type == "human":
-                messages.append(HumanMessage(content=content))
-            elif msg_type == "ai":
-                messages.append(AIMessage(content=content))
-            elif msg_type == "system":
-                messages.append(SystemMessage(content=content))
+def _compact_history(messages: list) -> list:
+    if len(messages) <= 50:
         return messages
-
-    def save(self, user_id: str, session_id: str, messages: list, metadata: dict = None, extra_message_data: list = None):
-        """保存对话"""
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter(User.username == user_id).first()
-            if not user:
-                return
-
-            session = (
-                db.query(ChatSession)
-                .filter(ChatSession.user_id == user.id, ChatSession.session_id == session_id)
-                .first()
-            )
-            if not session:
-                session = ChatSession(user_id=user.id, session_id=session_id, metadata_json=metadata or {})
-                db.add(session)
-                db.flush()
-            else:
-                session.metadata_json = metadata or {}
-
-            db.query(ChatMessage).filter(ChatMessage.session_ref_id == session.id).delete(synchronize_session=False)
-
-            serialized = []
-            now = datetime.utcnow()
-            for idx, msg in enumerate(messages):
-                rag_trace = None
-                if extra_message_data and idx < len(extra_message_data):
-                    extra = extra_message_data[idx] or {}
-                    rag_trace = extra.get("rag_trace")
-
-                db.add(
-                    ChatMessage(
-                        session_ref_id=session.id,
-                        message_type=msg.type,
-                        content=str(msg.content),
-                        timestamp=now,
-                        rag_trace=rag_trace,
-                    )
-                )
-                serialized.append(
-                    {
-                        "type": msg.type,
-                        "content": str(msg.content),
-                        "timestamp": now.isoformat(),
-                        "rag_trace": rag_trace,
-                    }
-                )
-
-            session.updated_at = now
-            db.commit()
-
-            cache.set_json(self._messages_cache_key(user_id, session_id), serialized)
-            cache.delete(self._sessions_cache_key(user_id))
-        finally:
-            db.close()
-
-    def load(self, user_id: str, session_id: str) -> list:
-        """加载对话"""
-        cached = cache.get_json(self._messages_cache_key(user_id, session_id))
-        if cached is not None:
-            return self._to_langchain_messages(cached)
-
-        records = self.get_session_messages(user_id, session_id)
-        cache.set_json(self._messages_cache_key(user_id, session_id), records)
-        return self._to_langchain_messages(records)
-
-    def list_sessions(self, user_id: str) -> list:
-        """列出用户的所有会话"""
-        return [item["session_id"] for item in self.list_session_infos(user_id)]
-
-    def list_session_infos(self, user_id: str) -> list[dict]:
-        cached = cache.get_json(self._sessions_cache_key(user_id))
-        if cached is not None:
-            return cached
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter(User.username == user_id).first()
-            if not user:
-                return []
-
-            sessions = (
-                db.query(ChatSession)
-                .filter(ChatSession.user_id == user.id)
-                .order_by(ChatSession.updated_at.desc())
-                .all()
-            )
-            result = []
-            for s in sessions:
-                count = db.query(ChatMessage).filter(ChatMessage.session_ref_id == s.id).count()
-                result.append(
-                    {
-                        "session_id": s.session_id,
-                        "updated_at": s.updated_at.isoformat(),
-                        "message_count": count,
-                    }
-                )
-            cache.set_json(self._sessions_cache_key(user_id), result)
-            return result
-        finally:
-            db.close()
-
-    def get_session_messages(self, user_id: str, session_id: str) -> list[dict]:
-        cached = cache.get_json(self._messages_cache_key(user_id, session_id))
-        if cached is not None:
-            return cached
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter(User.username == user_id).first()
-            if not user:
-                return []
-            session = (
-                db.query(ChatSession)
-                .filter(ChatSession.user_id == user.id, ChatSession.session_id == session_id)
-                .first()
-            )
-            if not session:
-                return []
-
-            rows = (
-                db.query(ChatMessage)
-                .filter(ChatMessage.session_ref_id == session.id)
-                .order_by(ChatMessage.id.asc())
-                .all()
-            )
-            result = [
-                {
-                    "type": row.message_type,
-                    "content": row.content,
-                    "timestamp": row.timestamp.isoformat(),
-                    "rag_trace": row.rag_trace,
-                }
-                for row in rows
-            ]
-            cache.set_json(self._messages_cache_key(user_id, session_id), result)
-            return result
-        finally:
-            db.close()
-
-    def delete_session(self, user_id: str, session_id: str) -> bool:
-        """删除指定用户的会话，返回是否删除成功"""
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter(User.username == user_id).first()
-            if not user:
-                return False
-            session = (
-                db.query(ChatSession)
-                .filter(ChatSession.user_id == user.id, ChatSession.session_id == session_id)
-                .first()
-            )
-            if not session:
-                return False
-
-            db.delete(session)
-            db.commit()
-            cache.delete(self._messages_cache_key(user_id, session_id))
-            cache.delete(self._sessions_cache_key(user_id))
-            return True
-        finally:
-            db.close()
+    summary = summarize_messages(messages[:40])
+    return [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
 
 
-
-def create_agent_instance():
-    model = init_chat_model(
-        model=MODEL,
-        model_provider="openai",
-        api_key=API_KEY,
-        base_url=BASE_URL,
-        temperature=0.3,
-        stream_usage=True,
-    )
-
-    agent = create_agent(
-        model=model,
-        tools=[get_current_weather, search_knowledge_base],
-        system_prompt=(
-            "You are a cute cat bot that loves to help users. "
-            "When responding, you may use tools to assist. "
-            "Use search_knowledge_base when users ask document/knowledge questions. "
-            "Do not call the same tool repeatedly in one turn. At most one knowledge tool call per turn. "
-            "Once you call search_knowledge_base and receive its result, you MUST immediately produce the Final Answer based on that result. "
-            "After receiving search_knowledge_base result, you MUST NOT call any tool again (including get_current_weather or search_knowledge_base). "
-            "If search_knowledge_base returns '知识库当前为空，尚未上传文档，无法基于文档检索回答。', output that message directly without paraphrasing. "
-            "Use the retrieved context to answer directly and helpfully. "
-            "If the context is relevant but partial, provide the best grounded answer you can and briefly note what remains uncertain. "
-            "Do not be overly conservative when the context already contains useful evidence. "
-            "If the retrieved context is insufficient, answer honestly instead of making up facts. "
-            "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
-            "but do not reveal chain-of-thought. "
-            "When answering from retrieved documents, cite the supporting document and page when available. "
-            "For financial questions, prefer evidence that best matches the user's company, year, and document type when the retrieved context includes those details. "
-            "If a calculation is needed, show the formula briefly and use only numbers supported by the retrieved context. "
-            "Do not invent values, periods, units, or facts that are not supported by the retrieved evidence."
-        ),
-    )
-    return agent, model
+def _response_metadata(prepared: dict, usage: dict | None = None) -> dict:
+    return {
+        "execution_mode": prepared["execution_mode"],
+        "route_reason": prepared["route_reason"],
+        "citations": prepared["citations"],
+        "evidence_status": prepared["evidence_status"],
+        "calculation": None,
+        "trace_id": prepared["trace_id"],
+        "usage": usage or {},
+    }
 
 
-agent, model = create_agent_instance()
-
-storage = ConversationStorage()
-
-def summarize_old_messages(model, messages: list) -> str:
-    """将旧消息总结为摘要"""
-    # 提取旧对话
-    old_conversation = "\n".join([
-        f"{'用户' if msg.type == 'human' else 'AI'}: {msg.content}"
-        for msg in messages
-    ])
-
-    # 生成摘要
-    summary_prompt = f"""请总结以下对话的关键信息：
-
-{old_conversation}
-总结（包含用户信息、重要事实、待办事项）："""
-
-    summary = model.invoke(summary_prompt).content
-    return summary
-
-
-def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: str = "default_session"):
-    """使用 Agent 处理用户消息并返回响应"""
-    started_at = time.perf_counter()
-    messages = storage.load(user_id, session_id)
-
-    # 清理可能残留的 RAG 上下文，避免跨请求污染
-    get_last_rag_context(clear=True)
-    reset_tool_call_guards()
-    
-    if len(messages) > 50:
-        summary = summarize_old_messages(model, messages[:40])
-
-        messages = [
-            SystemMessage(content=f"之前的对话摘要：\n{summary}")
-        ] + messages[40:]
-
+def chat_with_agent(
+    user_text: str,
+    user_id: str = "default_user",
+    session_id: str = "default_session",
+    profile: str | None = None,
+    execution_mode: str | None = None,
+):
+    """Run one evidence-grounded chat turn."""
+    started = time.perf_counter()
+    messages = _compact_history(storage.load(user_id, session_id))
+    history = list(messages)
     messages.append(HumanMessage(content=user_text))
-    result = agent.invoke(
-        {"messages": messages},
-        config={"recursion_limit": 8},
-    )
 
-    response_content = ""
-    if isinstance(result, dict):
-        if "output" in result:
-            response_content = result["output"]
-        elif "messages" in result and result["messages"]:
-            msg = result["messages"][-1]
-            response_content = getattr(msg, "content", str(msg))
-        else:
-            response_content = str(result)
-    elif hasattr(result, "content"):
-        response_content = result.content
+    prepared = prepare_rag_response(user_text, profile=profile, mode=execution_mode)
+    if prepared["evidence_status"] == "insufficient":
+        response_content, usage = INSUFFICIENT_EVIDENCE_MESSAGE, {}
     else:
-        response_content = str(result)
-    
+        response_content, usage = generate_answer(user_text, prepared["evidence"], history)
+
     messages.append(AIMessage(content=response_content))
-
-    rag_context = get_last_rag_context(clear=True)
-    rag_trace = rag_context.get("rag_trace") if rag_context else None
-    if rag_trace is not None:
-        total_latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
-        breakdown = dict(rag_trace.get("latency_breakdown") or {})
-        retrieval_ms = sum(
-            float(breakdown.get(key, 0.0) or 0.0)
-            for key in ("query_parse_ms", "initial_retrieval_ms", "page_rerank_ms")
-        )
-        breakdown["generation_latency_ms"] = round(max(0.0, total_latency_ms - retrieval_ms), 2)
-        breakdown["total_latency_ms"] = total_latency_ms
-        rag_trace["latency_breakdown"] = breakdown
-
+    rag_trace = prepared["rag_trace"]
+    latency = dict(rag_trace.get("latency_breakdown") or {})
+    latency["total_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    rag_trace["latency_breakdown"] = latency
     extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": rag_trace}]
     storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)
 
     return {
         "response": response_content,
         "rag_trace": rag_trace,
+        **_response_metadata(prepared, usage),
     }
 
 
-async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", session_id: str = "default_session"):
-    """使用 Agent 处理用户消息并流式返回响应。
-    
-    架构：使用统一输出队列 + 后台任务，确保 RAG 检索步骤在工具执行期间实时推送，
-    而非等待工具完成后才显示。
-    """
-    messages = storage.load(user_id, session_id)
-
-    # 清理可能残留的 RAG 上下文
-    get_last_rag_context(clear=True)
-    reset_tool_call_guards()
-
-    # 统一输出队列：所有事件（content / rag_step）都汇入这里
-    output_queue = asyncio.Queue()
-
-    class _RagStepProxy:
-        """代理对象：将 emit_rag_step 的原始 step dict 包装后放入统一输出队列。"""
-        def put_nowait(self, step):
-            output_queue.put_nowait({"type": "rag_step", "step": step})
-
-    set_rag_step_queue(_RagStepProxy())
-
-    if len(messages) > 50:
-        summary = summarize_old_messages(model, messages[:40])
-        messages = [
-            SystemMessage(content=f"之前的对话摘要：\n{summary}")
-        ] + messages[40:]
-
+async def chat_with_agent_stream(
+    user_text: str,
+    user_id: str = "default_user",
+    session_id: str = "default_session",
+    profile: str | None = None,
+    execution_mode: str | None = None,
+):
+    """Stream operational retrieval status and a grounded answer using SSE."""
+    messages = _compact_history(storage.load(user_id, session_id))
+    history = list(messages)
     messages.append(HumanMessage(content=user_text))
+    status_queue: asyncio.Queue = asyncio.Queue()
 
-    full_response = ""
+    class _StatusProxy:
+        def put_nowait(self, step):
+            status_queue.put_nowait(step)
 
-    async def _agent_worker():
-        """后台任务：运行 agent 并将内容 chunk 推入输出队列。"""
-        nonlocal full_response
-        try:
-            async for msg, metadata in agent.astream(
-                {"messages": messages},
-                stream_mode="messages",
-                config={"recursion_limit": 8},
-            ):
-                if not isinstance(msg, AIMessageChunk):
-                    continue
-                if getattr(msg, "tool_call_chunks", None):
-                    continue
-
-                content = ""
-                if isinstance(msg.content, str):
-                    content = msg.content
-                elif isinstance(msg.content, list):
-                    for block in msg.content:
-                        if isinstance(block, str):
-                            content += block
-                        elif isinstance(block, dict) and block.get("type") == "text":
-                            content += block.get("text", "")
-
-                if content:
-                    full_response += content
-                    await output_queue.put({"type": "content", "content": content})
-        except Exception as e:
-            await output_queue.put({"type": "error", "content": str(e)})
-        finally:
-            # 哨兵：通知主循环 agent 已完成
-            await output_queue.put(None)
-
-    # 启动后台任务
-    agent_task = asyncio.create_task(_agent_worker())
+    set_rag_step_queue(_StatusProxy())
+    prepare_task = asyncio.create_task(
+        asyncio.to_thread(prepare_rag_response, user_text, profile, execution_mode)
+    )
 
     try:
-        # 主循环：持续从统一队列取事件并 yield SSE
-        # RAG 步骤在工具执行期间通过 call_soon_threadsafe 实时入队，不需要等 agent 产出 chunk
-        while True:
-            event = await output_queue.get()
-            if event is None:
-                break
-            yield f"data: {json.dumps(event)}\n\n"
-    except GeneratorExit:
-        # 客户端断开连接（AbortController）时，FastAPI 会向此生成器抛出 GeneratorExit
-        # 我们必须在此处取消后台任务
-        agent_task.cancel()
-        try:
-            await agent_task
-        except asyncio.CancelledError:
-            pass  # 任务已成功取消
-        raise  # 重新抛出 GeneratorExit 以便 FastAPI 正确处理关闭
+        while not prepare_task.done():
+            try:
+                step = await asyncio.wait_for(status_queue.get(), timeout=0.15)
+            except asyncio.TimeoutError:
+                continue
+            event = {
+                "type": "status",
+                "stage": "retrieval",
+                "label": step.get("label", "正在检索证据"),
+                "detail": step.get("detail", ""),
+                "step": step,
+            }
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        prepared = await prepare_task
+        while not status_queue.empty():
+            step = status_queue.get_nowait()
+            event = {
+                "type": "status",
+                "stage": "retrieval",
+                "label": step.get("label", "正在检索证据"),
+                "detail": step.get("detail", ""),
+                "step": step,
+            }
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    except RetrievalServiceError as exc:
+        yield f"data: {json.dumps({'type': 'error', 'content': str(exc)}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+        return
     finally:
-        # 正常结束或异常退出时清理
         set_rag_step_queue(None)
-        if not agent_task.done():
-             agent_task.cancel()
+        if not prepare_task.done():
+            prepare_task.cancel()
 
-    # 获取 RAG trace
-    rag_context = get_last_rag_context(clear=True)
-    rag_trace = rag_context.get("rag_trace") if rag_context else None
+    for citation in prepared["citations"]:
+        yield f"data: {json.dumps({'type': 'citation', 'citation': citation}, ensure_ascii=False)}\n\n"
 
-    # 发送 trace 信息
-    if rag_trace:
-        yield f"data: {json.dumps({'type': 'trace', 'rag_trace': rag_trace})}\n\n"
+    full_response = ""
+    usage = {}
+    if prepared["evidence_status"] == "insufficient":
+        full_response = INSUFFICIENT_EVIDENCE_MESSAGE
+        yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
+    else:
+        async for content, chunk_usage in stream_answer(user_text, prepared["evidence"], history):
+            full_response += content
+            usage = chunk_usage or usage
+            yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"
 
-    # 发送结束信号
+    rag_trace = prepared["rag_trace"]
+    trace_event = {"type": "trace", "rag_trace": rag_trace, **_response_metadata(prepared, usage)}
+    yield f"data: {json.dumps(trace_event, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
-    # 保存对话
     messages.append(AIMessage(content=full_response))
     extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": rag_trace}]
     storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)

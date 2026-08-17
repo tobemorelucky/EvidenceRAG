@@ -1,4 +1,5 @@
 from datetime import datetime
+import os
 from typing import List
 
 from cache import cache
@@ -29,6 +30,11 @@ class DocumentPageStore:
                 "page_numbers": "ALTER TABLE document_pages ADD COLUMN page_numbers JSON NOT NULL DEFAULT '[]'",
                 "page_years": "ALTER TABLE document_pages ADD COLUMN page_years JSON NOT NULL DEFAULT '[]'",
                 "page_metric_tokens": "ALTER TABLE document_pages ADD COLUMN page_metric_tokens JSON NOT NULL DEFAULT '[]'",
+                "company": "ALTER TABLE document_pages ADD COLUMN company VARCHAR(255) NOT NULL DEFAULT ''",
+                "report_year": "ALTER TABLE document_pages ADD COLUMN report_year INTEGER NOT NULL DEFAULT 0",
+                "financial_document_type": "ALTER TABLE document_pages ADD COLUMN financial_document_type VARCHAR(50) NOT NULL DEFAULT ''",
+                "location": "ALTER TABLE document_pages ADD COLUMN location VARCHAR(255) NOT NULL DEFAULT ''",
+                "content_hash": "ALTER TABLE document_pages ADD COLUMN content_hash VARCHAR(64) NOT NULL DEFAULT ''",
             }
             for name, sql in alter_sql.items():
                 if name in columns:
@@ -46,6 +52,11 @@ class DocumentPageStore:
             "file_type": item.file_type,
             "file_path": item.file_path,
             "page_number": item.page_number,
+            "company": item.company,
+            "report_year": item.report_year,
+            "financial_document_type": item.financial_document_type,
+            "location": item.location,
+            "content_hash": item.content_hash,
             "page_text": item.page_text,
             "table_text": item.table_text,
             "chunk_ids": list(item.chunk_ids or []),
@@ -60,6 +71,15 @@ class DocumentPageStore:
     @staticmethod
     def _cache_key(filename: str, page_number: int) -> str:
         return f"document_page:{filename}:{page_number}"
+
+    @staticmethod
+    def _page_embedding_text(page_text: str) -> str:
+        """Keep full page text in storage but cap only the vector input length."""
+        max_chars = max(1000, int(os.getenv("PAGE_EMBEDDING_MAX_CHARS", "3000")))
+        if len(page_text) <= max_chars:
+            return page_text
+        half = max_chars // 2
+        return f"{page_text[:half]}\n[page text truncated for embedding]\n{page_text[-half:]}"
 
     def upsert_pages(self, pages: List[dict]) -> int:
         if not pages:
@@ -82,6 +102,11 @@ class DocumentPageStore:
                     "file_type": page.get("file_type", ""),
                     "file_path": page.get("file_path", ""),
                     "page_number": page_number,
+                    "company": page.get("company", ""),
+                    "report_year": int(page.get("report_year", 0) or 0),
+                    "financial_document_type": page.get("financial_document_type", ""),
+                    "location": page.get("location", f"page:{page_number}"),
+                    "content_hash": page.get("content_hash", ""),
                     "page_text": page_text,
                     "table_text": table_text,
                     "chunk_ids": list(page.get("chunk_ids") or []),
@@ -94,7 +119,11 @@ class DocumentPageStore:
         if not normalized_pages:
             return 0
 
-        page_embeddings = embedding_service.get_embeddings(page_texts)
+        page_batch_size = max(1, int(os.getenv("PAGE_EMBEDDING_BATCH_SIZE", "16")))
+        page_embeddings = embedding_service.get_embeddings(
+            [self._page_embedding_text(text) for text in page_texts],
+            batch_size=page_batch_size,
+        )
 
         db = SessionLocal()
         upserted = 0
@@ -109,6 +138,11 @@ class DocumentPageStore:
                 )
                 payload = {
                     "doc_name": page["doc_name"],
+                    "company": page["company"],
+                    "report_year": page["report_year"],
+                    "financial_document_type": page["financial_document_type"],
+                    "location": page["location"],
+                    "content_hash": page["content_hash"],
                     "file_type": page["file_type"],
                     "file_path": page["file_path"],
                     "page_text": page["page_text"],
@@ -128,6 +162,11 @@ class DocumentPageStore:
                     "file_type": payload["file_type"],
                     "file_path": payload["file_path"],
                     "page_number": page_number,
+                    "company": payload["company"],
+                    "report_year": payload["report_year"],
+                    "financial_document_type": payload["financial_document_type"],
+                    "location": payload["location"],
+                    "content_hash": payload["content_hash"],
                     "page_text": payload["page_text"],
                     "table_text": payload["table_text"],
                     "chunk_ids": payload["chunk_ids"],
@@ -152,6 +191,60 @@ class DocumentPageStore:
             db.close()
 
         return upserted
+
+    def insert_preembedded_pages(self, pages: List[dict], embeddings: List[list[float]]) -> int:
+        """Fast path for a freshly rebuilt collection.
+
+        The benchmark rebuild has already removed all derived page rows.  Using
+        per-row SELECT/UPDATE and eagerly warming Redis in that situation adds
+        thousands of network round trips without improving retrieval.  Runtime
+        uploads continue to use :meth:`upsert_pages`.
+        """
+        if len(pages) != len(embeddings):
+            raise ValueError("pages and embeddings must have the same length")
+        if not pages:
+            return 0
+
+        now = datetime.utcnow()
+        mappings = []
+        for page, embedding in zip(pages, embeddings):
+            filename = (page.get("filename") or "").strip()
+            if not filename:
+                continue
+            page_text = sanitize_text(page.get("page_text", ""))
+            table_text = sanitize_text(page.get("table_text", ""))
+            mappings.append(
+                {
+                    "doc_name": page.get("doc_name", ""),
+                    "filename": filename,
+                    "file_type": page.get("file_type", ""),
+                    "file_path": page.get("file_path", ""),
+                    "page_number": int(page.get("page_number", 0) or 0),
+                    "company": page.get("company", ""),
+                    "report_year": int(page.get("report_year", 0) or 0),
+                    "financial_document_type": page.get("financial_document_type", ""),
+                    "location": page.get("location", ""),
+                    "content_hash": page.get("content_hash", ""),
+                    "page_text": page_text,
+                    "table_text": table_text,
+                    "chunk_ids": list(page.get("chunk_ids") or []),
+                    "embedding_cache_key": build_embedding_cache_key(
+                        filename, int(page.get("page_number", 0) or 0), page_text
+                    ),
+                    "page_dense_embedding": list(embedding or []),
+                    **compute_page_features(page_text, table_text),
+                    "updated_at": now,
+                }
+            )
+        if not mappings:
+            return 0
+        db = SessionLocal()
+        try:
+            db.bulk_insert_mappings(DocumentPage, mappings)
+            db.commit()
+        finally:
+            db.close()
+        return len(mappings)
 
     def get_pages_by_filenames(self, filenames: List[str]) -> List[dict]:
         normalized = [item.strip() for item in filenames if item and item.strip()]

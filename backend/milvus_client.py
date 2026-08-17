@@ -5,7 +5,13 @@ import threading
 from typing import Callable, TypeVar
 
 from dotenv import load_dotenv
-from pymilvus import MilvusClient, DataType, AnnSearchRequest, RRFRanker
+from pymilvus import AnnSearchRequest, DataType, MilvusClient, RRFRanker
+
+try:
+    from pymilvus import Function, FunctionType
+except ImportError:  # pragma: no cover - compatibility with older clients
+    Function = None
+    FunctionType = None
 
 load_dotenv()
 
@@ -23,6 +29,8 @@ class MilvusManager:
         self.port = os.getenv("MILVUS_PORT", "19530")
         self.collection_name = os.getenv("MILVUS_COLLECTION", "embeddings_collection")
         self.configured_search_ef = max(1, int(os.getenv("MILVUS_SEARCH_EF", "128")))
+        self.sparse_mode = os.getenv("MILVUS_SPARSE_MODE", "milvus_bm25").strip().lower()
+        self.uses_builtin_bm25 = self.sparse_mode == "milvus_bm25" and Function is not None
         self.uri = f"http://{self.host}:{self.port}"
         self.client = None
         self._client_lock = threading.RLock()
@@ -129,16 +137,35 @@ class MilvusManager:
                 # 密集向量（来自 embedding 模型）
                 schema.add_field("dense_embedding", DataType.FLOAT_VECTOR, dim=dense_dim)
                 
-                # 稀疏向量（来自 BM25）
-                schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
-                
                 # 文本和元数据字段
-                schema.add_field("text", DataType.VARCHAR, max_length=8192)
+                schema.add_field(
+                    "text",
+                    DataType.VARCHAR,
+                    max_length=8192,
+                    enable_analyzer=self.uses_builtin_bm25,
+                    enable_match=self.uses_builtin_bm25,
+                    analyzer_params={"type": "standard"} if self.uses_builtin_bm25 else None,
+                )
+                schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
+                if self.uses_builtin_bm25:
+                    schema.add_function(
+                        Function(
+                            name="text_bm25",
+                            function_type=FunctionType.BM25,
+                            input_field_names=["text"],
+                            output_field_names=["sparse_embedding"],
+                        )
+                    )
                 schema.add_field("filename", DataType.VARCHAR, max_length=255)
                 schema.add_field("file_type", DataType.VARCHAR, max_length=50)
                 schema.add_field("file_path", DataType.VARCHAR, max_length=1024)
                 schema.add_field("page_number", DataType.INT64)
                 schema.add_field("chunk_idx", DataType.INT64)
+                schema.add_field("company", DataType.VARCHAR, max_length=255)
+                schema.add_field("report_year", DataType.INT64)
+                schema.add_field("financial_document_type", DataType.VARCHAR, max_length=50)
+                schema.add_field("location", DataType.VARCHAR, max_length=255)
+                schema.add_field("content_hash", DataType.VARCHAR, max_length=64)
 
                 # Auto-merging 所需层级字段
                 schema.add_field("chunk_id", DataType.VARCHAR, max_length=512)
@@ -168,7 +195,7 @@ class MilvusManager:
                 index_params.add_index(
                     field_name="sparse_embedding",
                     index_type="SPARSE_INVERTED_INDEX",
-                    metric_type="IP",
+                    metric_type="BM25" if self.uses_builtin_bm25 else "IP",
                     params={"drop_ratio_build": 0.2}
                 )
 
@@ -274,10 +301,11 @@ class MilvusManager:
     def hybrid_retrieve(
         self,
         dense_embedding: list[float],
-        sparse_embedding: dict,
+        sparse_embedding: dict | None,
         top_k: int = 5,
         rrf_k: int = 60,     #可调节
         filter_expr: str = "",
+        query_text: str | None = None,
     ) -> list[dict]:
         """
         混合检索 - 使用 RRF 融合密集向量和稀疏向量的检索结果
@@ -302,6 +330,11 @@ class MilvusManager:
             "root_chunk_id",
             "chunk_level",
             "chunk_idx",
+            "company",
+            "report_year",
+            "financial_document_type",
+            "location",
+            "content_hash",
         ]
         actual_search_k = max(1, top_k * 2)
         effective_ef = self._resolve_effective_ef(actual_search_k)
@@ -325,10 +358,15 @@ class MilvusManager:
         )
         
         # 稀疏向量搜索请求
+        if self.uses_builtin_bm25 and not query_text:
+            raise ValueError("Milvus BM25 hybrid retrieval requires query_text")
         sparse_search = AnnSearchRequest(
-            data=[sparse_embedding],
+            data=[query_text if self.uses_builtin_bm25 else sparse_embedding],
             anns_field="sparse_embedding",
-            param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
+            param={
+                "metric_type": "BM25" if self.uses_builtin_bm25 else "IP",
+                "params": {} if self.uses_builtin_bm25 else {"drop_ratio_search": 0.2},
+            },
             limit=actual_search_k,
             expr=filter_expr,
         )
@@ -365,6 +403,11 @@ class MilvusManager:
                     "root_chunk_id": hit.get("root_chunk_id", ""),
                     "chunk_level": hit.get("chunk_level", 0),
                     "chunk_idx": hit.get("chunk_idx", 0),
+                    "company": hit.get("company", ""),
+                    "report_year": hit.get("report_year", 0),
+                    "financial_document_type": hit.get("financial_document_type", ""),
+                    "location": hit.get("location", ""),
+                    "content_hash": hit.get("content_hash", ""),
                     "score": hit.get("distance", 0.0)
                 })
         
@@ -406,6 +449,11 @@ class MilvusManager:
                     "root_chunk_id",
                     "chunk_level",
                     "chunk_idx",
+                    "company",
+                    "report_year",
+                    "financial_document_type",
+                    "location",
+                    "content_hash",
                 ],
                 filter=filter_expr,
             )
@@ -429,6 +477,11 @@ class MilvusManager:
                     "root_chunk_id": hit.get("entity", {}).get("root_chunk_id", ""),
                     "chunk_level": hit.get("entity", {}).get("chunk_level", 0),
                     "chunk_idx": hit.get("entity", {}).get("chunk_idx", 0),
+                    "company": hit.get("entity", {}).get("company", ""),
+                    "report_year": hit.get("entity", {}).get("report_year", 0),
+                    "financial_document_type": hit.get("entity", {}).get("financial_document_type", ""),
+                    "location": hit.get("entity", {}).get("location", ""),
+                    "content_hash": hit.get("entity", {}).get("content_hash", ""),
                     "score": hit.get("distance", 0.0)
                 })
         

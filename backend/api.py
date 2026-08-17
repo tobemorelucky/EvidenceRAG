@@ -92,7 +92,9 @@ def _write_table_evidence_docs_safe(filename: str, table_evidence_docs: list[dic
 
 
 def _remove_bm25_stats_for_filename(filename: str) -> None:
-    """删除 Milvus 中该文件对应 chunk 前，先从持久化 BM25 统计中扣减。"""
+    """兼容旧集合；Milvus 内置 BM25 集合无需维护应用侧语料统计。"""
+    if getattr(milvus_manager, "uses_builtin_bm25", False):
+        return
     rows = milvus_manager.query_all(
         filter_expr=f'filename == "{filename}"',
         output_fields=["text"],
@@ -182,7 +184,13 @@ async def delete_session(session_id: str, current_user: User = Depends(get_curre
 async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user)):
     try:
         session_id = request.session_id or "default_session"
-        resp = chat_with_agent(request.message, current_user.username, session_id)
+        resp = chat_with_agent(
+            request.message,
+            current_user.username,
+            session_id,
+            profile=request.profile,
+            execution_mode=request.execution_mode,
+        )
         if isinstance(resp, dict):
             return ChatResponse(**resp)
         return ChatResponse(response=resp)
@@ -202,21 +210,30 @@ async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_c
             if code in (401, 403):
                 raise HTTPException(status_code=code, detail=message)
             raise HTTPException(status_code=code, detail=message)
-        raise HTTPException(status_code=500, detail=message)
+        logger.exception("chat request failed")
+        raise HTTPException(status_code=500, detail="回答生成服务暂不可用，请稍后重试")
 
 
 @router.post("/chat/stream")
 async def chat_stream_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user)):
-    """跟 Agent 对话 (流式)"""
+    """以统一 SSE 事件流返回检索状态、答案、引用和审计信息。"""
 
     async def event_generator():
         try:
             session_id = request.session_id or "default_session"
-            async for chunk in chat_with_agent_stream(request.message, current_user.username, session_id):
+            async for chunk in chat_with_agent_stream(
+                request.message,
+                current_user.username,
+                session_id,
+                profile=request.profile,
+                execution_mode=request.execution_mode,
+            ):
                 yield chunk
         except Exception as e:
-            error_data = {"type": "error", "content": str(e)}
+            logger.exception("streaming chat request failed")
+            error_data = {"type": "error", "content": "回答生成服务暂不可用，请稍后重试"}
             yield f"data: {json.dumps(error_data)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -379,9 +396,9 @@ def _process_delete_job(job_id: str, filename: str) -> None:
         delete_job_manager.complete_step(job_id, "prepare", "删除任务已创建")
 
         failed_step = "bm25"
-        delete_job_manager.update_step(job_id, "bm25", 20, "running", "正在同步 BM25 统计")
+        delete_job_manager.update_step(job_id, "bm25", 20, "running", "正在更新稀疏索引状态")
         _remove_bm25_stats_for_filename(filename)
-        delete_job_manager.complete_step(job_id, "bm25", "BM25 统计已同步")
+        delete_job_manager.complete_step(job_id, "bm25", "稀疏索引状态已更新")
 
         failed_step = "milvus"
         delete_job_manager.update_step(job_id, "milvus", 30, "running", "正在删除 Milvus 向量数据")
@@ -412,7 +429,7 @@ async def list_documents(_: User = Depends(require_admin)):
         milvus_manager.init_collection()
 
         results = milvus_manager.query_all(
-            output_fields=["filename", "file_type"],
+            output_fields=["filename", "file_type", "page_number", "evidence_type"],
         )
 
         file_stats = {}
@@ -424,11 +441,21 @@ async def list_documents(_: User = Depends(require_admin)):
                     "filename": filename,
                     "file_type": file_type,
                     "chunk_count": 0,
+                    "page_numbers": set(),
                 }
-            file_stats[filename]["chunk_count"] += 1
+            if (item.get("evidence_type") or "text_chunk") == "text_chunk":
+                file_stats[filename]["chunk_count"] += 1
+            if item.get("page_number") is not None:
+                file_stats[filename]["page_numbers"].add(int(item.get("page_number") or 0))
 
         documents = [
-            DocumentInfo(**stats)
+            DocumentInfo(
+                filename=stats["filename"],
+                file_type=stats["file_type"],
+                chunk_count=stats["chunk_count"],
+                page_count=len(stats["page_numbers"]),
+                index_status="ready",
+            )
             for stats in sorted(file_stats.values(), key=lambda item: item["filename"].lower())
         ]
         logger.info(

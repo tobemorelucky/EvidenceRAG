@@ -18,7 +18,11 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Cute Cat Bot API")
+    app = FastAPI(
+        title="EvidenceRAG API",
+        description="可检索、可引用、可验证、可审计的专业 RAG 服务。",
+        version="0.2.0",
+    )
 
     @app.on_event("startup")
     async def _startup_init_db():

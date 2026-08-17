@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import hashlib
 from typing import Dict, List
 
 from langchain_community.document_loaders import (
@@ -13,6 +14,7 @@ from langchain_community.document_loaders import (
     UnstructuredExcelLoader,
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 try:
     from table_parser import TableAwareParser
@@ -24,17 +26,52 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 
 
+class _PdfiumLoader:
+    """Fast local text-only PDF loader for indexing.
+
+    pypdf is convenient but spends a disproportionate amount of benchmark
+    rebuild time in Python.  PDFium performs the same page-text extraction in
+    native code and returns the page metadata shape expected by the existing
+    loader pipeline.
+    """
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+
+    def load(self) -> list[Document]:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(self.file_path)
+        try:
+            documents = []
+            for page_index in range(len(pdf)):
+                page = pdf[page_index]
+                try:
+                    text = page.get_textpage().get_text_range()
+                finally:
+                    page.close()
+                documents.append(Document(page_content=text, metadata={"source": self.file_path, "page": page_index}))
+            return documents
+        finally:
+            pdf.close()
+
+
 class DocumentLoader:
     """Load documents and split them into three chunk levels."""
 
-    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
+    def __init__(
+        self,
+        chunk_size: int = 800,
+        chunk_overlap: int = 128,
+        include_parent_chunks: bool = True,
+    ):
         # Keep the original constructor shape for compatibility.
-        level_1_size = max(1200, chunk_size * 2)
-        level_1_overlap = max(240, chunk_overlap * 2)
-        level_2_size = max(600, chunk_size)
-        level_2_overlap = max(120, chunk_overlap)
-        level_3_size = max(300, chunk_size // 2)
-        level_3_overlap = max(60, chunk_overlap // 2)
+        level_1_size = max(1600, chunk_size * 2)
+        level_1_overlap = max(256, chunk_overlap * 2)
+        level_2_size = max(800, chunk_size)
+        level_2_overlap = max(128, chunk_overlap)
+        level_3_size = max(768, chunk_size)
+        level_3_overlap = max(128, chunk_overlap)
 
         separators = ["\n\n", "\n", ".", ";", ",", " ", ""]
         self._splitter_level_1 = RecursiveCharacterTextSplitter(
@@ -42,20 +79,57 @@ class DocumentLoader:
             chunk_overlap=level_1_overlap,
             add_start_index=True,
             separators=separators,
+            length_function=self._token_count,
         )
         self._splitter_level_2 = RecursiveCharacterTextSplitter(
             chunk_size=level_2_size,
             chunk_overlap=level_2_overlap,
             add_start_index=True,
             separators=separators,
+            length_function=self._token_count,
         )
         self._splitter_level_3 = RecursiveCharacterTextSplitter(
             chunk_size=level_3_size,
             chunk_overlap=level_3_overlap,
             add_start_index=True,
             separators=separators,
+            length_function=self._token_count,
         )
+        self._include_parent_chunks = include_parent_chunks
         self._table_parser = TableAwareParser()
+
+    @staticmethod
+    def _token_count(text: str) -> int:
+        """Stable finance-aware token estimate used without a remote tokenizer."""
+        return len(re.findall(r"[$€£¥]?\d[\d,]*(?:\.\d+)?%?|[A-Za-z]+(?:[-'][A-Za-z]+)*|[\u4e00-\u9fff]|\S", text or ""))
+
+    @staticmethod
+    def _financial_metadata(filename: str) -> dict:
+        stem = os.path.splitext(filename)[0]
+        year_match = re.search(r"(?:19|20)\d{2}", stem)
+        upper = stem.upper()
+        if "10K" in upper:
+            document_type = "10-K"
+        elif "10Q" in upper:
+            document_type = "10-Q"
+        elif "EARNINGS" in upper:
+            document_type = "earnings"
+        else:
+            document_type = "financial_document"
+        company = re.split(r"_(?:19|20)\d{2}", stem, maxsplit=1)[0]
+        return {
+            "company": company,
+            "report_year": int(year_match.group()) if year_match else 0,
+            "financial_document_type": document_type,
+        }
+
+    @staticmethod
+    def _content_hash(text: str) -> str:
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _table_ingestion_enabled() -> bool:
+        return os.getenv("TABLE_AWARE_INGESTION", "false").strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _build_chunk_id(filename: str, page_number: int, level: int, index: int) -> str:
@@ -65,6 +139,13 @@ class DocumentLoader:
     def _resolve_doc_type_and_loader(file_path: str, filename: str):
         file_lower = filename.lower()
         if file_lower.endswith(".pdf"):
+            if os.getenv("PDF_TEXT_BACKEND", "pdfium").strip().lower() == "pdfium":
+                try:
+                    import pypdfium2  # noqa: F401
+
+                    return "PDF", _PdfiumLoader(file_path)
+                except ImportError:
+                    logger.warning("pypdfium2 unavailable; falling back to PyPDFLoader")
             return "PDF", PyPDFLoader(file_path)
         if file_lower.endswith((".docx", ".doc")):
             return "Word", Docx2txtLoader(file_path)
@@ -113,6 +194,26 @@ class DocumentLoader:
         root_chunks: List[Dict] = []
         page_number = int(base_doc.get("page_number", 0))
         filename = base_doc["filename"]
+
+        # Finance retrieval uses page discovery followed by leaf-chunk search.
+        # When auto-merging is disabled, producing levels 1/2 only duplicates
+        # parsing and database work. Keep the hierarchy for legacy callers, but
+        # let the benchmark builder generate the actual retrieval unit directly.
+        if not self._include_parent_chunks:
+            leaf_docs = self._splitter_level_3.create_documents([text], [base_doc])
+            return [
+                {
+                    **base_doc,
+                    "text": sanitize_text(leaf_doc.page_content).strip(),
+                    "chunk_id": self._build_chunk_id(filename, page_number, 3, index),
+                    "parent_chunk_id": "",
+                    "root_chunk_id": "",
+                    "chunk_level": 3,
+                    "chunk_idx": page_global_chunk_idx + index,
+                }
+                for index, leaf_doc in enumerate(leaf_docs)
+                if sanitize_text(leaf_doc.page_content).strip()
+            ]
 
         level_1_docs = self._splitter_level_1.create_documents([text], [base_doc])
         level_1_counter = 0
@@ -197,6 +298,8 @@ class DocumentLoader:
                     "file_path": file_path,
                     "file_type": doc_type,
                     "page_number": page_number,
+                    "location": f"page:{page_number}",
+                    **self._financial_metadata(filename),
                 }
                 page_chunks = self._split_page_to_three_levels(
                     text=page_text,
@@ -204,6 +307,8 @@ class DocumentLoader:
                     page_global_chunk_idx=page_global_chunk_idx,
                 )
                 page_global_chunk_idx += len(page_chunks)
+                for chunk in page_chunks:
+                    chunk["content_hash"] = self._content_hash(chunk.get("text", ""))
                 documents.extend(page_chunks)
                 pages.append(
                     {
@@ -212,7 +317,10 @@ class DocumentLoader:
                         "file_type": doc_type,
                         "file_path": file_path,
                         "page_number": page_number,
+                        "location": f"page:{page_number}",
                         "page_text": page_text,
+                        "content_hash": self._content_hash(page_text),
+                        **self._financial_metadata(filename),
                         "table_text": self._extract_table_text(page_text),
                         "chunk_ids": [
                             chunk.get("chunk_id", "")
@@ -222,7 +330,7 @@ class DocumentLoader:
                     }
                 )
             tables = []
-            if doc_type == "PDF":
+            if doc_type == "PDF" and self._table_ingestion_enabled():
                 try:
                     tables = self._table_parser.extract_tables(file_path, filename)
                 except Exception:

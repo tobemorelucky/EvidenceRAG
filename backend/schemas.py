@@ -29,6 +29,8 @@ class CurrentUserResponse(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = "default_session"
+    profile: Optional[str] = None
+    execution_mode: Optional[str] = None
 
 
 class DebugRetrievalRequest(BaseModel):
@@ -51,8 +53,8 @@ class RetrievedChunk(BaseModel):
 
 
 class RagTrace(BaseModel):
-    tool_used: bool
-    tool_name: str
+    tool_used: bool = True
+    tool_name: str = "retrieval_orchestrator"
     query: Optional[str] = None
     original_question: Optional[str] = None
     rewritten_question: Optional[str] = None
@@ -157,11 +159,34 @@ class RagTrace(BaseModel):
     final_evidence_pack_debug: Optional[List[RetrievedChunk]] = None
     final_evidence_pack_used: Optional[List[RetrievedChunk]] = None
     doc_stage_selected_docs: Optional[List[dict]] = None
+    profile: Optional[str] = None
+    execution_mode: Optional[str] = None
+    route_reason: Optional[str] = None
+    evidence_status: Optional[str] = None
+    trace_id: Optional[str] = None
+    prompt_version: Optional[str] = None
+    agent_tool_calls: Optional[List[dict]] = None
+    agent_tool_call_count: Optional[int] = None
+
+
+class Citation(BaseModel):
+    id: str
+    filename: str
+    page_number: Optional[str | int] = None
+    text: Optional[str] = None
+    score: Optional[float] = None
 
 
 class ChatResponse(BaseModel):
     response: str
     rag_trace: Optional[RagTrace] = None
+    execution_mode: Optional[str] = None
+    route_reason: Optional[str] = None
+    citations: Optional[List[Citation]] = None
+    evidence_status: Optional[str] = None
+    calculation: Optional[dict] = None
+    trace_id: Optional[str] = None
+    usage: Optional[dict] = None
 
 
 class MessageInfo(BaseModel):
@@ -194,6 +219,8 @@ class DocumentInfo(BaseModel):
     filename: str
     file_type: str
     chunk_count: int
+    page_count: int = 0
+    index_status: str = "ready"
     uploaded_at: Optional[str] = None
 
 

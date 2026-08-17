@@ -35,7 +35,13 @@ class MilvusWriter:
             return _TRUNCATION_SUFFIX[:limit]
         return sanitized[: limit - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
 
-    def write_documents(self, documents: list[dict], batch_size: int = 50, progress_callback=None):
+    def write_documents(
+        self,
+        documents: list[dict],
+        batch_size: int = 50,
+        progress_callback=None,
+        embeddings: list[list[float]] | None = None,
+    ):
         """
         批量写入文档到 Milvus（同时生成密集和稀疏向量）
         :param documents: 文档列表
@@ -43,31 +49,45 @@ class MilvusWriter:
         """
         if not documents:
             return
+        if embeddings is not None and len(embeddings) != len(documents):
+            raise ValueError("documents and embeddings must have the same length")
 
         self.milvus_manager.init_collection()
 
         sanitized_documents = [{**doc, "text": self._sanitize_and_trim_text(doc.get("text", ""))} for doc in documents]
         all_texts = [doc["text"] for doc in sanitized_documents]
-        self.embedding_service.increment_add_documents(all_texts)
+        uses_builtin_bm25 = bool(getattr(self.milvus_manager, "uses_builtin_bm25", False))
+        if not uses_builtin_bm25:
+            self.embedding_service.increment_add_documents(all_texts)
 
         total = len(sanitized_documents)
         for i in range(0, total, batch_size):
             batch = sanitized_documents[i:i + batch_size]
             texts = [doc["text"] for doc in batch]
             
-            # 同时生成密集向量和稀疏向量
-            dense_embeddings, sparse_embeddings = self.embedding_service.get_all_embeddings(texts)
+            if embeddings is not None:
+                dense_embeddings = embeddings[i:i + batch_size]
+                sparse_embeddings = [None] * len(batch)
+            elif uses_builtin_bm25:
+                dense_embeddings = self.embedding_service.get_embeddings(texts)
+                sparse_embeddings = [None] * len(texts)
+            else:
+                dense_embeddings, sparse_embeddings = self.embedding_service.get_all_embeddings(texts)
 
             insert_data = [
-                {
+                ({
                     "dense_embedding": dense_emb,
-                    "sparse_embedding": sparse_emb,
                     "text": doc["text"],
                     "filename": doc.get("filename", ""),
                     "file_type": doc.get("file_type", ""),
                     "file_path": doc.get("file_path", ""),
                     "page_number": doc.get("page_number", 0),
                     "chunk_idx": doc.get("chunk_idx", 0),
+                    "company": doc.get("company", ""),
+                    "report_year": doc.get("report_year", 0),
+                    "financial_document_type": doc.get("financial_document_type", ""),
+                    "location": doc.get("location", ""),
+                    "content_hash": doc.get("content_hash", ""),
                     "evidence_type": doc.get("evidence_type", "text_chunk") or "text_chunk",
                     "table_id": doc.get("table_id", ""),
                     "row_id": doc.get("row_id", ""),
@@ -76,7 +96,7 @@ class MilvusWriter:
                     "parent_chunk_id": doc.get("parent_chunk_id", ""),
                     "root_chunk_id": doc.get("root_chunk_id", ""),
                     "chunk_level": doc.get("chunk_level", 0),
-                }
+                } | ({"sparse_embedding": sparse_emb} if not uses_builtin_bm25 else {}))
                 for doc, dense_emb, sparse_emb in zip(batch, dense_embeddings, sparse_embeddings)
             ]
 
