@@ -16,4 +16,5 @@ volumes/
 # OS files
 .DS_Store
 data/
+reports/
 

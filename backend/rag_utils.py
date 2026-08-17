@@ -2024,6 +2024,16 @@ def _is_query_planner_enabled() -> bool:
     return _parse_bool(os.getenv("RAG_QUERY_PLANNER_ENABLED"), False)
 
 
+def _is_anchor_guard_enabled() -> bool:
+    """Anchor filtering is an experimental precision heuristic, not a baseline."""
+    return _parse_bool(os.getenv("RAG_ANCHOR_GUARD_ENABLED"), False)
+
+
+def _is_cover_filter_enabled() -> bool:
+    """Cover/TOC filtering is a precision experiment and can remove valid filings."""
+    return _parse_bool(os.getenv("RAG_COVER_FILTER_ENABLED"), False)
+
+
 def _is_page_level_fusion_enabled() -> bool:
     return _parse_bool(os.getenv("RAG_PAGE_LEVEL_FUSION"), True)
 
@@ -3456,16 +3466,19 @@ def finalize_retrieved_documents(
         combined_pack = _deduplicate_docs(
             evidence_pack_used + stage_two_candidates + fallback_candidates
         )
-        combined_pack, anchor_guard_applied, anchor_filtered_count = _apply_anchor_guard_to_docs(
-            combined_pack,
-            stage_two_meta.get("query_anchors", []) or [],
-        )
-        if evidence_pack_used:
-            filtered_used_pack, _, _ = _apply_anchor_guard_to_docs(
-                evidence_pack_used,
+        if _is_anchor_guard_enabled():
+            combined_pack, anchor_guard_applied, anchor_filtered_count = _apply_anchor_guard_to_docs(
+                combined_pack,
                 stage_two_meta.get("query_anchors", []) or [],
             )
-            evidence_pack_used = filtered_used_pack
+            if evidence_pack_used:
+                filtered_used_pack, _, _ = _apply_anchor_guard_to_docs(
+                    evidence_pack_used,
+                    stage_two_meta.get("query_anchors", []) or [],
+                )
+                evidence_pack_used = filtered_used_pack
+        else:
+            anchor_guard_applied, anchor_filtered_count = False, 0
         stage_two_meta["anchor_guard_applied"] = anchor_guard_applied
         stage_two_meta["anchor_filtered_count"] = anchor_filtered_count
         if len(evidence_pack_used) < final_top_k:
@@ -3494,18 +3507,25 @@ def finalize_retrieved_documents(
         }
     else:
         page_rerank_ms = 0.0
-        filtered_candidates, cover_page_filtered_count = _filter_cover_or_toc_docs(query, deduped_candidates)
-        rerank_input = filtered_candidates or deduped_candidates
-        stage_two_meta["cover_page_filtered_count"] = cover_page_filtered_count if filtered_candidates else 0
+        if _is_cover_filter_enabled():
+            filtered_candidates, cover_page_filtered_count = _filter_cover_or_toc_docs(query, deduped_candidates)
+            rerank_input = filtered_candidates or deduped_candidates
+            stage_two_meta["cover_page_filtered_count"] = cover_page_filtered_count if filtered_candidates else 0
+        else:
+            rerank_input = deduped_candidates
+            stage_two_meta["cover_page_filtered_count"] = 0
         reranked_docs, rerank_meta = _rerank_documents(
             query=query,
             docs=rerank_input,
             top_k=max(final_top_k * 2, final_top_k),
         )
-        reranked_docs, anchor_guard_applied, anchor_filtered_count = _apply_anchor_guard_to_docs(
-            reranked_docs,
-            stage_two_meta.get("query_anchors", []) or [],
-        )
+        if _is_anchor_guard_enabled():
+            reranked_docs, anchor_guard_applied, anchor_filtered_count = _apply_anchor_guard_to_docs(
+                reranked_docs,
+                stage_two_meta.get("query_anchors", []) or [],
+            )
+        else:
+            anchor_guard_applied, anchor_filtered_count = False, 0
         stage_two_meta["anchor_guard_applied"] = anchor_guard_applied
         stage_two_meta["anchor_filtered_count"] = anchor_filtered_count
         page_fusion_selected_docs, selected_pages, page_fusion_used = _select_docs_from_fused_pages(
