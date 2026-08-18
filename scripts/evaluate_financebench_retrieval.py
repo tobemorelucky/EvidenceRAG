@@ -1,8 +1,10 @@
-"""Token-free FinanceBench evidence-retrieval evaluation.
+"""FinanceBench evidence-retrieval evaluation.
 
 This evaluates retrieval only.  It never calls the answer model, LangSmith, a
-query planner, or a remote reranker.  Gold pages come from the benchmark CSV's
-``evidence`` field and results are written for failure analysis.
+query planner, or agent.  Remote reranking is disabled by default and can be
+enabled explicitly for a controlled retrieval-only comparison. Gold pages come
+from the benchmark CSV's ``evidence`` field and results are written for failure
+analysis.
 """
 
 import argparse
@@ -106,21 +108,30 @@ def classify_failure(gold: list[dict[str, Any]], retrieved: list[dict[str, Any]]
     return "gold_page_not_retrieved"
 
 
-def _retrieval_environment() -> None:
-    """Disable every remote/model-assisted experimental branch before import."""
+def _retrieval_environment(*, enable_rerank: bool) -> None:
+    """Disable non-retrieval branches before importing the RAG implementation."""
     os.environ["RAG_QUERY_PLANNER_ENABLED"] = "false"
     os.environ["RAG_ANCHOR_GUARD_ENABLED"] = "false"
     os.environ["RAG_COVER_FILTER_ENABLED"] = "false"
+    os.environ["RAG_PAGE_FIRST_ENABLED"] = "true"
+    os.environ["RAG_PAGE_NEIGHBOR_WINDOW"] = "0"
     os.environ["FINANCE_RAG_ENABLE_STEP_BACK"] = "false"
-    os.environ["RERANK_MODEL"] = ""
-    os.environ["RERANK_BINDING_HOST"] = ""
-    os.environ["RERANK_API_KEY"] = ""
+    if not enable_rerank:
+        os.environ["RERANK_MODEL"] = ""
+        os.environ["RERANK_BINDING_HOST"] = ""
+        os.environ["RERANK_API_KEY"] = ""
     os.environ["TABLE_AWARE_RETRIEVAL"] = "off"
     os.environ["RAG_EVIDENCE_GROUPING_ENABLED"] = "false"
 
 
-def evaluate(rows: list[dict[str, str]], candidate_k: int, final_k: int) -> list[dict[str, Any]]:
-    _retrieval_environment()
+def evaluate(
+    rows: list[dict[str, str]],
+    candidate_k: int,
+    final_k: int,
+    *,
+    enable_rerank: bool = False,
+) -> list[dict[str, Any]]:
+    _retrieval_environment(enable_rerank=enable_rerank)
     sys.path.insert(0, str(BACKEND))
     from rag_utils import retrieve_documents
 
@@ -165,6 +176,20 @@ def evaluate(rows: list[dict[str, str]], candidate_k: int, final_k: int) -> list
                 str(k): page_hit_at_k(gold, final_hits, k)
                 for k in (1, final_k)
             },
+            "page_first_trace": {
+                "selected_documents": (retrieval.get("meta") or {}).get("page_first_selected_documents", []),
+                "selected_pages": (retrieval.get("meta") or {}).get("page_first_selected_pages", []),
+                "fallback": (retrieval.get("meta") or {}).get("page_first_fallback", ""),
+            },
+            "rerank": {
+                "enabled": bool((retrieval.get("meta") or {}).get("rerank_enabled")),
+                "applied": bool((retrieval.get("meta") or {}).get("rerank_applied")),
+                "model": (retrieval.get("meta") or {}).get("rerank_model"),
+                "error": (retrieval.get("meta") or {}).get("rerank_error"),
+                "local_enabled": bool((retrieval.get("meta") or {}).get("local_rerank_enabled")),
+                "local_applied": bool((retrieval.get("meta") or {}).get("local_rerank_applied")),
+                "local_error": (retrieval.get("meta") or {}).get("local_rerank_error"),
+            },
             "retrieval_ms": (retrieval.get("meta") or {}).get("latency_breakdown", {}).get("total_retrieval_ms"),
         }
         results.append(record)
@@ -208,7 +233,13 @@ def main() -> None:
     parser.add_argument("--split", choices=("dev", "holdout", "all"), default="dev")
     parser.add_argument("--candidate-k", type=int, default=40)
     parser.add_argument("--final-k", type=int, default=5)
+    parser.add_argument("--limit", type=int, default=0, help="Evaluate only the first N selected rows (0 means all).")
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
+    parser.add_argument(
+        "--enable-rerank",
+        action="store_true",
+        help="Enable the configured rerank service; the answer model remains disabled.",
+    )
     args = parser.parse_args()
 
     with args.dataset.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -220,8 +251,15 @@ def main() -> None:
         rows = [row for row in all_rows if not is_development_row(row, dev_ids)]
     else:
         rows = all_rows
+    if args.limit > 0:
+        rows = rows[: args.limit]
 
-    records = evaluate(rows, candidate_k=max(1, args.candidate_k), final_k=max(1, args.final_k))
+    records = evaluate(
+        rows,
+        candidate_k=max(1, args.candidate_k),
+        final_k=max(1, args.final_k),
+        enable_rerank=args.enable_rerank,
+    )
     summary = build_summary(records)
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -229,6 +267,8 @@ def main() -> None:
         "split": args.split,
         "candidate_k": args.candidate_k,
         "final_k": args.final_k,
+        "limit": args.limit,
+        "rerank_enabled": args.enable_rerank,
         "summary": summary,
         "records": records,
     }

@@ -13,6 +13,7 @@ from langchain.chat_models import init_chat_model
 
 from document_page_store import DocumentPageStore
 from embedding import embedding_service as _embedding_service
+from local_reranker import LocalReranker
 from finance_rag_features import (
     COMPANY_ALIASES,
     FINANCE_METRIC_HINTS,
@@ -74,6 +75,7 @@ _milvus_manager = MilvusManager()
 _parent_chunk_store = ParentChunkStore()
 _document_page_store = DocumentPageStore()
 _table_store = TableStore()
+_local_reranker = LocalReranker()
 
 _stepback_model = None
 
@@ -1682,6 +1684,28 @@ def _extract_metric_hints(text: str) -> set[str]:
     return _feature_extract_metric_hints(text)
 
 
+_FINANCE_OPERAND_HINTS = {
+    "quick ratio": {"cash", "cash equivalents", "receivables", "current liabilities", "short-term investments"},
+    "current ratio": {"current assets", "current liabilities"},
+    "working capital ratio": {"current assets", "current liabilities"},
+    "operating margin": {"operating income", "income from operations", "revenue", "net sales"},
+    "gross margin": {"gross profit", "revenue", "net sales"},
+    "fixed asset turnover": {"revenue", "net sales", "property plant equipment", "ppe", "pp&e"},
+    "ppne": {"property plant equipment", "ppe", "pp&e", "net property"},
+    "free cash flow": {"operating cash flow", "capital expenditures", "capex"},
+}
+
+
+def _expand_finance_operand_tokens(query: str) -> set[str]:
+    lowered = (query or "").lower()
+    expanded: set[str] = set()
+    for metric, hints in _FINANCE_OPERAND_HINTS.items():
+        if metric in lowered:
+            for hint in hints:
+                expanded.update(_extract_keyword_tokens(hint))
+    return expanded
+
+
 def _fallback_query_terms(text: str) -> set[str]:
     terms = set()
     for token in _QUERY_ANCHOR_TOKEN_PATTERN.findall(text or ""):
@@ -1857,53 +1881,55 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         "rerank_endpoint": _get_rerank_endpoint(),
         "rerank_error": None,
         "candidate_count": len(docs_with_rank),
+        "local_rerank_enabled": _local_reranker.enabled,
+        "local_rerank_applied": False,
+        "local_rerank_error": None,
     }
-    if not docs_with_rank or not meta["rerank_enabled"]:
+    if not docs_with_rank:
         return docs_with_rank[:top_k], meta
+    if meta["rerank_enabled"]:
+        payload = {
+            "model": RERANK_MODEL,
+            "query": query,
+            "documents": [doc.get("text", "") for doc in docs_with_rank],
+            "top_n": min(top_k, len(docs_with_rank)),
+            "return_documents": False,
+        }
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {RERANK_API_KEY}"}
+        try:
+            response = requests.post(meta["rerank_endpoint"], headers=headers, json=payload, timeout=RERANK_TIMEOUT_SECONDS)
+            if response.status_code >= 400:
+                meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
+            else:
+                items = response.json().get("results", [])
+                reranked = []
+                for item in items:
+                    idx = item.get("index")
+                    if isinstance(idx, int) and 0 <= idx < len(docs_with_rank):
+                        doc = dict(docs_with_rank[idx])
+                        if item.get("relevance_score") is not None:
+                            doc["rerank_score"] = item["relevance_score"]
+                        reranked.append(doc)
+                if reranked:
+                    meta["rerank_applied"] = True
+                    return reranked[:top_k], meta
+                meta["rerank_error"] = "empty_rerank_results"
+        except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            meta["rerank_error"] = str(exc)
 
-    payload = {
-        "model": RERANK_MODEL,
-        "query": query,
-        "documents": [doc.get("text", "") for doc in docs_with_rank],
-        "top_n": min(top_k, len(docs_with_rank)),
-        "return_documents": False,
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {RERANK_API_KEY}",
-    }
-    try:
-        meta["rerank_applied"] = True
-        response = requests.post(
-            meta["rerank_endpoint"],
-            headers=headers,
-            json=payload,
-            timeout=RERANK_TIMEOUT_SECONDS,
-        )
-        if response.status_code >= 400:
-            meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
-            return docs_with_rank[:top_k], meta
-
-        items = response.json().get("results", [])
-        reranked = []
-        for item in items:
-            idx = item.get("index")
-            if isinstance(idx, int) and 0 <= idx < len(docs_with_rank):
-                doc = dict(docs_with_rank[idx])
-                score = item.get("relevance_score")
-                if score is not None:
-                    doc["rerank_score"] = score
-                reranked.append(doc)
-
-        if reranked:
-            return reranked[:top_k], meta
-
-        meta["rerank_error"] = "empty_rerank_results"
-        return docs_with_rank[:top_k], meta
-    except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-        meta["rerank_error"] = str(e)
-        return docs_with_rank[:top_k], meta
+    if _local_reranker.enabled:
+        try:
+            reranked = _local_reranker.rerank(query, docs_with_rank, top_k)
+            if reranked:
+                meta["local_rerank_applied"] = True
+                meta["rerank_applied"] = True
+                meta["rerank_model"] = str(_local_reranker.model_path)
+                meta["rerank_endpoint"] = "local_cross_encoder"
+                return reranked, meta
+            meta["local_rerank_error"] = "empty_rerank_results"
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError) as exc:
+            meta["local_rerank_error"] = str(exc)
+    return docs_with_rank[:top_k], meta
 
 
 def _select_doc_stage_documents(candidate_docs: List[dict], doc_stage_top_n: int, query_parse: Dict[str, Any]) -> List[dict]:
@@ -2032,6 +2058,11 @@ def _is_anchor_guard_enabled() -> bool:
 def _is_cover_filter_enabled() -> bool:
     """Cover/TOC filtering is a precision experiment and can remove valid filings."""
     return _parse_bool(os.getenv("RAG_COVER_FILTER_ENABLED"), False)
+
+
+def _is_page_first_enabled() -> bool:
+    """Finance baseline: discover pages before choosing their evidence chunks."""
+    return _parse_bool(os.getenv("RAG_PAGE_FIRST_ENABLED"), True)
 
 
 def _is_page_level_fusion_enabled() -> bool:
@@ -2384,7 +2415,7 @@ def _score_candidate_pages(
     query_numbers = _extract_numbers(query)
     query_years = _extract_years(query)
     query_metrics = _extract_metric_hints(query)
-    query_tokens = _extract_keyword_tokens(query)
+    query_tokens = _extract_keyword_tokens(query) | _expand_finance_operand_tokens(query)
     target_company = query_parse.get("company") or ""
     target_years = set(str(year) for year in (query_parse.get("years") or []))
     target_doc_types = set(query_parse.get("doc_types") or ([] if not query_parse.get("doc_type") else [query_parse.get("doc_type")]))
@@ -2425,7 +2456,7 @@ def _score_candidate_pages(
         )
         dense_raw = max(0.0, _dot_product(query_embedding, dense_embedding)) if dense_embedding else 0.0
         keyword_raw = token_overlap + metric_overlap + number_overlap
-        cover_penalty = config["cover_toc_penalty"] if _looks_like_cover_or_toc_chunk(
+        cover_penalty = config["cover_toc_penalty"] if _is_cover_filter_enabled() and _looks_like_cover_or_toc_chunk(
             {"page_number": page.get("page_number"), "text": page_text},
             query,
         ) else 0.0
@@ -2854,6 +2885,115 @@ def _run_two_stage_retrieval(
     return page_stage_candidates, meta
 
 
+def _build_page_first_candidates(
+    query: str,
+    chunk_candidates: List[dict],
+    *,
+    candidate_k: int,
+    config: Dict[str, Any],
+) -> tuple[List[dict], Dict[str, Any]]:
+    """Promote pages first, then return one best evidence chunk per page.
+
+    The initial hybrid search is retained only for inexpensive document
+    discovery.  This prevents a frequently mentioned but wrong chunk from
+    crowding out every other page before page-level financial signals are used.
+    """
+    if not chunk_candidates:
+        return [], {"page_first_enabled": True, "page_first_fallback": "no_chunk_candidates"}
+    query_parse = parse_finance_query(query)
+    query_parse["raw_question"] = query
+    selected_docs = _select_doc_stage_documents(
+        chunk_candidates,
+        doc_stage_top_n=config["doc_stage_top_n"],
+        query_parse=query_parse,
+    )
+    pages = _document_page_store.get_pages_by_filenames(
+        [item.get("filename") or "" for item in selected_docs],
+        warm_cache=False,
+    )
+    scored_pages, page_meta = _score_candidate_pages(query, pages, chunk_candidates, query_parse, config)
+    if _is_cover_filter_enabled():
+        scored_pages = [page for page in scored_pages if not page.get("cover_like")]
+    selected_pages = scored_pages[: max(config["page_stage_top_n"], candidate_k // 4)]
+    neighbor_window = max(0, _parse_int(os.getenv("RAG_PAGE_NEIGHBOR_WINDOW"), 0))
+    if neighbor_window and selected_pages:
+        pages_by_key = {
+            ((page.get("filename") or ""), _coerce_int(page.get("page_number")) or 0): page
+            for page in pages
+        }
+        expanded_pages = {
+            ((page.get("filename") or ""), _coerce_int(page.get("page_number")) or 0): dict(page)
+            for page in selected_pages
+        }
+        for anchor in selected_pages[:5]:
+            filename = anchor.get("filename") or ""
+            anchor_page = _coerce_int(anchor.get("page_number")) or 0
+            for delta in range(1, neighbor_window + 1):
+                for page_number in (anchor_page - delta, anchor_page + delta):
+                    neighbor = pages_by_key.get((filename, page_number))
+                    if not neighbor:
+                        continue
+                    neighbor_score = float(anchor.get("page_score", 0.0) or 0.0) - 0.02 * delta
+                    key = (filename, page_number)
+                    current = expanded_pages.get(key)
+                    if current is None or neighbor_score > float(current.get("page_score", 0.0) or 0.0):
+                        expanded_pages[key] = {
+                            **neighbor,
+                            "page_score": neighbor_score,
+                            "neighbor_page": True,
+                            "neighbor_anchor_page": anchor_page,
+                        }
+        selected_pages = sorted(expanded_pages.values(), key=lambda page: page.get("page_score", 0.0), reverse=True)
+
+    query_tokens = _extract_keyword_tokens(query) | _expand_finance_operand_tokens(query)
+    query_metrics = _extract_metric_hints(query)
+    selected_chunks: list[dict] = []
+    page_chunks: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    all_chunk_ids = [chunk_id for page in selected_pages for chunk_id in page.get("chunk_ids", []) if chunk_id]
+    for chunk in _milvus_manager.get_chunks_by_ids(list(dict.fromkeys(all_chunk_ids))):
+        page_key = ((chunk.get("filename") or ""), _coerce_int(chunk.get("page_number")) or 0)
+        page_chunks[page_key].append(chunk)
+    for page in selected_pages:
+        chunks = page_chunks.get(((page.get("filename") or ""), _coerce_int(page.get("page_number")) or 0), [])
+        if not chunks:
+            continue
+
+        def chunk_priority(chunk: dict) -> float:
+            text = chunk.get("text", "") or ""
+            return (
+                float(page.get("page_score", 0.0) or 0.0)
+                + 0.20 * _score_overlap(query_tokens, _extract_keyword_tokens(text))
+                + 0.15 * _score_overlap(query_metrics, _extract_metric_hints(text))
+            )
+
+        best_chunk = max(chunks, key=chunk_priority)
+        selected_chunks.append(
+            {
+                **best_chunk,
+                "doc_name": page.get("doc_name") or get_doc_name(page.get("filename", "")),
+                "page_score": page.get("page_score", 0.0),
+                "score": chunk_priority(best_chunk),
+                "rerank_score": chunk_priority(best_chunk),
+                "source": "page_first",
+            }
+        )
+
+    selected_chunks.sort(key=_combined_score, reverse=True)
+    selected_keys = {_doc_key(item) for item in selected_chunks}
+    fallback = [item for item in chunk_candidates if _doc_key(item) not in selected_keys]
+    return (selected_chunks + fallback)[:candidate_k], {
+        "page_first_enabled": True,
+        "page_first_selected_documents": [item.get("filename", "") for item in selected_docs],
+        "page_first_selected_pages": [
+            {"filename": item.get("filename", ""), "page_number": item.get("page_number"), "page_score": item.get("page_score", 0.0), "neighbor_page": bool(item.get("neighbor_page"))}
+            for item in selected_pages
+        ],
+        "page_first_page_count": len(pages),
+        "page_first_chunk_count": len(selected_chunks),
+        **page_meta,
+    }
+
+
 def _get_stepback_model():
     global _stepback_model
     if not ARK_API_KEY or not MODEL:
@@ -2968,6 +3108,11 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "page_anchor_filtered_count": 0,
         "page_anchor_guard_fallback_reason": "",
         "page_contributing_routes": {},
+        "page_first_enabled": False,
+        "page_first_selected_documents": [],
+        "page_first_selected_pages": [],
+        "page_first_page_count": 0,
+        "page_first_chunk_count": 0,
         "retrieve_error": None,
         "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
         "rerank_applied": False,
@@ -3034,9 +3179,25 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
             "fused_pages_after_anchor_guard": [],
             "page_anchor_guard_fallback_reason": "",
         }
+    page_first_meta: Dict[str, Any] = {}
+    if _is_page_first_enabled() and fused_docs_all:
+        try:
+            fused_docs, page_first_meta = _build_page_first_candidates(
+                query,
+                fused_docs_all,
+                candidate_k=candidate_k,
+                config=config,
+            )
+        except Exception as exc:
+            logger.exception("page-first candidate selection failed; using chunk baseline")
+            page_first_meta = {
+                "page_first_enabled": True,
+                "page_first_fallback": f"{type(exc).__name__}: {exc}",
+            }
     meta = {
         **base_meta,
         **last_meta,
+        **page_first_meta,
         "query_planner_enabled": planner_enabled,
         "planner_intent": planner.get("intent", ""),
         "planner_must_keep_terms": planner.get("must_keep_terms", []) or [],

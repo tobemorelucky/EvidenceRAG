@@ -17,4 +17,5 @@ volumes/
 .DS_Store
 data/
 reports/
+models/
 

@@ -246,7 +246,7 @@ class DocumentPageStore:
             db.close()
         return len(mappings)
 
-    def get_pages_by_filenames(self, filenames: List[str]) -> List[dict]:
+    def get_pages_by_filenames(self, filenames: List[str], *, warm_cache: bool = True) -> List[dict]:
         normalized = [item.strip() for item in filenames if item and item.strip()]
         if not normalized:
             return []
@@ -255,11 +255,12 @@ class DocumentPageStore:
         try:
             rows = db.query(DocumentPage).filter(DocumentPage.filename.in_(normalized)).all()
             results = [self._to_dict(row) for row in rows]
-            for payload in results:
-                cache.set_json(
-                    self._cache_key(payload["filename"], int(payload.get("page_number", 0) or 0)),
-                    payload,
-                )
+            if warm_cache:
+                for payload in results:
+                    cache.set_json(
+                        self._cache_key(payload["filename"], int(payload.get("page_number", 0) or 0)),
+                        payload,
+                    )
             return sorted(results, key=lambda item: ((item.get("filename") or "").lower(), int(item.get("page_number", 0) or 0)))
         finally:
             db.close()
