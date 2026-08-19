@@ -6,6 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from agent_tools import find_evidence, open_pages, select_pages
 from prompts import PROMPT_VERSION
 from query_planner import plan_retrieval_queries
 from rag_pipeline import run_rag_graph
@@ -181,6 +182,27 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             )
             final_docs = list(finalized.get("context_docs") or finalized.get("final_retrieved_docs") or final_docs)
 
+        if len(tool_calls) < config.max_tool_calls:
+            found_docs = find_evidence(question, all_candidates or initial_docs, limit=3)
+            tool_calls.append({"tool": "find", "matches": len(found_docs)})
+        else:
+            found_docs = []
+        if found_docs and len(tool_calls) < config.max_tool_calls:
+            requested_pages = select_pages(found_docs, limit=3)
+            opened_pages = open_pages(requested_pages, limit=3)
+            tool_calls.append({"tool": "open_page", "pages": len(opened_pages)})
+            opened_by_page = {
+                (item.get("filename"), item.get("page_number")): item
+                for item in opened_pages
+            }
+            final_docs = [
+                {
+                    **document,
+                    **opened_by_page.get((document.get("filename"), document.get("page_number")), {}),
+                }
+                for document in final_docs
+            ]
+
     citations = build_citations(final_docs)
     evidence_status = "sufficient" if len(citations) >= 2 else ("limited" if citations else "insufficient")
     trace.update(
@@ -209,4 +231,3 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         "evidence_status": evidence_status,
         "trace_id": trace["trace_id"],
     }
-

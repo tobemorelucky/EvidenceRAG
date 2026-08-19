@@ -9,6 +9,7 @@ analysis.
 
 import argparse
 import csv
+import faulthandler
 import hashlib
 import json
 import os
@@ -108,7 +109,7 @@ def classify_failure(gold: list[dict[str, Any]], retrieved: list[dict[str, Any]]
     return "gold_page_not_retrieved"
 
 
-def _retrieval_environment(*, enable_rerank: bool) -> None:
+def _retrieval_environment(*, enable_rerank: bool, diagnose: bool = False) -> None:
     """Disable non-retrieval branches before importing the RAG implementation."""
     os.environ["RAG_QUERY_PLANNER_ENABLED"] = "false"
     os.environ["RAG_ANCHOR_GUARD_ENABLED"] = "false"
@@ -122,6 +123,7 @@ def _retrieval_environment(*, enable_rerank: bool) -> None:
         os.environ["RERANK_API_KEY"] = ""
     os.environ["TABLE_AWARE_RETRIEVAL"] = "off"
     os.environ["RAG_EVIDENCE_GROUPING_ENABLED"] = "false"
+    os.environ["RAG_RETRIEVAL_DEBUG"] = "true" if diagnose else "false"
 
 
 def evaluate(
@@ -130,15 +132,26 @@ def evaluate(
     final_k: int,
     *,
     enable_rerank: bool = False,
+    diagnose: bool = False,
+    slow_question_seconds: int = 0,
+    on_record: Any = None,
 ) -> list[dict[str, Any]]:
-    _retrieval_environment(enable_rerank=enable_rerank)
+    _retrieval_environment(enable_rerank=enable_rerank, diagnose=diagnose)
+    print("[setup] Loading local retrieval runtime...", flush=True)
     sys.path.insert(0, str(BACKEND))
     from rag_utils import retrieve_documents
 
     results = []
+    print(f"[setup] Evaluating {len(rows)} FinanceBench questions.", flush=True)
     for index, row in enumerate(rows, 1):
         gold = parse_gold_evidence(row)
-        retrieval = retrieve_documents(row["question"], top_k=final_k, candidate_k=candidate_k, apply_page_merge=False)
+        if slow_question_seconds > 0:
+            faulthandler.dump_traceback_later(slow_question_seconds, repeat=False)
+        try:
+            retrieval = retrieve_documents(row["question"], top_k=final_k, candidate_k=candidate_k, apply_page_merge=False)
+        finally:
+            if slow_question_seconds > 0:
+                faulthandler.cancel_dump_traceback_later()
         candidates = list(retrieval.get("candidate_docs") or [])
         final_docs = list(retrieval.get("final_retrieved_docs") or retrieval.get("docs") or [])
 
@@ -193,6 +206,8 @@ def evaluate(
             "retrieval_ms": (retrieval.get("meta") or {}).get("latency_breakdown", {}).get("total_retrieval_ms"),
         }
         results.append(record)
+        if on_record:
+            on_record(results)
         print(f"[{index:02d}/{len(rows)}] {record['financebench_id']}: {record['candidate_failure']}", flush=True)
     return results
 
@@ -240,6 +255,13 @@ def main() -> None:
         action="store_true",
         help="Enable the configured rerank service; the answer model remains disabled.",
     )
+    parser.add_argument("--diagnose", action="store_true", help="Print retrieval stages for locating slow queries.")
+    parser.add_argument(
+        "--slow-question-seconds",
+        type=int,
+        default=0,
+        help="Dump the Python stack if one question exceeds this duration (0 disables it).",
+    )
     args = parser.parse_args()
 
     with args.dataset.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -254,11 +276,30 @@ def main() -> None:
     if args.limit > 0:
         rows = rows[: args.limit]
 
+    print(
+        f"[setup] split={args.split} questions={len(rows)} candidate_k={args.candidate_k} "
+        f"remote_rerank={args.enable_rerank}",
+        flush=True,
+    )
+
+    args.report_dir.mkdir(parents=True, exist_ok=True)
+    output = args.report_dir / f"financebench_retrieval_{args.split}.json"
+    checkpoint = args.report_dir / f"financebench_retrieval_{args.split}.partial.json"
+
+    def write_checkpoint(records: list[dict[str, Any]]) -> None:
+        checkpoint.write_text(
+            json.dumps({"split": args.split, "records_completed": len(records), "records": records}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     records = evaluate(
         rows,
         candidate_k=max(1, args.candidate_k),
         final_k=max(1, args.final_k),
         enable_rerank=args.enable_rerank,
+        diagnose=args.diagnose,
+        slow_question_seconds=max(0, args.slow_question_seconds),
+        on_record=write_checkpoint,
     )
     summary = build_summary(records)
     report = {
@@ -272,9 +313,8 @@ def main() -> None:
         "summary": summary,
         "records": records,
     }
-    args.report_dir.mkdir(parents=True, exist_ok=True)
-    output = args.report_dir / f"financebench_retrieval_{args.split}.json"
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    checkpoint.unlink(missing_ok=True)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"Report: {output}")
 

@@ -45,6 +45,11 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+def _retrieval_debug(message: str) -> None:
+    if _parse_bool(os.getenv("RAG_RETRIEVAL_DEBUG"), False):
+        print(f"[retrieval] {message}", flush=True)
+
 ARK_API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
@@ -2011,7 +2016,13 @@ def _retrieve_leaf_chunks(
         "retrieve_error": None,
     }
     try:
+        embedding_started = time.perf_counter()
+        _retrieval_debug(f"scope={retrieval_scope} embedding starting")
         dense_embedding, sparse_embedding = _get_hybrid_query_embeddings(query)
+        meta["query_embedding_ms"] = round((time.perf_counter() - embedding_started) * 1000, 2)
+        _retrieval_debug(f"scope={retrieval_scope} embedding_ms={meta['query_embedding_ms']}")
+        milvus_started = time.perf_counter()
+        _retrieval_debug(f"scope={retrieval_scope} milvus starting")
         retrieved = _milvus_manager.hybrid_retrieve(
             dense_embedding=dense_embedding,
             sparse_embedding=sparse_embedding,
@@ -2019,6 +2030,7 @@ def _retrieve_leaf_chunks(
             filter_expr=filter_expr,
             query_text=query,
         )
+        meta["milvus_retrieval_ms"] = round((time.perf_counter() - milvus_started) * 1000, 2)
         meta["retrieval_mode"] = "hybrid"
         meta["candidate_count"] = len(retrieved)
         return {"docs": retrieved, "meta": meta}
@@ -3145,6 +3157,7 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
     per_query_retrieval_counts: list[dict] = []
     last_meta: Dict[str, Any] = {}
     for route in routes:
+        _retrieval_debug(f"route={route['label']} starting")
         retrieved = _retrieve_leaf_chunks(
             route["query"],
             top_k=route["top_k"],
@@ -3162,6 +3175,11 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
             }
         )
         last_meta = retrieved.get("meta", {}) or {}
+        _retrieval_debug(
+            f"route={route['label']} candidates={len(retrieved.get('docs', []) or [])} "
+            f"embedding_ms={(retrieved.get('meta', {}) or {}).get('query_embedding_ms', '')} "
+            f"milvus_ms={(retrieved.get('meta', {}) or {}).get('milvus_retrieval_ms', '')}"
+        )
 
     fused_docs_all = _rrf_fuse_retrieval_routes(route_results)
     page_level_fusion_enabled = planner_enabled and _is_page_level_fusion_enabled()
@@ -3182,12 +3200,14 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
     page_first_meta: Dict[str, Any] = {}
     if _is_page_first_enabled() and fused_docs_all:
         try:
+            _retrieval_debug(f"page_first starting fused_candidates={len(fused_docs_all)}")
             fused_docs, page_first_meta = _build_page_first_candidates(
                 query,
                 fused_docs_all,
                 candidate_k=candidate_k,
                 config=config,
             )
+            _retrieval_debug(f"page_first candidates={len(fused_docs)}")
         except Exception as exc:
             logger.exception("page-first candidate selection failed; using chunk baseline")
             page_first_meta = {

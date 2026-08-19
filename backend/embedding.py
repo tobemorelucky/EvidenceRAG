@@ -361,8 +361,10 @@ class EmbeddingService:
                         active_batch_size = next_batch_size
                         self._maybe_empty_cuda_cache()
                         continue
+                    first_index = min(indexes) + 1
+                    last_index = max(indexes) + 1
                     raise Exception(
-                        f"本地嵌入模型批处理失败: batch={batch_index + 1}/{len(batches)}: {str(e)}"
+                        f"本地嵌入模型批处理失败: batch={first_index}-{last_index}: {str(e)}"
                     ) from e
                 batch_index += 1
             if any(item is None for item in embeddings):

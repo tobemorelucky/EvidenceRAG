@@ -16,14 +16,21 @@ from prompts import (
 
 
 def _create_model():
-    return init_chat_model(
-        model=os.getenv("MODEL"),
-        model_provider="openai",
-        api_key=os.getenv("ARK_API_KEY"),
-        base_url=os.getenv("BASE_URL"),
-        temperature=float(os.getenv("ANSWER_TEMPERATURE", "0.1")),
-        stream_usage=True,
-    )
+    options = {
+        "model": os.getenv("MODEL"),
+        "model_provider": "openai",
+        "api_key": os.getenv("ARK_API_KEY"),
+        "base_url": os.getenv("BASE_URL"),
+        "temperature": float(os.getenv("ANSWER_TEMPERATURE", "0.1")),
+        "stream_usage": True,
+    }
+    max_completion_tokens = os.getenv("ANSWER_MAX_COMPLETION_TOKENS")
+    if max_completion_tokens:
+        options["max_completion_tokens"] = int(max_completion_tokens)
+    thinking_mode = os.getenv("ANSWER_THINKING_MODE", "").strip().lower()
+    if thinking_mode in {"enabled", "disabled", "auto"}:
+        options["extra_body"] = {"thinking": {"type": thinking_mode}}
+    return init_chat_model(**options)
 
 
 model = _create_model()
@@ -82,4 +89,3 @@ def summarize_messages(messages: list) -> str:
         ]
     )
     return _content_text(getattr(response, "content", response))
-

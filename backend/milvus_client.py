@@ -1,6 +1,7 @@
 """Milvus 客户端 - 支持密集向量+稀疏向量混合检索"""
 import logging
 import os
+import socket
 import threading
 from typing import Callable, TypeVar
 
@@ -32,6 +33,7 @@ class MilvusManager:
         self.sparse_mode = os.getenv("MILVUS_SPARSE_MODE", "milvus_bm25").strip().lower()
         self.uses_builtin_bm25 = self.sparse_mode == "milvus_bm25" and Function is not None
         self.uri = f"http://{self.host}:{self.port}"
+        self.connect_timeout = max(1.0, float(os.getenv("MILVUS_CONNECT_TIMEOUT_SECONDS", "5")))
         self.client = None
         self._client_lock = threading.RLock()
 
@@ -81,7 +83,15 @@ class MilvusManager:
         # Lazy-create client to avoid blocking app import/startup when Milvus is temporarily unavailable.
         with self._client_lock:
             if self.client is None:
-                self.client = MilvusClient(uri=self.uri)
+                try:
+                    with socket.create_connection((self.host, int(self.port)), timeout=self.connect_timeout):
+                        pass
+                except OSError as exc:
+                    raise ConnectionError(
+                        f"Milvus is unavailable at {self.host}:{self.port}. "
+                        "Start the Milvus service before running retrieval."
+                    ) from exc
+                self.client = MilvusClient(uri=self.uri, timeout=self.connect_timeout)
             return self.client
 
     @staticmethod
