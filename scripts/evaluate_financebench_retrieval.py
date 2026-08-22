@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,15 +110,31 @@ def classify_failure(gold: list[dict[str, Any]], retrieved: list[dict[str, Any]]
     return "gold_page_not_retrieved"
 
 
-def _retrieval_environment(*, enable_rerank: bool, diagnose: bool = False) -> None:
+def _retrieval_environment(
+    *,
+    enable_rerank: bool,
+    use_local_rerank: bool = False,
+    local_rerank_candidate_k: int = 20,
+    field_aware: bool = False,
+    diagnose: bool = False,
+) -> None:
     """Disable non-retrieval branches before importing the RAG implementation."""
     os.environ["RAG_QUERY_PLANNER_ENABLED"] = "false"
     os.environ["RAG_ANCHOR_GUARD_ENABLED"] = "false"
     os.environ["RAG_COVER_FILTER_ENABLED"] = "false"
     os.environ["RAG_PAGE_FIRST_ENABLED"] = "true"
+    os.environ["RAG_FIELD_AWARE_ENABLED"] = "true" if field_aware else "false"
     os.environ["RAG_PAGE_NEIGHBOR_WINDOW"] = "0"
     os.environ["FINANCE_RAG_ENABLE_STEP_BACK"] = "false"
-    if not enable_rerank:
+    if use_local_rerank:
+        os.environ["RERANK_MODEL"] = ""
+        os.environ["RERANK_BINDING_HOST"] = ""
+        os.environ["RERANK_API_KEY"] = ""
+        os.environ["LOCAL_RERANK_ENABLED"] = "true"
+        os.environ["LOCAL_RERANK_CANDIDATE_K"] = str(max(1, local_rerank_candidate_k))
+    elif enable_rerank:
+        os.environ["LOCAL_RERANK_ENABLED"] = "true"
+    elif not enable_rerank:
         os.environ["RERANK_MODEL"] = ""
         os.environ["RERANK_BINDING_HOST"] = ""
         os.environ["RERANK_API_KEY"] = ""
@@ -132,11 +149,21 @@ def evaluate(
     final_k: int,
     *,
     enable_rerank: bool = False,
+    use_local_rerank: bool = False,
+    local_rerank_candidate_k: int = 20,
+    rerank_interval_seconds: float = 0.0,
+    field_aware: bool = False,
     diagnose: bool = False,
     slow_question_seconds: int = 0,
     on_record: Any = None,
 ) -> list[dict[str, Any]]:
-    _retrieval_environment(enable_rerank=enable_rerank, diagnose=diagnose)
+    _retrieval_environment(
+        enable_rerank=enable_rerank,
+        use_local_rerank=use_local_rerank,
+        local_rerank_candidate_k=local_rerank_candidate_k,
+        field_aware=field_aware,
+        diagnose=diagnose,
+    )
     print("[setup] Loading local retrieval runtime...", flush=True)
     sys.path.insert(0, str(BACKEND))
     from rag_utils import retrieve_documents
@@ -192,13 +219,19 @@ def evaluate(
             "page_first_trace": {
                 "selected_documents": (retrieval.get("meta") or {}).get("page_first_selected_documents", []),
                 "selected_pages": (retrieval.get("meta") or {}).get("page_first_selected_pages", []),
+                "anchor_window": (retrieval.get("meta") or {}).get("page_first_anchor_window", 0),
                 "fallback": (retrieval.get("meta") or {}).get("page_first_fallback", ""),
             },
+            "evidence_coverage": (retrieval.get("meta") or {}).get("evidence_coverage", {}),
             "rerank": {
                 "enabled": bool((retrieval.get("meta") or {}).get("rerank_enabled")),
                 "applied": bool((retrieval.get("meta") or {}).get("rerank_applied")),
                 "model": (retrieval.get("meta") or {}).get("rerank_model"),
+                "provider": (retrieval.get("meta") or {}).get("rerank_provider"),
                 "error": (retrieval.get("meta") or {}).get("rerank_error"),
+                "remote_candidate_count": (retrieval.get("meta") or {}).get("remote_rerank_candidate_count"),
+                "remote_input_chars": (retrieval.get("meta") or {}).get("remote_rerank_input_chars"),
+                "remote_rate_limited": bool((retrieval.get("meta") or {}).get("remote_rerank_rate_limited")),
                 "local_enabled": bool((retrieval.get("meta") or {}).get("local_rerank_enabled")),
                 "local_applied": bool((retrieval.get("meta") or {}).get("local_rerank_applied")),
                 "local_error": (retrieval.get("meta") or {}).get("local_rerank_error"),
@@ -209,6 +242,9 @@ def evaluate(
         if on_record:
             on_record(results)
         print(f"[{index:02d}/{len(rows)}] {record['financebench_id']}: {record['candidate_failure']}", flush=True)
+        if enable_rerank and rerank_interval_seconds > 0 and index < len(rows):
+            print(f"[rate-limit] waiting {rerank_interval_seconds:.1f}s before the next remote rerank request", flush=True)
+            time.sleep(rerank_interval_seconds)
     return results
 
 
@@ -255,6 +291,28 @@ def main() -> None:
         action="store_true",
         help="Enable the configured rerank service; the answer model remains disabled.",
     )
+    parser.add_argument(
+        "--use-local-rerank",
+        action="store_true",
+        help="Use the local cross-encoder only; no request is made to the remote rerank service.",
+    )
+    parser.add_argument(
+        "--local-rerank-candidate-k",
+        type=int,
+        default=20,
+        help="Number of retrieved chunks scored by --use-local-rerank.",
+    )
+    parser.add_argument(
+        "--rerank-interval-seconds",
+        type=float,
+        default=0.0,
+        help="Wait between remote rerank requests during retrieval-only evaluation (production is unaffected).",
+    )
+    parser.add_argument(
+        "--field-aware",
+        action="store_true",
+        help="Use the anchor ±1 context experiment and emit field-coverage traces.",
+    )
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval stages for locating slow queries.")
     parser.add_argument(
         "--slow-question-seconds",
@@ -263,6 +321,8 @@ def main() -> None:
         help="Dump the Python stack if one question exceeds this duration (0 disables it).",
     )
     args = parser.parse_args()
+    if args.enable_rerank and args.use_local_rerank:
+        parser.error("--enable-rerank and --use-local-rerank are mutually exclusive.")
 
     with args.dataset.open("r", encoding="utf-8-sig", newline="") as handle:
         all_rows = list(csv.DictReader(handle))
@@ -278,7 +338,8 @@ def main() -> None:
 
     print(
         f"[setup] split={args.split} questions={len(rows)} candidate_k={args.candidate_k} "
-        f"remote_rerank={args.enable_rerank}",
+        f"remote_rerank={args.enable_rerank} local_rerank={args.use_local_rerank} "
+        f"field_aware={args.field_aware}",
         flush=True,
     )
 
@@ -297,6 +358,10 @@ def main() -> None:
         candidate_k=max(1, args.candidate_k),
         final_k=max(1, args.final_k),
         enable_rerank=args.enable_rerank,
+        use_local_rerank=args.use_local_rerank,
+        local_rerank_candidate_k=max(1, args.local_rerank_candidate_k),
+        rerank_interval_seconds=max(0.0, args.rerank_interval_seconds),
+        field_aware=args.field_aware,
         diagnose=args.diagnose,
         slow_question_seconds=max(0, args.slow_question_seconds),
         on_record=write_checkpoint,
@@ -310,6 +375,10 @@ def main() -> None:
         "final_k": args.final_k,
         "limit": args.limit,
         "rerank_enabled": args.enable_rerank,
+        "local_rerank_enabled": args.use_local_rerank,
+        "local_rerank_candidate_k": max(1, args.local_rerank_candidate_k),
+        "rerank_interval_seconds": max(0.0, args.rerank_interval_seconds),
+        "field_aware": args.field_aware,
         "summary": summary,
         "records": records,
     }

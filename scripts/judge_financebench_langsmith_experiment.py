@@ -32,14 +32,46 @@ def _content_text(content) -> str:
 
 
 def _judge_model():
-    return init_chat_model(
-        model=os.getenv("JUDGE_MODEL", "deepseek-v4-pro-ga-260813"),
-        model_provider="openai",
-        api_key=os.getenv("JUDGE_API_KEY") or os.getenv("ARK_API_KEY"),
-        base_url=os.getenv("JUDGE_BASE_URL") or os.getenv("BASE_URL"),
-        temperature=0,
-        max_completion_tokens=int(os.getenv("JUDGE_MAX_COMPLETION_TOKENS", "512")),
+    options = {
+        "model": os.getenv("JUDGE_MODEL", "deepseek-v4-pro-ga-260813"),
+        "model_provider": "openai",
+        "api_key": os.getenv("JUDGE_API_KEY") or os.getenv("ARK_API_KEY"),
+        "base_url": os.getenv("JUDGE_BASE_URL") or os.getenv("BASE_URL"),
+        "temperature": 0,
+        "max_completion_tokens": int(os.getenv("JUDGE_MAX_COMPLETION_TOKENS", "512")),
+    }
+    thinking_mode = os.getenv("JUDGE_THINKING_MODE", "disabled").strip().lower()
+    if thinking_mode in {"enabled", "disabled", "auto"}:
+        options["extra_body"] = {"thinking": {"type": thinking_mode}}
+    return init_chat_model(**options)
+
+
+def _judge_once(model, prompt: str) -> dict:
+    response = model.invoke(prompt)
+    return _parse_verdict(_content_text(getattr(response, "content", response)))
+
+
+def _judge_with_retry(model, prompt: str) -> dict:
+    verdict = _judge_once(model, prompt)
+    if verdict["verdict"] != "invalid_judge_output":
+        return verdict
+    retry_prompt = (
+        "Return exactly one JSON object and no other text. "
+        "The allowed keys are score, verdict, reason. score must be 0 or 1.\n\n"
+        + prompt
     )
+    retry = _judge_once(model, retry_prompt)
+    retry["retried"] = True
+    return retry
+
+
+def _requested_run_ids(values: list[str] | None) -> set[str]:
+    return {
+        item.strip()
+        for value in (values or [])
+        for item in value.split(",")
+        if item.strip()
+    }
 
 
 def _parse_verdict(text: str) -> dict:
@@ -56,10 +88,15 @@ def main() -> None:
     parser.add_argument("--experiment-name", required=True)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output", type=Path, default=ROOT / "reports" / "financebench_judge.jsonl")
+    parser.add_argument("--run-id", action="append", help="Judge only this LangSmith root run ID; repeat or comma-separate values.")
+    parser.add_argument("--append", action="store_true", help="Append selected re-judged runs to an existing JSONL output.")
     args = parser.parse_args()
 
     client = Client()
     runs = list(client.list_runs(project_name=args.experiment_name, is_root=True))
+    requested_ids = _requested_run_ids(args.run_id)
+    if requested_ids:
+        runs = [run for run in runs if str(run.id) in requested_ids]
     if args.limit > 0:
         runs = runs[: args.limit]
     if not runs:
@@ -67,20 +104,18 @@ def main() -> None:
     model = _judge_model()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     print(f"[setup] experiment={args.experiment_name} runs={len(runs)} judge={os.getenv('JUDGE_MODEL', 'deepseek-v4-pro-ga-260813')}", flush=True)
-    with args.output.open("w", encoding="utf-8") as handle:
+    with args.output.open("a" if args.append else "w", encoding="utf-8") as handle:
         for index, run in enumerate(runs, 1):
             example = client.read_example(run.reference_example_id)
             inputs = getattr(example, "inputs", None) or {}
             expected = getattr(example, "outputs", None) or {}
             outputs = getattr(run, "outputs", None) or {}
-            response = model.invoke(
-                JUDGE_PROMPT.format(
-                    question=inputs.get("question", ""),
-                    reference=expected.get("answer", ""),
-                    answer=outputs.get("answer", ""),
-                )
+            prompt = JUDGE_PROMPT.format(
+                question=inputs.get("question", ""),
+                reference=expected.get("answer", ""),
+                answer=outputs.get("answer", ""),
             )
-            verdict = _parse_verdict(_content_text(getattr(response, "content", response)))
+            verdict = _judge_with_retry(model, prompt)
             client.create_feedback(
                 run_id=run.id,
                 key="answer_correctness_v4_pro",
@@ -89,7 +124,13 @@ def main() -> None:
                 comment=verdict["reason"],
                 source_info={"model": os.getenv("JUDGE_MODEL", "deepseek-v4-pro-ga-260813")},
             )
-            record = {"run_id": str(run.id), "reference_example_id": str(run.reference_example_id), **verdict}
+            record = {
+                "run_id": str(run.id),
+                "reference_example_id": str(run.reference_example_id),
+                "judge_model": os.getenv("JUDGE_MODEL", "deepseek-v4-pro-ga-260813"),
+                "thinking": os.getenv("JUDGE_THINKING_MODE", "disabled"),
+                **verdict,
+            }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
             print(f"[{index:02d}/{len(runs)}] {verdict['verdict']}", flush=True)

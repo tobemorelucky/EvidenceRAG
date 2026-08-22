@@ -83,6 +83,23 @@ METRIC_ALIASES = {
     "liabilities": ["liabilities"],
 }
 
+FIELD_ALIASES = {
+    "cash_from_operations": ["net cash provided by operating activities", "cash from operations", "cash flows from operating activities"],
+    "current_assets": ["total current assets", "current assets"],
+    "current_liabilities": ["total current liabilities", "current liabilities"],
+    "cash_and_equivalents": ["cash and cash equivalents", "cash equivalents"],
+    "short_term_investments": ["short-term investments", "short term investments", "marketable securities"],
+    "accounts_receivable": ["accounts receivable", "trade receivables", "receivables, net"],
+    "inventory": ["inventory", "inventories"],
+    "revenue": ["net revenue", "net revenues", "net sales", "total revenue", "total revenues", "revenue"],
+    "operating_income": ["operating income", "income from operations", "operating profit"],
+    "net_income": ["net income", "net earnings"],
+    "total_assets": ["total assets"],
+    "ppe": ["property, plant and equipment", "property and equipment", "net pp&e", "net ppe"],
+    "depreciation_amortization": ["depreciation and amortization", "depreciation, amortization"],
+    "capital_expenditures": ["capital expenditures", "capital expenditure", "capital spending", "purchases of property"],
+}
+
 DOC_TYPE_ALIASES = {
     "10-K": ["10-k", "10 k"],
     "10-Q": ["10-q", "10 q"],
@@ -177,9 +194,72 @@ def extract_metrics(question: str) -> List[str]:
     return metrics
 
 
+def infer_task_spec(question: str) -> Dict[str, object]:
+    """Infer deterministic FinanceBench-style calculation requirements without an LLM call."""
+    text = (question or "").lower()
+    if "quick ratio" in text:
+        return {"task_type": "calculation", "required_fields": ["cash_and_equivalents", "short_term_investments", "accounts_receivable", "current_liabilities"], "formula": "(cash_and_equivalents + short_term_investments + accounts_receivable) / current_liabilities"}
+    if "operating cash flow ratio" in text:
+        return {"task_type": "calculation", "required_fields": ["cash_from_operations", "current_liabilities"], "formula": "cash_from_operations / current_liabilities"}
+    if "working capital ratio" in text:
+        return {"task_type": "calculation", "required_fields": ["current_assets", "current_liabilities"], "formula": "current_assets / current_liabilities"}
+    if "fixed asset turnover" in text:
+        return {"task_type": "calculation", "required_fields": ["revenue", "ppe"], "formula": "revenue / average(ppe)"}
+    if "return on assets" in text or re.search(r"\broa\b", text):
+        return {"task_type": "calculation", "required_fields": ["net_income", "total_assets"], "formula": "net_income / average(total_assets)"}
+    if "operating margin" in text:
+        return {"task_type": "calculation", "required_fields": ["operating_income", "revenue"], "formula": "operating_income / revenue"}
+    if "depreciation" in text and "margin" in text:
+        return {"task_type": "calculation", "required_fields": ["depreciation_amortization", "revenue"], "formula": "depreciation_amortization / revenue"}
+    if "ebitda" in text and ("capex" in text or "capital expenditure" in text or "capital spending" in text):
+        return {"task_type": "calculation", "required_fields": ["operating_income", "depreciation_amortization", "capital_expenditures"], "formula": "operating_income + depreciation_amortization - capital_expenditures"}
+    if any(marker in text for marker in ("highest", "lowest", "largest", "smallest", "which region", "which segment")):
+        return {"task_type": "selection", "required_fields": [], "formula": ""}
+    if any(marker in text for marker in ("increase", "decrease", "change", "compare", "between", "versus", " vs ")):
+        return {"task_type": "comparison", "required_fields": [], "formula": ""}
+    return {"task_type": "lookup", "required_fields": [], "formula": ""}
+
+
+def build_required_field_query(question: str) -> str:
+    """Add required statement labels to a calculation query without an LLM rewrite."""
+    task_spec = infer_task_spec(question)
+    required_fields = list(task_spec.get("required_fields") or [])
+    if not required_fields:
+        return ""
+    labels = [FIELD_ALIASES[field][0] for field in required_fields if FIELD_ALIASES.get(field)]
+    return f"{question}\nRequired financial statement fields: {'; '.join(labels)}"
+
+
+def assess_required_field_coverage(task_spec: Dict[str, object], documents: List[Dict[str, object]]) -> Dict[str, object]:
+    """Report whether retrieved evidence contains each required field; never triggers another search."""
+    required_fields = list(task_spec.get("required_fields") or [])
+    context = "\n".join(str(document.get("text") or document.get("page_text") or "") for document in documents)
+    lowered = context.lower()
+    matched = {
+        field: next((alias for alias in FIELD_ALIASES.get(field, []) if alias in lowered), "")
+        for field in required_fields
+    }
+    missing = [field for field, alias in matched.items() if not alias]
+    if not required_fields or not missing:
+        status = "complete"
+    elif len(missing) == len(required_fields):
+        status = "insufficient"
+    else:
+        status = "partial"
+    return {
+        "task_type": task_spec.get("task_type", "lookup"),
+        "formula": task_spec.get("formula", ""),
+        "required_fields": required_fields,
+        "matched_fields": {field: alias for field, alias in matched.items() if alias},
+        "missing_fields": missing,
+        "status": status,
+        "supplemental_search_attempted": False,
+    }
+
+
 def parse_query(question: str) -> Dict[str, object]:
     company_match = detect_company(question)
-    return {
+    parsed = {
         "company": company_match.company if company_match else "",
         "matched_company_alias": company_match.matched_alias if company_match else "",
         "company_match_method": company_match.method if company_match else "",
@@ -189,6 +269,7 @@ def parse_query(question: str) -> Dict[str, object]:
         "doc_types": extract_doc_types(question),
         "metrics": extract_metrics(question),
     }
+    return {**parsed, **infer_task_spec(question)}
 
 
 def company_aliases_for(company: str) -> List[str]:

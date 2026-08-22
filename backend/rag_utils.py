@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 
 import requests
@@ -25,7 +26,12 @@ from finance_rag_features import (
     normalize_doc_name,
     parse_finance_query,
 )
-from query_parser import matches_company_text
+from query_parser import (
+    assess_required_field_coverage,
+    build_required_field_query,
+    infer_task_spec,
+    matches_company_text,
+)
 from query_planner import plan_retrieval_queries
 from milvus_client import MilvusManager
 from parent_chunk_store import ParentChunkStore
@@ -57,6 +63,9 @@ RERANK_MODEL = os.getenv("RERANK_MODEL")
 RERANK_BINDING_HOST = os.getenv("RERANK_BINDING_HOST")
 RERANK_API_KEY = os.getenv("RERANK_API_KEY")
 RERANK_TIMEOUT_SECONDS = max(1.0, float(os.getenv("RERANK_TIMEOUT_SECONDS", "5")))
+RERANK_REMOTE_CANDIDATE_K = max(1, int(os.getenv("RERANK_REMOTE_CANDIDATE_K", "16")))
+RERANK_REMOTE_MAX_CHARS = max(256, int(os.getenv("RERANK_REMOTE_MAX_CHARS", "1600")))
+RERANK_REMOTE_MIN_INTERVAL_SECONDS = max(0.0, float(os.getenv("RERANK_REMOTE_MIN_INTERVAL_SECONDS", "4")))
 
 AUTO_MERGE_ENABLED = os.getenv("AUTO_MERGE_ENABLED", "false").lower() == "true"
 AUTO_MERGE_THRESHOLD = int(os.getenv("AUTO_MERGE_THRESHOLD", "2"))
@@ -83,6 +92,8 @@ _table_store = TableStore()
 _local_reranker = LocalReranker()
 
 _stepback_model = None
+_rerank_request_lock = threading.Lock()
+_last_remote_rerank_started_at = 0.0
 
 
 def _get_hybrid_query_embeddings(query: str) -> tuple[list[float], dict | None]:
@@ -1886,6 +1897,10 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         "rerank_endpoint": _get_rerank_endpoint(),
         "rerank_error": None,
         "candidate_count": len(docs_with_rank),
+        "remote_rerank_candidate_count": 0,
+        "remote_rerank_input_chars": 0,
+        "remote_rerank_rate_limited": False,
+        "rerank_provider": "none",
         "local_rerank_enabled": _local_reranker.enabled,
         "local_rerank_applied": False,
         "local_rerank_error": None,
@@ -1893,30 +1908,47 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
     if not docs_with_rank:
         return docs_with_rank[:top_k], meta
     if meta["rerank_enabled"]:
+        remote_docs = docs_with_rank[:RERANK_REMOTE_CANDIDATE_K]
+        remote_texts = [str(doc.get("text", "") or "")[:RERANK_REMOTE_MAX_CHARS] for doc in remote_docs]
+        meta["remote_rerank_candidate_count"] = len(remote_docs)
+        meta["remote_rerank_input_chars"] = sum(len(text) for text in remote_texts)
         payload = {
             "model": RERANK_MODEL,
             "query": query,
-            "documents": [doc.get("text", "") for doc in docs_with_rank],
-            "top_n": min(top_k, len(docs_with_rank)),
+            "documents": remote_texts,
+            "top_n": min(top_k, len(remote_docs)),
             "return_documents": False,
         }
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {RERANK_API_KEY}"}
         try:
-            response = requests.post(meta["rerank_endpoint"], headers=headers, json=payload, timeout=RERANK_TIMEOUT_SECONDS)
+            global _last_remote_rerank_started_at
+            with _rerank_request_lock:
+                remaining = RERANK_REMOTE_MIN_INTERVAL_SECONDS - (time.monotonic() - _last_remote_rerank_started_at)
+                if remaining > 0:
+                    time.sleep(remaining)
+                _last_remote_rerank_started_at = time.monotonic()
+                response = requests.post(
+                    meta["rerank_endpoint"],
+                    headers=headers,
+                    json=payload,
+                    timeout=RERANK_TIMEOUT_SECONDS,
+                )
             if response.status_code >= 400:
                 meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
+                meta["remote_rerank_rate_limited"] = response.status_code == 429
             else:
                 items = response.json().get("results", [])
                 reranked = []
                 for item in items:
                     idx = item.get("index")
-                    if isinstance(idx, int) and 0 <= idx < len(docs_with_rank):
-                        doc = dict(docs_with_rank[idx])
+                    if isinstance(idx, int) and 0 <= idx < len(remote_docs):
+                        doc = dict(remote_docs[idx])
                         if item.get("relevance_score") is not None:
                             doc["rerank_score"] = item["relevance_score"]
                         reranked.append(doc)
                 if reranked:
                     meta["rerank_applied"] = True
+                    meta["rerank_provider"] = "remote"
                     return reranked[:top_k], meta
                 meta["rerank_error"] = "empty_rerank_results"
         except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
@@ -1930,6 +1962,7 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
                 meta["rerank_applied"] = True
                 meta["rerank_model"] = str(_local_reranker.model_path)
                 meta["rerank_endpoint"] = "local_cross_encoder"
+                meta["rerank_provider"] = "local_fallback" if meta["rerank_error"] else "local"
                 return reranked, meta
             meta["local_rerank_error"] = "empty_rerank_results"
         except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError) as exc:
@@ -2077,6 +2110,11 @@ def _is_page_first_enabled() -> bool:
     return _parse_bool(os.getenv("RAG_PAGE_FIRST_ENABLED"), True)
 
 
+def _is_field_aware_enabled() -> bool:
+    """Enable the controlled anchor-window and evidence-coverage experiment."""
+    return _parse_bool(os.getenv("RAG_FIELD_AWARE_ENABLED"), False)
+
+
 def _is_page_level_fusion_enabled() -> bool:
     return _parse_bool(os.getenv("RAG_PAGE_LEVEL_FUSION"), True)
 
@@ -2085,6 +2123,7 @@ def _build_retrieval_routes(
     original_query: str,
     candidate_k: int,
     planner: Dict[str, Any],
+    field_aware_query: str = "",
 ) -> list[dict]:
     planner = planner or {}
     routes: list[dict] = [
@@ -2120,6 +2159,7 @@ def _build_retrieval_routes(
     _append(planner.get("evidence_field_queries") or [], "evidence_field", 0.85, "evidence_field")
     _append(planner.get("table_heading_queries") or [], "table_heading", 0.55, "table_heading")
     _append(planner.get("keyword_queries") or [], "keyword", 0.65, "keyword")
+    _append([field_aware_query], "required_fields", 0.90, "required_fields")
     return routes
 
 
@@ -2913,6 +2953,7 @@ def _build_page_first_candidates(
     if not chunk_candidates:
         return [], {"page_first_enabled": True, "page_first_fallback": "no_chunk_candidates"}
     query_parse = parse_finance_query(query)
+    query_parse.update(infer_task_spec(query))
     query_parse["raw_question"] = query
     selected_docs = _select_doc_stage_documents(
         chunk_candidates,
@@ -2979,16 +3020,18 @@ def _build_page_first_candidates(
             )
 
         best_chunk = max(chunks, key=chunk_priority)
-        selected_chunks.append(
-            {
-                **best_chunk,
-                "doc_name": page.get("doc_name") or get_doc_name(page.get("filename", "")),
-                "page_score": page.get("page_score", 0.0),
-                "score": chunk_priority(best_chunk),
-                "rerank_score": chunk_priority(best_chunk),
-                "source": "page_first",
-            }
-        )
+        for chunk in [best_chunk]:
+            selected_chunks.append(
+                {
+                    **chunk,
+                    "doc_name": page.get("doc_name") or get_doc_name(page.get("filename", "")),
+                    "page_score": page.get("page_score", 0.0),
+                    "score": chunk_priority(chunk),
+                    "rerank_score": chunk_priority(chunk),
+                    "source": "page_first_anchor" if _is_field_aware_enabled() else "page_first",
+                    "anchor_chunk_id": best_chunk.get("chunk_id", ""),
+                }
+            )
 
     selected_chunks.sort(key=_combined_score, reverse=True)
     selected_keys = {_doc_key(item) for item in selected_chunks}
@@ -3002,6 +3045,7 @@ def _build_page_first_candidates(
         ],
         "page_first_page_count": len(pages),
         "page_first_chunk_count": len(selected_chunks),
+        "page_first_anchor_window": 1 if _is_field_aware_enabled() else 0,
         **page_meta,
     }
 
@@ -3152,7 +3196,8 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "constraints": [],
         "parse_error": "",
     }
-    routes = _build_retrieval_routes(query, candidate_k, planner)
+    field_aware_query = build_required_field_query(query) if _is_field_aware_enabled() else ""
+    routes = _build_retrieval_routes(query, candidate_k, planner, field_aware_query)
     route_results: list[dict] = []
     per_query_retrieval_counts: list[dict] = []
     last_meta: Dict[str, Any] = {}
@@ -3228,7 +3273,8 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "planner_keyword_queries": planner.get("keyword_queries", []) or [],
         "planner_table_queries": planner.get("table_heading_queries", []) or [],
         "planner_validation_dropped_queries": planner.get("planner_validation_dropped_queries", []) or [],
-        "planner_parse_error": planner.get("parse_error", ""),
+            "planner_parse_error": planner.get("parse_error", ""),
+            "field_aware_query": field_aware_query,
         "per_query_retrieval_counts": per_query_retrieval_counts,
         "rrf_fused_candidate_count": len(fused_docs_all),
         "page_level_fusion_enabled": page_level_fusion_enabled,
@@ -3605,6 +3651,7 @@ def finalize_retrieved_documents(
     if experimental_mode:
         t_parse = time.perf_counter()
         query_parse = parse_finance_query(query)
+        query_parse.update(infer_task_spec(query))
         query_parse["raw_question"] = query
         query_parse_ms = round((time.perf_counter() - t_parse) * 1000, 2)
         stage_two_meta["query_parse"] = query_parse
@@ -3805,11 +3852,14 @@ def retrieve_documents(
     started_at = time.perf_counter()
     table_aware_config = get_table_aware_retrieval_config()
     candidates = retrieve_candidate_documents(query, candidate_k=candidate_k)
+    field_aware = _is_field_aware_enabled()
     finalized = finalize_retrieved_documents(
         query,
         candidates.get("docs", []),
         final_top_k=top_k,
-        enable_page_merge=apply_page_merge,
+        enable_page_merge=apply_page_merge or field_aware,
+        adjacent_page_window=0 if field_aware else None,
+        adjacent_chunk_window=1 if field_aware else None,
     )
     context_docs = list(finalized.get("context_docs", []) or [])
     combined_meta = {**(candidates.get("meta", {}) or {}), **(finalized.get("meta", {}) or {})}
@@ -3822,6 +3872,10 @@ def retrieve_documents(
     if table_aware_config["mode"] != "off" and evidence_group_docs:
         context_docs = evidence_group_docs
     meta = {**combined_meta, **table_context_meta}
+    task_spec = (meta.get("query_parse") or {})
+    if not task_spec.get("task_type"):
+        task_spec = infer_task_spec(query)
+    meta["evidence_coverage"] = assess_required_field_coverage(task_spec, context_docs)
     meta["latency_breakdown"] = {
         **(candidates.get("meta", {}).get("latency_breakdown", {}) or {}),
         **(finalized.get("meta", {}).get("latency_breakdown", {}) or {}),
@@ -3862,6 +3916,8 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
         "query_parse": meta.get("query_parse", {}),
         "rag_trace": {
             "retrieval_mode": meta.get("retrieval_mode", "baseline"),
+            "field_aware_enabled": _is_field_aware_enabled(),
+            "evidence_coverage": meta.get("evidence_coverage", {}),
             "query_planner_enabled": meta.get("query_planner_enabled", False),
             "planner_intent": meta.get("planner_intent", ""),
             "planner_must_keep_terms": meta.get("planner_must_keep_terms", []) or [],

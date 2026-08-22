@@ -49,6 +49,21 @@ def _install_rag_utils_stubs():
     query_parser = types.ModuleType("query_parser")
     query_parser.company_aliases_for = lambda company: []
     query_parser.matches_company_text = lambda *args, **kwargs: False
+    query_parser.infer_task_spec = lambda query: {
+        "task_type": "lookup",
+        "formula": "",
+        "required_fields": [],
+    }
+    query_parser.build_required_field_query = lambda query: ""
+    query_parser.assess_required_field_coverage = lambda *args, **kwargs: {
+        "task_type": "lookup",
+        "formula": "",
+        "required_fields": [],
+        "matched_fields": {},
+        "missing_fields": [],
+        "status": "complete",
+        "supplemental_search_attempted": False,
+    }
     sys.modules["query_parser"] = query_parser
 
     query_planner = types.ModuleType("query_planner")

@@ -5,6 +5,7 @@ import csv
 import faulthandler
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -41,10 +42,16 @@ def _development_ids(rows: list[dict[str, str]], size: int = 20) -> set[str]:
     return {row.get("financebench_id") or "" for row in selected}
 
 
-def _configure_static_baseline(max_completion_tokens: int, thinking_mode: str, diagnose: bool) -> None:
+def _configure_static_baseline(
+    max_completion_tokens: int,
+    thinking_mode: str,
+    diagnose: bool,
+    field_aware: bool,
+    enable_rerank: bool,
+    local_rerank_fallback: bool,
+) -> None:
     """Freeze the baseline before importing any backend module."""
-    os.environ.update(
-        {
+    settings = {
             "RAG_QUERY_PLANNER_ENABLED": "false",
             "FINANCE_RAG_ENABLE_STEP_BACK": "false",
             "RAG_EXECUTION_MODE": "static",
@@ -52,6 +59,7 @@ def _configure_static_baseline(max_completion_tokens: int, thinking_mode: str, d
             "FINANCE_RAG_CANDIDATE_K": "40",
             "FINANCE_RAG_FINAL_TOP_K": "5",
             "RAG_PAGE_FIRST_ENABLED": "true",
+            "RAG_FIELD_AWARE_ENABLED": "true" if field_aware else "false",
             "RAG_PAGE_NEIGHBOR_WINDOW": "0",
             "RAG_ANCHOR_GUARD_ENABLED": "false",
             "RAG_COVER_FILTER_ENABLED": "false",
@@ -61,16 +69,23 @@ def _configure_static_baseline(max_completion_tokens: int, thinking_mode: str, d
             "AUTO_MERGE_ENABLED": "false",
             "TABLE_AWARE_RETRIEVAL": "off",
             "RAG_EVIDENCE_GROUPING_ENABLED": "false",
-            "RERANK_MODEL": "",
-            "RERANK_BINDING_HOST": "",
-            "RERANK_API_KEY": "",
-            "LOCAL_RERANK_ENABLED": "false",
             "ANSWER_MAX_COMPLETION_TOKENS": str(max_completion_tokens),
             "ANSWER_THINKING_MODE": thinking_mode,
             "ANSWER_TEMPERATURE": "0",
             "RAG_RETRIEVAL_DEBUG": "true" if diagnose else "false",
-        }
-    )
+    }
+    if not enable_rerank:
+        settings.update(
+            {
+                "RERANK_MODEL": "",
+                "RERANK_BINDING_HOST": "",
+                "RERANK_API_KEY": "",
+                "LOCAL_RERANK_ENABLED": "false",
+            }
+        )
+    elif local_rerank_fallback:
+        settings["LOCAL_RERANK_ENABLED"] = "true"
+    os.environ.update(settings)
 
 
 def _normalized_document_name(value: object) -> str:
@@ -109,12 +124,55 @@ def main() -> None:
     parser.add_argument("--max-completion-tokens", type=int, default=512)
     parser.add_argument("--thinking", choices=("disabled", "auto", "enabled"), default="disabled")
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval and generation stage timing.")
+    parser.add_argument(
+        "--field-aware",
+        action="store_true",
+        help="Enable anchor ±1 context selection and required-field coverage tracing.",
+    )
+    parser.add_argument(
+        "--enable-rerank",
+        action="store_true",
+        help="Use the configured remote reranker and preserve a local reranker fallback.",
+    )
+    parser.add_argument(
+        "--disable-local-rerank-fallback",
+        action="store_true",
+        help="With --enable-rerank, do not fall back to the local cross-encoder after a remote failure.",
+    )
     parser.add_argument("--slow-question-seconds", type=int, default=90, help="Dump a stack trace after this many seconds per question (0 disables it).")
     parser.add_argument("--output", type=Path, help="Write each completed answer, citations, and trace to JSONL.")
+    parser.add_argument(
+        "--skip-auto-judge",
+        action="store_true",
+        help="Do not run the configured FinanceBench judge after a successful experiment.",
+    )
+    parser.add_argument(
+        "--judge-output",
+        type=Path,
+        help="Optional JSONL destination for automatic judge results.",
+    )
     parser.add_argument("--resume", action="store_true", help="Skip completed FinanceBench IDs in --output.")
+    parser.add_argument(
+        "--retry-empty-retrieval-from",
+        type=Path,
+        help="Run only IDs whose prior JSONL trace had zero fused retrieval candidates.",
+    )
+    parser.add_argument(
+        "--retry-delay-seconds",
+        type=float,
+        default=2.0,
+        help="One-time wait before retrying a failed zero-candidate retrieval.",
+    )
     args = parser.parse_args()
 
-    _configure_static_baseline(args.max_completion_tokens, args.thinking, args.diagnose)
+    _configure_static_baseline(
+        args.max_completion_tokens,
+        args.thinking,
+        args.diagnose,
+        args.field_aware,
+        args.enable_rerank,
+        not args.disable_local_rerank_fallback,
+    )
     with DATA_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
         source_rows = list(csv.DictReader(handle))
     id_by_question = {row.get("question", ""): row.get("financebench_id", "") for row in source_rows}
@@ -135,6 +193,23 @@ def main() -> None:
         ]
     if args.limit > 0:
         examples = examples[: args.limit]
+    if args.retry_empty_retrieval_from:
+        if not args.retry_empty_retrieval_from.exists():
+            raise SystemExit(f"Retry source does not exist: {args.retry_empty_retrieval_from}")
+        retry_ids = set()
+        for line in args.retry_empty_retrieval_from.read_text(encoding="utf-8").splitlines():
+            try:
+                prior = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            trace = prior.get("rag_trace") or {}
+            if trace.get("rrf_fused_candidate_count") == 0:
+                retry_ids.add(prior.get("financebench_id"))
+        examples = [
+            example
+            for example in examples
+            if (getattr(example, "metadata", None) or {}).get("financebench_id") in retry_ids
+        ]
     if args.resume:
         if not args.output:
             raise SystemExit("--resume requires --output.")
@@ -167,6 +242,15 @@ def main() -> None:
     def retrieve(question: str) -> dict:
         return prepare_rag_response(question, profile="finance", mode="static")
 
+    def failed_empty_retrieval(prepared: dict) -> bool:
+        trace = prepared.get("rag_trace") or {}
+        route_counts = trace.get("per_query_retrieval_counts") or []
+        return trace.get("rrf_fused_candidate_count") == 0 and any(
+            entry.get("retrieval_mode") == "failed"
+            for entry in route_counts
+            if isinstance(entry, dict)
+        )
+
     @traceable(name="EvidenceRAG.generate", run_type="llm")
     def generate(question: str, evidence: str) -> tuple[str, dict]:
         return generate_answer(question, evidence, [])
@@ -185,6 +269,15 @@ def main() -> None:
         finally:
             if args.slow_question_seconds > 0:
                 faulthandler.cancel_dump_traceback_later()
+        if failed_empty_retrieval(prepared):
+            delay = max(0.0, args.retry_delay_seconds)
+            print(
+                f"[question] {financebench_id} retrieval failed with zero candidates; retrying after {delay:.1f}s",
+                flush=True,
+            )
+            if delay:
+                time.sleep(delay)
+            prepared = retrieve(question)
         retrieval_seconds = time.perf_counter() - started
         if args.diagnose:
             print(f"[question] {financebench_id} retrieve finished in {retrieval_seconds:.2f}s", flush=True)
@@ -227,7 +320,8 @@ def main() -> None:
         "execution_mode": "static",
         "query_planner": False,
         "step_back": False,
-        "rerank": False,
+        "field_aware": args.field_aware,
+        "rerank": args.enable_rerank,
         "thinking": args.thinking,
         "max_completion_tokens": args.max_completion_tokens,
         "temperature": 0,
@@ -254,6 +348,26 @@ def main() -> None:
             blocking=True,
         )
         print(f"Experiment: {results.experiment_name}", flush=True)
+        if not args.skip_auto_judge:
+            judge_output = args.judge_output or (
+                ROOT / "reports" / f"{results.experiment_name}_judge.jsonl"
+            )
+            judge_command = [
+                sys.executable,
+                str(ROOT / "scripts" / "judge_financebench_langsmith_experiment.py"),
+                "--experiment-name",
+                results.experiment_name,
+                "--output",
+                str(judge_output),
+            ]
+            print(f"[judge] starting output={judge_output}", flush=True)
+            completed = subprocess.run(judge_command, cwd=ROOT, check=False)
+            if completed.returncode != 0:
+                raise SystemExit(
+                    f"Experiment completed, but automatic judge failed (exit code {completed.returncode}). "
+                    f"Run the judge command manually for: {results.experiment_name}"
+                )
+            print(f"[judge] completed output={judge_output}", flush=True)
     finally:
         if output_handle:
             output_handle.close()
