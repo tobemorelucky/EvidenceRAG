@@ -47,6 +47,8 @@ def _install_rag_utils_stubs():
     sys.modules["finance_rag_features"] = finance
 
     query_parser = types.ModuleType("query_parser")
+    query_parser.FIELD_ALIASES = {}
+    query_parser.FIELD_STATEMENT_TYPES = {}
     query_parser.company_aliases_for = lambda company: []
     query_parser.matches_company_text = lambda *args, **kwargs: False
     query_parser.infer_task_spec = lambda query: {
@@ -55,6 +57,11 @@ def _install_rag_utils_stubs():
         "required_fields": [],
     }
     query_parser.build_required_field_query = lambda query: ""
+    query_parser.build_finance_query_rewrite = lambda query: ""
+    query_parser.build_supplemental_field_query = lambda query, coverage: ""
+    query_parser.infer_statement_types = lambda query, required_fields=None: []
+    query_parser.infer_page_statement_types = lambda text: []
+    query_parser.match_required_fields_in_text = lambda required_fields, text: {}
     query_parser.assess_required_field_coverage = lambda *args, **kwargs: {
         "task_type": "lookup",
         "formula": "",
@@ -926,28 +933,13 @@ def test_retrieve_documents_auto_non_table_query_does_not_force_table_attachment
     assert result["meta"]["table_context_source"] == "none"
 
 
-def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
+def test_retrieve_candidate_documents_uses_only_original_and_finance_rewrite(monkeypatch):
     module = _install_rag_utils_stubs()
     calls = []
 
-    monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
-    monkeypatch.setattr(
-        module,
-        "plan_retrieval_queries",
-        lambda question: {
-            "enabled": True,
-            "intent": "numeric_lookup",
-            "must_keep_terms": ["Adobe", "2022"],
-            "semantic_queries": ["Adobe operating margin 2022"],
-            "evidence_field_queries": ["Adobe revenue income from operations 2022"],
-            "table_heading_queries": ["Adobe statements of income 2022"],
-            "keyword_queries": ["Adobe margin 2022"],
-            "planner_validation_dropped_queries": [],
-            "expected_evidence_type": "text",
-            "constraints": [],
-            "parse_error": "",
-        },
-    )
+    monkeypatch.setenv("RAG_FIELD_AWARE_ENABLED", "true")
+    rewrite = "What was Adobe operating margin in 2022?\nFinancial retrieval anchors: operating income; total revenue; 2022"
+    monkeypatch.setattr(module, "build_finance_query_rewrite", lambda question: rewrite)
 
     def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
         calls.append({"query": query, "top_k": top_k, "filter_expr": filter_expr, "scope": retrieval_scope})
@@ -955,18 +947,8 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
             "What was Adobe operating margin in 2022?": [
                 {"filename": "1.pdf", "page_number": 8, "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.4}
             ],
-            "Adobe operating margin 2022": [
-                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.3},
-                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.2},
-            ],
-            "Adobe revenue income from operations 2022": [
+            rewrite: [
                 {"filename": "1.pdf", "page_number": 8, "chunk_id": "c3", "text": "Income from operations was $12.4 billion in 2022.", "score": 0.45}
-            ],
-            "Adobe statements of income 2022": [
-                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c4", "text": "Statements of income for fiscal 2022.", "score": 0.35}
-            ],
-            "Adobe margin 2022": [
-                {"filename": "1.pdf", "page_number": 9, "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.5}
             ],
         }
         return {"docs": docs_map.get(query, []), "meta": {"retrieval_mode": "hybrid"}}
@@ -977,63 +959,122 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
 
     assert [item["query"] for item in calls] == [
         "What was Adobe operating margin in 2022?",
-        "Adobe operating margin 2022",
-        "Adobe revenue income from operations 2022",
-        "Adobe statements of income 2022",
-        "Adobe margin 2022",
+        rewrite,
     ]
-    assert result["meta"]["query_planner_enabled"] is True
-    assert result["meta"]["planner_dense_queries"] == ["Adobe operating margin 2022"]
-    assert result["meta"]["planner_semantic_queries"] == ["Adobe operating margin 2022"]
-    assert result["meta"]["planner_evidence_field_queries"] == ["Adobe revenue income from operations 2022"]
-    assert result["meta"]["planner_table_heading_queries"] == ["Adobe statements of income 2022"]
-    assert result["meta"]["planner_keyword_queries"] == ["Adobe margin 2022"]
-    assert result["meta"]["rrf_fused_candidate_count"] == 5
-    assert result["meta"]["page_level_fusion_enabled"] is True
-    assert result["meta"]["fused_page_count"] == 2
-    assert result["meta"]["fused_top_pages"][0]["page_number"] == 8
-    assert set(result["meta"]["page_contributing_routes"]["1.pdf#page=8"]) == {
-        "original",
-        "semantic_1",
-        "evidence_field_1",
-        "table_heading_1",
-    }
-    assert len(result["meta"]["per_query_retrieval_counts"]) == 5
+    assert result["meta"]["query_planner_enabled"] is False
+    assert result["meta"]["planner_semantic_queries"] == []
+    assert result["meta"]["rrf_fused_candidate_count"] == 2
+    assert len(result["meta"]["per_query_retrieval_counts"]) == 2
+    assert result["meta"]["per_query_retrieval_counts"][1]["category"] == "finance_rewrite"
     assert result["docs"][0]["chunk_id"] == "c1"
 
 
-def test_retrieve_candidate_documents_page_fusion_anchor_guard_filters_cross_anchor_pages(monkeypatch):
+def test_statement_type_bonus_promotes_matching_financial_statement(monkeypatch):
     module = _install_rag_utils_stubs()
 
-    monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
+    class _Embedding:
+        def get_embeddings(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(module, "_embedding_service", _Embedding())
     monkeypatch.setattr(
         module,
-        "plan_retrieval_queries",
-        lambda question: {
-            "enabled": True,
-            "intent": "numeric_lookup",
-            "must_keep_terms": ["Adobe", "2022"],
-            "semantic_queries": ["Adobe operating margin 2022"],
-            "evidence_field_queries": ["Adobe revenue income from operations 2022"],
-            "table_heading_queries": [],
-            "keyword_queries": [],
-            "planner_validation_dropped_queries": [],
-            "expected_evidence_type": "text",
-            "constraints": [],
-            "parse_error": "",
+        "infer_page_statement_types",
+        lambda text: ["income_statement"] if "STATEMENTS OF INCOME" in text else ["balance_sheet"],
+    )
+    pages = [
+        {
+            "filename": "ADOBE_2022_10K.pdf",
+            "page_number": 40,
+            "page_text": "CONSOLIDATED STATEMENTS OF INCOME\nRevenue and operating income",
+            "page_dense_embedding": [1.0, 0.0],
+            "chunk_ids": ["income"],
         },
+        {
+            "filename": "ADOBE_2022_10K.pdf",
+            "page_number": 41,
+            "page_text": "CONSOLIDATED BALANCE SHEETS\nAssets and liabilities",
+            "page_dense_embedding": [1.0, 0.0],
+            "chunk_ids": ["balance"],
+        },
+    ]
+    query_parse = {
+        "company": "",
+        "years": [],
+        "doc_types": [],
+        "statement_types": ["income_statement"],
+    }
+
+    scored, _ = module._score_candidate_pages(
+        "operating margin",
+        pages,
+        [],
+        query_parse,
+        module.get_finance_rag_config(),
     )
 
+    assert scored[0]["page_number"] == 40
+    assert scored[0]["statement_type_match_score"] == 1.0
+
+
+def test_page_first_returns_anchor_chunk_and_direct_neighbors(monkeypatch):
+    module = _install_rag_utils_stubs()
+    monkeypatch.setenv("RAG_FIELD_AWARE_ENABLED", "true")
+    candidate = {"filename": "ADOBE_2022_10K.pdf", "page_number": 40, "chunk_id": "c1", "text": "candidate", "score": 1.0}
+    page = {"filename": "ADOBE_2022_10K.pdf", "page_number": 40, "chunk_ids": ["c0", "c1", "c2"], "page_score": 1.0}
+    chunks = [
+        {"filename": page["filename"], "page_number": 40, "chunk_id": "c0", "chunk_idx": 0, "text": "context before"},
+        {"filename": page["filename"], "page_number": 40, "chunk_id": "c1", "chunk_idx": 1, "text": "operating margin anchor"},
+        {"filename": page["filename"], "page_number": 40, "chunk_id": "c2", "chunk_idx": 2, "text": "context after"},
+    ]
+
+    class _PageStore:
+        def get_pages_by_filenames(self, filenames, warm_cache=False):
+            return [page]
+
+    class _Milvus:
+        def get_chunks_by_ids(self, chunk_ids):
+            return chunks
+
+    monkeypatch.setattr(module, "_document_page_store", _PageStore())
+    monkeypatch.setattr(module, "_milvus_manager", _Milvus())
+    monkeypatch.setattr(module, "_select_doc_stage_documents", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(module, "_score_candidate_pages", lambda *args, **kwargs: ([page], {}))
+    monkeypatch.setattr(
+        module,
+        "_extract_keyword_tokens",
+        lambda text: {"operating", "margin"} if "operating margin" in text else set(),
+    )
+
+    docs, meta = module._build_page_first_candidates(
+        "operating margin",
+        [candidate],
+        candidate_k=5,
+        config=module.get_finance_rag_config(),
+    )
+
+    selected = {doc["chunk_id"]: doc["anchor_chunk_offset"] for doc in docs if "anchor_chunk_offset" in doc}
+    assert selected == {"c0": -1, "c1": 0, "c2": 1}
+    assert meta["page_first_anchor_window"] == 1
+
+
+def test_legacy_planner_flag_cannot_reenable_generated_query_routes(monkeypatch):
+    module = _install_rag_utils_stubs()
+    calls = []
+
+    monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
+    monkeypatch.setenv("RAG_FIELD_AWARE_ENABLED", "true")
+    rewrite = "What was Adobe operating margin in 2022?\nFinancial retrieval anchors: operating income; total revenue; 2022"
+    monkeypatch.setattr(module, "build_finance_query_rewrite", lambda question: rewrite)
+
     def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
+        calls.append(query)
         docs_map = {
             "What was Adobe operating margin in 2022?": [
                 {"filename": "1.pdf", "page_number": 8, "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.6},
                 {"filename": "2.pdf", "page_number": 4, "chunk_id": "c2", "text": "Ulta margin was 12% in 2022.", "score": 0.9},
             ],
-            "Adobe operating margin 2022": [
-                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c3", "text": "Adobe revenue and income from operations for 2022.", "score": 0.5},
-            ],
-            "Adobe revenue income from operations 2022": [
+            rewrite: [
                 {"filename": "1.pdf", "page_number": 8, "chunk_id": "c4", "text": "Statements of income Adobe 2022 revenue income from operations.", "score": 0.4},
             ],
         }
@@ -1043,11 +1084,10 @@ def test_retrieve_candidate_documents_page_fusion_anchor_guard_filters_cross_anc
 
     result = module.retrieve_candidate_documents("What was Adobe operating margin in 2022?", candidate_k=5)
 
-    assert result["meta"]["page_level_fusion_enabled"] is True
-    assert result["meta"]["page_anchor_filtered_count"] == 1
-    assert result["meta"]["fused_top_pages"][0]["filename"] == "1.pdf"
-    assert result["meta"]["fused_pages_after_anchor_guard"][0]["filename"] == "1.pdf"
-    assert all(page["filename"] == "1.pdf" for page in result["meta"]["fused_pages_after_anchor_guard"])
+    assert calls == ["What was Adobe operating margin in 2022?", rewrite]
+    assert result["meta"]["query_planner_enabled"] is False
+    assert result["meta"]["page_level_fusion_enabled"] is False
+    assert result["meta"]["planner_semantic_queries"] == []
 
 
 def test_finalize_retrieved_documents_prefers_page_fusion_for_final_context(monkeypatch):
@@ -1110,28 +1150,12 @@ def test_finalize_retrieved_documents_prefers_page_fusion_for_final_context(monk
     assert result["final_retrieved_docs"][1]["filename"] == "1.pdf"
 
 
-def test_retrieve_candidate_documents_planner_failure_falls_back_to_original_query(monkeypatch):
+def test_question_without_required_fields_uses_only_original_query(monkeypatch):
     module = _install_rag_utils_stubs()
     calls = []
 
     monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
-    monkeypatch.setattr(
-        module,
-        "plan_retrieval_queries",
-        lambda question: {
-            "enabled": False,
-            "intent": "",
-            "must_keep_terms": [],
-            "semantic_queries": [],
-            "evidence_field_queries": [],
-            "table_heading_queries": [],
-            "keyword_queries": [],
-            "planner_validation_dropped_queries": [],
-            "expected_evidence_type": "",
-            "constraints": [],
-            "parse_error": "planner_failed",
-        },
-    )
+    monkeypatch.setattr(module, "build_finance_query_rewrite", lambda question: "")
 
     def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
         calls.append(query)
@@ -1145,25 +1169,22 @@ def test_retrieve_candidate_documents_planner_failure_falls_back_to_original_que
     result = module.retrieve_candidate_documents("Summarize this document.", candidate_k=5)
 
     assert calls == ["Summarize this document."]
-    assert result["meta"]["query_planner_enabled"] is True
+    assert result["meta"]["query_planner_enabled"] is False
     assert result["meta"]["planner_dense_queries"] == []
     assert result["meta"]["planner_semantic_queries"] == []
     assert result["meta"]["planner_evidence_field_queries"] == []
     assert result["meta"]["planner_table_heading_queries"] == []
     assert result["meta"]["planner_keyword_queries"] == []
     assert result["meta"]["planner_table_queries"] == []
-    assert result["meta"]["planner_parse_error"] == "planner_failed"
+    assert result["meta"]["planner_parse_error"] == ""
     assert result["docs"][0]["chunk_id"] == "c1"
 
 
-def test_retrieve_candidate_documents_does_not_call_planner_when_disabled(monkeypatch):
+def test_retrieve_candidate_documents_uses_original_when_finance_rewrite_is_empty(monkeypatch):
     module = _install_rag_utils_stubs()
     calls = []
 
     monkeypatch.delenv("RAG_QUERY_PLANNER_ENABLED", raising=False)
-
-    def _fail_planner(question):
-        raise AssertionError("planner should not be called when disabled")
 
     def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
         calls.append(query)
@@ -1172,7 +1193,7 @@ def test_retrieve_candidate_documents_does_not_call_planner_when_disabled(monkey
             "meta": {"retrieval_mode": "hybrid"},
         }
 
-    monkeypatch.setattr(module, "plan_retrieval_queries", _fail_planner)
+    monkeypatch.setattr(module, "build_finance_query_rewrite", lambda question: "")
     monkeypatch.setattr(module, "_retrieve_leaf_chunks", _fake_retrieve_leaf_chunks)
 
     result = module.retrieve_candidate_documents("What was revenue?", candidate_k=5)

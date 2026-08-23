@@ -7,8 +7,9 @@ import uuid
 from dataclasses import dataclass
 
 from agent_tools import find_evidence, open_pages, select_pages
+from calculation_service import build_calculation_result, format_calculation_evidence
 from prompts import PROMPT_VERSION
-from query_planner import plan_retrieval_queries
+from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
 from rag_pipeline import run_rag_graph
 from rag_utils import finalize_retrieved_documents, get_finance_rag_config
 
@@ -113,6 +114,14 @@ def build_citations(documents: list[dict]) -> list[dict]:
     return citations
 
 
+def _resolve_evidence_status(citations: list[dict], coverage: dict) -> str:
+    if not citations:
+        return "insufficient"
+    if coverage.get("status") in {"partial", "insufficient"}:
+        return "limited"
+    return "sufficient"
+
+
 def _run_search(query: str) -> dict:
     try:
         return run_rag_graph(query)
@@ -121,18 +130,8 @@ def _run_search(query: str) -> dict:
 
 
 def _agent_queries(question: str) -> list[str]:
-    plan = plan_retrieval_queries(question)
-    candidates = []
-    for key in ("semantic_queries", "evidence_field_queries", "keyword_queries", "table_heading_queries"):
-        candidates.extend(plan.get(key) or [])
-    result = []
-    for candidate in candidates:
-        text = str(candidate or "").strip()
-        if text and text != question and text not in result:
-            result.append(text)
-        if len(result) >= 2:
-            break
-    return result
+    rewrite = build_finance_query_rewrite(question)
+    return [rewrite] if rewrite and rewrite != question else []
 
 
 def prepare_rag_response(question: str, profile: str | None = None, mode: str | None = None) -> dict:
@@ -204,13 +203,22 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             ]
 
     citations = build_citations(final_docs)
-    evidence_status = "sufficient" if len(citations) >= 2 else ("limited" if citations else "insufficient")
+    query_parse = parse_query(question)
+    evidence_coverage = assess_required_field_coverage(query_parse, final_docs)
+    evidence_coverage["supplemental_search_attempted"] = bool(
+        trace.get("supplemental_search_attempted")
+        or (trace.get("evidence_coverage") or {}).get("supplemental_search_attempted")
+    )
+    calculation = build_calculation_result(query_parse, evidence_coverage, final_docs)
+    evidence_status = _resolve_evidence_status(citations, evidence_coverage)
     trace.update(
         {
             "profile": config.profile,
             "execution_mode": execution_mode,
             "route_reason": route_reason,
             "evidence_status": evidence_status,
+            "evidence_coverage": evidence_coverage,
+            "calculation": calculation,
             "trace_id": str(uuid.uuid4()),
             "prompt_version": PROMPT_VERSION,
             "agent_tool_calls": tool_calls,
@@ -220,8 +228,16 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
     latency = dict(trace.get("latency_breakdown") or {})
     latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
     trace["latency_breakdown"] = latency
+    evidence = _format_evidence(final_docs)
+    answer_directives = build_answer_directives(question, query_parse)
+    if answer_directives:
+        directive_text = "\n".join(f"- {directive}" for directive in answer_directives)
+        evidence = f"Question-specific answer contract (instructions, not evidence):\n{directive_text}\n\n---\n\n{evidence}"
+    calculation_evidence = format_calculation_evidence(calculation)
+    if calculation_evidence:
+        evidence = f"{evidence}\n\n---\n\n{calculation_evidence}"
     return {
-        "evidence": _format_evidence(final_docs),
+        "evidence": evidence,
         "docs": final_docs,
         "rag_trace": trace,
         "profile": config.profile,
@@ -229,5 +245,6 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         "route_reason": route_reason,
         "citations": citations,
         "evidence_status": evidence_status,
+        "calculation": calculation,
         "trace_id": trace["trace_id"],
     }

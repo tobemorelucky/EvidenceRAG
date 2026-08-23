@@ -60,7 +60,14 @@ def _configure_static_baseline(
             "FINANCE_RAG_FINAL_TOP_K": "5",
             "RAG_PAGE_FIRST_ENABLED": "true",
             "RAG_FIELD_AWARE_ENABLED": "true" if field_aware else "false",
-            "RAG_PAGE_NEIGHBOR_WINDOW": "0",
+            "RAG_PAGE_NEIGHBOR_WINDOW": "2" if field_aware else "0",
+            "RAG_CONTEXT_PAGE_WINDOW": "2" if field_aware else "0",
+            "RAG_SUPPLEMENTAL_SEARCH_ENABLED": "true" if field_aware else "false",
+            "RAG_SUPPLEMENTAL_CANDIDATE_K": "12",
+            "FINANCE_RAG_W_STATEMENT": "0.18",
+            "FINANCE_RAG_W_REQUIRED_FIELDS": "0.25",
+            "FINANCE_RAG_W_REQUIRED_PERIODS": "0.20",
+            "FINANCE_RAG_W_SELECTION_SCOPE": "0.30",
             "RAG_ANCHOR_GUARD_ENABLED": "false",
             "RAG_COVER_FILTER_ENABLED": "false",
             "FINANCE_RAG_ENABLE_PAGE_MERGE": "false",
@@ -85,6 +92,8 @@ def _configure_static_baseline(
         )
     elif local_rerank_fallback:
         settings["LOCAL_RERANK_ENABLED"] = "true"
+    else:
+        settings["LOCAL_RERANK_ENABLED"] = "false"
     os.environ.update(settings)
 
 
@@ -119,6 +128,12 @@ def main() -> None:
     parser.add_argument("--dataset-name", default="evidencerag_financebench_all100_v1")
     parser.add_argument("--split", choices=("dev", "holdout", "all"), default="dev")
     parser.add_argument("--limit", type=int, default=0, help="0 evaluates the whole selected split.")
+    parser.add_argument(
+        "--question-id",
+        action="append",
+        default=[],
+        help="Evaluate only this FinanceBench ID; repeat the option for a targeted set.",
+    )
     parser.add_argument("--experiment-prefix", default="evidencerag-finance-static")
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--max-completion-tokens", type=int, default=512)
@@ -126,8 +141,9 @@ def main() -> None:
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval and generation stage timing.")
     parser.add_argument(
         "--field-aware",
-        action="store_true",
-        help="Enable anchor ±1 context selection and required-field coverage tracing.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable deterministic finance rewrite and required-field coverage tracing (default: enabled).",
     )
     parser.add_argument(
         "--enable-rerank",
@@ -191,6 +207,20 @@ def main() -> None:
             for example in examples
             if ((getattr(example, "metadata", None) or {}).get("financebench_id") in dev_ids) == use_dev
         ]
+    if args.question_id:
+        requested_ids = set(args.question_id)
+        examples = [
+            example
+            for example in examples
+            if (getattr(example, "metadata", None) or {}).get("financebench_id") in requested_ids
+        ]
+        selected_ids = {
+            (getattr(example, "metadata", None) or {}).get("financebench_id")
+            for example in examples
+        }
+        missing_ids = requested_ids - selected_ids
+        if missing_ids:
+            parser.error(f"question IDs not found in selected split: {', '.join(sorted(missing_ids))}")
     if args.limit > 0:
         examples = examples[: args.limit]
     if args.retry_empty_retrieval_from:
@@ -303,6 +333,7 @@ def main() -> None:
             "answer": answer,
             "citations": prepared["citations"],
             "evidence_status": prepared["evidence_status"],
+            "calculation": prepared.get("calculation"),
             "execution_mode": prepared["execution_mode"],
             "route_reason": prepared["route_reason"],
             "rag_trace": prepared["rag_trace"],
@@ -321,6 +352,12 @@ def main() -> None:
         "query_planner": False,
         "step_back": False,
         "field_aware": args.field_aware,
+        "statement_aware": args.field_aware,
+        "required_field_page_scoring": args.field_aware,
+        "required_period_page_scoring": args.field_aware,
+        "supplemental_search": args.field_aware,
+        "page_neighbor_window": 2 if args.field_aware else 0,
+        "context_page_window": 2 if args.field_aware else 0,
         "rerank": args.enable_rerank,
         "thinking": args.thinking,
         "max_completion_tokens": args.max_completion_tokens,

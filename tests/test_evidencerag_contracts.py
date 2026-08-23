@@ -59,6 +59,13 @@ def test_prompt_contract_requires_cited_grounded_answers():
     assert "Answer only from the evidence" in prompts.ANSWER_SYSTEM_PROMPT
     assert "[source: filename, page N]" in prompts.ANSWER_SYSTEM_PROMPT
     assert "hidden chain-of-thought" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "Do not refuse merely because the final metric is not explicitly stated" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "same company, reporting period, unit, and accounting scope" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "including Corporate/Other rows and negative values" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "do not substitute a geographic, operating, or reportable segment value" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "Declare it irrelevant only when the supplied evidence explicitly supports" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "an explicitly labeled Total row" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "Keep full precision for intermediate arithmetic" in prompts.ANSWER_SYSTEM_PROMPT
     assert prompts.PROMPT_VERSION
 
 

@@ -113,6 +113,7 @@ def classify_failure(gold: list[dict[str, Any]], retrieved: list[dict[str, Any]]
 def _retrieval_environment(
     *,
     enable_rerank: bool,
+    local_rerank_fallback: bool = True,
     use_local_rerank: bool = False,
     local_rerank_candidate_k: int = 20,
     field_aware: bool = False,
@@ -124,7 +125,7 @@ def _retrieval_environment(
     os.environ["RAG_COVER_FILTER_ENABLED"] = "false"
     os.environ["RAG_PAGE_FIRST_ENABLED"] = "true"
     os.environ["RAG_FIELD_AWARE_ENABLED"] = "true" if field_aware else "false"
-    os.environ["RAG_PAGE_NEIGHBOR_WINDOW"] = "0"
+    os.environ["RAG_PAGE_NEIGHBOR_WINDOW"] = "2" if field_aware else "0"
     os.environ["FINANCE_RAG_ENABLE_STEP_BACK"] = "false"
     if use_local_rerank:
         os.environ["RERANK_MODEL"] = ""
@@ -133,11 +134,12 @@ def _retrieval_environment(
         os.environ["LOCAL_RERANK_ENABLED"] = "true"
         os.environ["LOCAL_RERANK_CANDIDATE_K"] = str(max(1, local_rerank_candidate_k))
     elif enable_rerank:
-        os.environ["LOCAL_RERANK_ENABLED"] = "true"
+        os.environ["LOCAL_RERANK_ENABLED"] = "true" if local_rerank_fallback else "false"
     elif not enable_rerank:
         os.environ["RERANK_MODEL"] = ""
         os.environ["RERANK_BINDING_HOST"] = ""
         os.environ["RERANK_API_KEY"] = ""
+        os.environ["LOCAL_RERANK_ENABLED"] = "false"
     os.environ["TABLE_AWARE_RETRIEVAL"] = "off"
     os.environ["RAG_EVIDENCE_GROUPING_ENABLED"] = "false"
     os.environ["RAG_RETRIEVAL_DEBUG"] = "true" if diagnose else "false"
@@ -149,6 +151,7 @@ def evaluate(
     final_k: int,
     *,
     enable_rerank: bool = False,
+    local_rerank_fallback: bool = True,
     use_local_rerank: bool = False,
     local_rerank_candidate_k: int = 20,
     rerank_interval_seconds: float = 0.0,
@@ -159,6 +162,7 @@ def evaluate(
 ) -> list[dict[str, Any]]:
     _retrieval_environment(
         enable_rerank=enable_rerank,
+        local_rerank_fallback=local_rerank_fallback,
         use_local_rerank=use_local_rerank,
         local_rerank_candidate_k=local_rerank_candidate_k,
         field_aware=field_aware,
@@ -181,6 +185,7 @@ def evaluate(
                 faulthandler.cancel_dump_traceback_later()
         candidates = list(retrieval.get("candidate_docs") or [])
         final_docs = list(retrieval.get("final_retrieved_docs") or retrieval.get("docs") or [])
+        context_docs = list(retrieval.get("context_docs") or retrieval.get("docs") or final_docs)
 
         def compact(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return [
@@ -195,6 +200,7 @@ def evaluate(
 
         candidate_hits = compact(candidates)
         final_hits = compact(final_docs)
+        context_hits = compact(context_docs)
         record = {
             "financebench_id": row.get("financebench_id", ""),
             "question_type": row.get("question_type", ""),
@@ -202,8 +208,10 @@ def evaluate(
             "gold": gold,
             "candidate_failure": classify_failure(gold, candidate_hits),
             "final_failure": classify_failure(gold, final_hits),
+            "context_failure": classify_failure(gold, context_hits),
             "candidate_hits": candidate_hits[:candidate_k],
             "final_hits": final_hits[:final_k],
+            "context_hits": context_hits,
             "candidate_page_hit_at": {
                 str(k): page_hit_at_k(gold, candidate_hits, k)
                 for k in (1, 5, 10, candidate_k)
@@ -216,6 +224,7 @@ def evaluate(
                 str(k): page_hit_at_k(gold, final_hits, k)
                 for k in (1, final_k)
             },
+            "context_page_hit": page_hit_at_k(gold, context_hits, len(context_hits)),
             "page_first_trace": {
                 "selected_documents": (retrieval.get("meta") or {}).get("page_first_selected_documents", []),
                 "selected_pages": (retrieval.get("meta") or {}).get("page_first_selected_pages", []),
@@ -230,6 +239,7 @@ def evaluate(
                 "provider": (retrieval.get("meta") or {}).get("rerank_provider"),
                 "error": (retrieval.get("meta") or {}).get("rerank_error"),
                 "remote_candidate_count": (retrieval.get("meta") or {}).get("remote_rerank_candidate_count"),
+                "remote_anchor_count": (retrieval.get("meta") or {}).get("remote_rerank_anchor_count"),
                 "remote_input_chars": (retrieval.get("meta") or {}).get("remote_rerank_input_chars"),
                 "remote_rate_limited": bool((retrieval.get("meta") or {}).get("remote_rerank_rate_limited")),
                 "local_enabled": bool((retrieval.get("meta") or {}).get("local_rerank_enabled")),
@@ -252,6 +262,7 @@ def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(records)
     counts = Counter(record["candidate_failure"] for record in records)
     final_counts = Counter(record["final_failure"] for record in records)
+    context_counts = Counter(record.get("context_failure", "") for record in records)
     candidate_depth = max((max(map(int, record["candidate_page_hit_at"].keys())) for record in records), default=0)
     return {
         "questions": total,
@@ -272,8 +283,10 @@ def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_page_hit_offset_minus_one_at_10": round(sum(record["candidate_page_hit_offset_minus_one_at"].get("10", False) for record in records) / total, 4) if total else 0,
         "final_page_hit_at_1": round(sum(record["final_page_hit_at"].get("1", False) for record in records) / total, 4) if total else 0,
         "final_page_hit_at_5": round(sum(record["final_page_hit_at"].get("5", False) for record in records) / total, 4) if total else 0,
+        "context_page_hit": round(sum(bool(record.get("context_page_hit")) for record in records) / total, 4) if total else 0,
         "candidate_failure_counts": dict(sorted(counts.items())),
         "final_failure_counts": dict(sorted(final_counts.items())),
+        "context_failure_counts": dict(sorted(context_counts.items())),
         "note": "Primary page-hit metrics use exact benchmark page numbers. The offset metric is diagnostic only for detecting an index convention mismatch.",
     }
 
@@ -285,6 +298,12 @@ def main() -> None:
     parser.add_argument("--candidate-k", type=int, default=40)
     parser.add_argument("--final-k", type=int, default=5)
     parser.add_argument("--limit", type=int, default=0, help="Evaluate only the first N selected rows (0 means all).")
+    parser.add_argument(
+        "--question-id",
+        action="append",
+        default=[],
+        help="Evaluate only this FinanceBench ID; repeat the option for multiple targeted questions.",
+    )
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
     parser.add_argument(
         "--enable-rerank",
@@ -303,6 +322,11 @@ def main() -> None:
         help="Number of retrieved chunks scored by --use-local-rerank.",
     )
     parser.add_argument(
+        "--disable-local-rerank-fallback",
+        action="store_true",
+        help="With --enable-rerank, report remote failures without loading the local cross-encoder.",
+    )
+    parser.add_argument(
         "--rerank-interval-seconds",
         type=float,
         default=0.0,
@@ -310,8 +334,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--field-aware",
-        action="store_true",
-        help="Use the anchor ±1 context experiment and emit field-coverage traces.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use deterministic finance rewrite and emit field-coverage traces (default: enabled).",
     )
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval stages for locating slow queries.")
     parser.add_argument(
@@ -333,6 +358,12 @@ def main() -> None:
         rows = [row for row in all_rows if not is_development_row(row, dev_ids)]
     else:
         rows = all_rows
+    if args.question_id:
+        requested_ids = set(args.question_id)
+        rows = [row for row in rows if (row.get("financebench_id") or "") in requested_ids]
+        missing_ids = requested_ids - {row.get("financebench_id") or "" for row in rows}
+        if missing_ids:
+            parser.error(f"question IDs not found in selected split: {', '.join(sorted(missing_ids))}")
     if args.limit > 0:
         rows = rows[: args.limit]
 
@@ -358,6 +389,7 @@ def main() -> None:
         candidate_k=max(1, args.candidate_k),
         final_k=max(1, args.final_k),
         enable_rerank=args.enable_rerank,
+        local_rerank_fallback=not args.disable_local_rerank_fallback,
         use_local_rerank=args.use_local_rerank,
         local_rerank_candidate_k=max(1, args.local_rerank_candidate_k),
         rerank_interval_seconds=max(0.0, args.rerank_interval_seconds),
@@ -375,6 +407,7 @@ def main() -> None:
         "final_k": args.final_k,
         "limit": args.limit,
         "rerank_enabled": args.enable_rerank,
+        "local_rerank_fallback": not args.disable_local_rerank_fallback,
         "local_rerank_enabled": args.use_local_rerank,
         "local_rerank_candidate_k": max(1, args.local_rerank_candidate_k),
         "rerank_interval_seconds": max(0.0, args.rerank_interval_seconds),

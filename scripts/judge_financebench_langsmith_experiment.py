@@ -109,6 +109,7 @@ def main() -> None:
             example = client.read_example(run.reference_example_id)
             inputs = getattr(example, "inputs", None) or {}
             expected = getattr(example, "outputs", None) or {}
+            example_metadata = getattr(example, "metadata", None) or {}
             outputs = getattr(run, "outputs", None) or {}
             prompt = JUDGE_PROMPT.format(
                 question=inputs.get("question", ""),
@@ -127,6 +128,8 @@ def main() -> None:
             record = {
                 "run_id": str(run.id),
                 "reference_example_id": str(run.reference_example_id),
+                "financebench_id": str(example_metadata.get("financebench_id") or inputs.get("financebench_id") or ""),
+                "question": str(inputs.get("question") or ""),
                 "judge_model": os.getenv("JUDGE_MODEL", "deepseek-v4-pro-ga-260813"),
                 "thinking": os.getenv("JUDGE_THINKING_MODE", "disabled"),
                 **verdict,

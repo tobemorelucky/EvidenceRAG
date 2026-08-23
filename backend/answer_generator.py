@@ -23,6 +23,8 @@ def _create_model():
         "base_url": os.getenv("BASE_URL"),
         "temperature": float(os.getenv("ANSWER_TEMPERATURE", "0.1")),
         "stream_usage": True,
+        "timeout": float(os.getenv("ANSWER_TIMEOUT_SECONDS", "60")),
+        "max_retries": int(os.getenv("ANSWER_MAX_RETRIES", "2")),
     }
     max_completion_tokens = os.getenv("ANSWER_MAX_COMPLETION_TOKENS")
     if max_completion_tokens:

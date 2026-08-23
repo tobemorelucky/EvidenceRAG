@@ -27,12 +27,17 @@ from finance_rag_features import (
     parse_finance_query,
 )
 from query_parser import (
+    FIELD_ALIASES,
+    FIELD_STATEMENT_TYPES,
     assess_required_field_coverage,
-    build_required_field_query,
+    build_finance_query_rewrite,
+    build_supplemental_field_query,
+    infer_page_statement_types,
+    infer_statement_types,
     infer_task_spec,
+    match_required_fields_in_text,
     matches_company_text,
 )
-from query_planner import plan_retrieval_queries
 from milvus_client import MilvusManager
 from parent_chunk_store import ParentChunkStore
 from evidence_group_builder import (
@@ -163,6 +168,10 @@ def get_finance_rag_config() -> Dict[str, Any]:
         "w_company": float(os.getenv("FINANCE_RAG_W_COMPANY", "0.15")),
         "w_year": float(os.getenv("FINANCE_RAG_W_YEAR", "0.10")),
         "w_doc_type": float(os.getenv("FINANCE_RAG_W_DOC_TYPE", "0.05")),
+        "w_statement": float(os.getenv("FINANCE_RAG_W_STATEMENT", "0.18")),
+        "w_required_fields": float(os.getenv("FINANCE_RAG_W_REQUIRED_FIELDS", "0.25")),
+        "w_required_periods": float(os.getenv("FINANCE_RAG_W_REQUIRED_PERIODS", "0.20")),
+        "w_selection_scope": float(os.getenv("FINANCE_RAG_W_SELECTION_SCOPE", "0.30")),
         "cover_toc_penalty": float(os.getenv("FINANCE_RAG_COVER_TOC_PENALTY", "0.40")),
     }
 
@@ -1898,6 +1907,7 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         "rerank_error": None,
         "candidate_count": len(docs_with_rank),
         "remote_rerank_candidate_count": 0,
+        "remote_rerank_anchor_count": 0,
         "remote_rerank_input_chars": 0,
         "remote_rerank_rate_limited": False,
         "rerank_provider": "none",
@@ -1908,7 +1918,41 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
     if not docs_with_rank:
         return docs_with_rank[:top_k], meta
     if meta["rerank_enabled"]:
-        remote_docs = docs_with_rank[:RERANK_REMOTE_CANDIDATE_K]
+        anchor_docs = []
+        covered_fields: set[str] = set()
+        covered_statements: set[str] = set()
+        for doc in docs_with_rank:
+            if not (
+                doc.get("required_field_anchor")
+                or doc.get("statement_type_anchor")
+                or doc.get("selection_scope_anchor")
+            ):
+                continue
+            anchor_docs.append(doc)
+            covered_fields.update((doc.get("matched_required_fields") or {}).keys())
+            covered_statements.update(doc.get("statement_types") or [])
+            if len(anchor_docs) >= min(6, RERANK_REMOTE_CANDIDATE_K):
+                break
+        for doc in docs_with_rank:
+            if len(anchor_docs) >= min(6, RERANK_REMOTE_CANDIDATE_K):
+                break
+            fields = set((doc.get("matched_required_fields") or {}).keys())
+            statements = set(doc.get("statement_types") or [])
+            adds_field = bool(fields - covered_fields)
+            adds_statement = bool(doc.get("statement_type_anchor") and statements - covered_statements)
+            if doc.get("selection_scope_anchor") or adds_field or adds_statement:
+                anchor_docs.append(doc)
+                covered_fields.update(fields)
+                covered_statements.update(statements)
+        remote_docs = _deduplicate_docs(anchor_docs + docs_with_rank)[:RERANK_REMOTE_CANDIDATE_K]
+        meta["remote_rerank_anchor_count"] = sum(
+            1
+            for doc in remote_docs
+            if doc.get("required_field_anchor")
+            or doc.get("statement_type_anchor")
+            or doc.get("matched_required_fields")
+            or doc.get("selection_scope_anchor")
+        )
         remote_texts = [str(doc.get("text", "") or "")[:RERANK_REMOTE_MAX_CHARS] for doc in remote_docs]
         meta["remote_rerank_candidate_count"] = len(remote_docs)
         meta["remote_rerank_input_chars"] = sum(len(text) for text in remote_texts)
@@ -2125,7 +2169,6 @@ def _build_retrieval_routes(
     planner: Dict[str, Any],
     field_aware_query: str = "",
 ) -> list[dict]:
-    planner = planner or {}
     routes: list[dict] = [
         {
             "label": "original",
@@ -2136,8 +2179,6 @@ def _build_retrieval_routes(
         }
     ]
     seen = {original_query.strip().lower()}
-    route_limit = _planner_query_limit(candidate_k)
-
     def _append(items: list[str], label_prefix: str, weight: float, category: str) -> None:
         for index, item in enumerate(items or [], 1):
             query = (item or "").strip()
@@ -2150,16 +2191,12 @@ def _build_retrieval_routes(
                     "label": f"{label_prefix}_{index}",
                     "query": query,
                     "weight": weight,
-                    "top_k": route_limit,
+                    "top_k": candidate_k,
                     "category": category,
                 }
             )
 
-    _append(planner.get("semantic_queries") or [], "semantic", 0.75, "semantic")
-    _append(planner.get("evidence_field_queries") or [], "evidence_field", 0.85, "evidence_field")
-    _append(planner.get("table_heading_queries") or [], "table_heading", 0.55, "table_heading")
-    _append(planner.get("keyword_queries") or [], "keyword", 0.65, "keyword")
-    _append([field_aware_query], "required_fields", 0.90, "required_fields")
+    _append([field_aware_query], "finance_rewrite", 0.90, "finance_rewrite")
     return routes
 
 
@@ -2471,6 +2508,9 @@ def _score_candidate_pages(
     target_company = query_parse.get("company") or ""
     target_years = set(str(year) for year in (query_parse.get("years") or []))
     target_doc_types = set(query_parse.get("doc_types") or ([] if not query_parse.get("doc_type") else [query_parse.get("doc_type")]))
+    target_statement_types = set(query_parse.get("statement_types") or [])
+    required_fields = list(query_parse.get("required_fields") or [])
+    required_periods = [str(item).lower() for item in (query_parse.get("required_periods") or [])]
 
     page_details: List[dict] = []
     for page in page_records:
@@ -2489,6 +2529,38 @@ def _score_candidate_pages(
         company_match_score = _company_match_score(query_parse, page.get("filename", ""), page_text, table_text)
         year_match_score = _year_match_score(query_parse, page.get("filename", ""), page_years, page_text)
         doc_type_match_score = _doc_type_match_score(query_parse, page.get("filename", ""), page_text)
+        page_statement_types = infer_page_statement_types(combined_text)
+        statement_type_match_score = (
+            len(target_statement_types & set(page_statement_types)) / len(target_statement_types)
+            if target_statement_types
+            else 0.0
+        )
+        matched_required_fields = match_required_fields_in_text(required_fields, combined_text)
+        required_field_match_score = (
+            len(matched_required_fields) / len(required_fields)
+            if required_fields
+            else 0.0
+        )
+        period_scope_text = "\n".join([page.get("filename", "") or "", combined_text]).lower()
+        matched_required_periods = [period for period in required_periods if period in period_scope_text]
+        required_period_match_score = (
+            len(matched_required_periods) / len(required_periods)
+            if required_periods
+            else 0.0
+        )
+        lowered_combined_text = combined_text.lower()
+        selection_scope_score = 0.0
+        if query_parse.get("task_type") == "selection":
+            has_scope_heading = any(
+                marker in lowered_combined_text
+                for marker in ("segment results", "results by segment", "business segments", "geographic regions")
+            )
+            metric_occurrences = max(
+                (lowered_combined_text.count(alias) for field in required_fields for alias in FIELD_ALIASES.get(field, [])),
+                default=0,
+            )
+            if has_scope_heading and metric_occurrences >= 2:
+                selection_scope_score = 1.0
         token_overlap = _score_overlap(query_tokens, page_tokens)
         metric_overlap = _score_overlap(query_metrics, page_metrics)
         number_overlap = max(_score_overlap(query_numbers, page_numbers), _score_overlap(query_years, page_years))
@@ -2537,6 +2609,13 @@ def _score_candidate_pages(
                 "company_match_score": company_match_score,
                 "year_match_score": year_match_score,
                 "doc_type_match_score": doc_type_match_score,
+                "statement_types": page_statement_types,
+                "statement_type_match_score": statement_type_match_score,
+                "matched_required_fields": matched_required_fields,
+                "required_field_match_score": required_field_match_score,
+                "matched_required_periods": matched_required_periods,
+                "required_period_match_score": required_period_match_score,
+                "selection_scope_score": selection_scope_score,
                 "table_signal_score": table_signal_score,
                 "has_table_text": bool(table_text.strip()),
                 "initial_chunk_hit_score": initial_chunk_hit_score,
@@ -2562,6 +2641,10 @@ def _score_candidate_pages(
             + config["w_company"] * page["company_match_score"]
             + config["w_year"] * page["year_match_score"]
             + config["w_doc_type"] * page["doc_type_match_score"]
+            + config["w_statement"] * page["statement_type_match_score"]
+            + config["w_required_fields"] * page["required_field_match_score"]
+            + config["w_required_periods"] * page["required_period_match_score"]
+            + config["w_selection_scope"] * page["selection_scope_score"]
             + 0.08 * page["initial_chunk_hit_score_norm"]
             + 0.12 * page["table_signal_score"]
             - page["cover_toc_penalty"]
@@ -2588,6 +2671,10 @@ def _score_candidate_pages(
                 "company_match_score": round(page["company_match_score"], 6),
                 "year_match_score": round(page["year_match_score"], 6),
                 "doc_type_match_score": round(page["doc_type_match_score"], 6),
+                "statement_type_match_score": round(page["statement_type_match_score"], 6),
+                "required_field_match_score": round(page["required_field_match_score"], 6),
+                "required_period_match_score": round(page["required_period_match_score"], 6),
+                "selection_scope_score": round(page["selection_scope_score"], 6),
                 "table_signal_score": round(page["table_signal_score"], 6),
                 "has_table_text": page["has_table_text"],
                 "initial_chunk_hit_score": round(page["initial_chunk_hit_score_norm"], 6),
@@ -2898,6 +2985,12 @@ def _run_two_stage_retrieval(
                 "company_match_score": page.get("company_match_score"),
                 "year_match_score": page.get("year_match_score"),
                 "doc_type_match_score": page.get("doc_type_match_score"),
+                "statement_types": page.get("statement_types", []),
+                "statement_type_match_score": page.get("statement_type_match_score"),
+                "matched_required_fields": page.get("matched_required_fields", {}),
+                "required_field_match_score": page.get("required_field_match_score"),
+                "matched_required_periods": page.get("matched_required_periods", []),
+                "required_period_match_score": page.get("required_period_match_score"),
                 "filter_reason": page.get("filter_reason"),
                 "penalty_reason": page.get("penalty_reason"),
             }
@@ -2917,6 +3010,12 @@ def _run_two_stage_retrieval(
                 "company_match_score": page.get("company_match_score"),
                 "year_match_score": page.get("year_match_score"),
                 "doc_type_match_score": page.get("doc_type_match_score"),
+                "statement_types": page.get("statement_types", []),
+                "statement_type_match_score": page.get("statement_type_match_score"),
+                "matched_required_fields": page.get("matched_required_fields", {}),
+                "required_field_match_score": page.get("required_field_match_score"),
+                "matched_required_periods": page.get("matched_required_periods", []),
+                "required_period_match_score": page.get("required_period_match_score"),
                 "table_signal_score": page.get("table_signal_score"),
                 "has_table_text": page.get("has_table_text"),
                 "initial_chunk_hit_score": page.get("initial_chunk_hit_score"),
@@ -2944,7 +3043,7 @@ def _build_page_first_candidates(
     candidate_k: int,
     config: Dict[str, Any],
 ) -> tuple[List[dict], Dict[str, Any]]:
-    """Promote pages first, then return one best evidence chunk per page.
+    """Promote pages first, then return the best chunk and its direct neighbors.
 
     The initial hybrid search is retained only for inexpensive document
     discovery.  This prevents a frequently mentioned but wrong chunk from
@@ -2954,6 +3053,7 @@ def _build_page_first_candidates(
         return [], {"page_first_enabled": True, "page_first_fallback": "no_chunk_candidates"}
     query_parse = parse_finance_query(query)
     query_parse.update(infer_task_spec(query))
+    query_parse["statement_types"] = infer_statement_types(query, query_parse.get("required_fields") or [])
     query_parse["raw_question"] = query
     selected_docs = _select_doc_stage_documents(
         chunk_candidates,
@@ -2967,7 +3067,50 @@ def _build_page_first_candidates(
     scored_pages, page_meta = _score_candidate_pages(query, pages, chunk_candidates, query_parse, config)
     if _is_cover_filter_enabled():
         scored_pages = [page for page in scored_pages if not page.get("cover_like")]
-    selected_pages = scored_pages[: max(config["page_stage_top_n"], candidate_k // 4)]
+    page_limit = max(config["page_stage_top_n"], candidate_k // 4)
+    priority_pages: list[dict] = []
+    for field in query_parse.get("required_fields") or []:
+        preferred_statements = set(FIELD_STATEMENT_TYPES.get(field, []))
+        match = next(
+            (
+                page
+                for page in scored_pages
+                if field in (page.get("matched_required_fields") or {})
+                and (
+                    not preferred_statements
+                    or preferred_statements & set(page.get("statement_types") or [])
+                )
+            ),
+            None,
+        )
+        if match is None:
+            match = next(
+                (page for page in scored_pages if field in (page.get("matched_required_fields") or {})),
+                None,
+            )
+        if match:
+            priority_pages.append({**match, "required_field_anchor": field})
+    for statement_type in query_parse.get("statement_types") or []:
+        match = next(
+            (page for page in scored_pages if statement_type in (page.get("statement_types") or [])),
+            None,
+        )
+        if match:
+            priority_pages.append({**match, "statement_type_anchor": statement_type})
+    if query_parse.get("task_type") == "selection":
+        match = next((page for page in scored_pages if page.get("selection_scope_score", 0.0) > 0), None)
+        if match:
+            priority_pages.append({**match, "selection_scope_anchor": True})
+    selected_pages = []
+    selected_page_keys = set()
+    for page in priority_pages + scored_pages:
+        key = ((page.get("filename") or ""), _coerce_int(page.get("page_number")) or 0)
+        if key in selected_page_keys:
+            continue
+        selected_page_keys.add(key)
+        selected_pages.append(page)
+        if len(selected_pages) >= page_limit:
+            break
     neighbor_window = max(0, _parse_int(os.getenv("RAG_PAGE_NEIGHBOR_WINDOW"), 0))
     if neighbor_window and selected_pages:
         pages_by_key = {
@@ -3019,17 +3162,33 @@ def _build_page_first_candidates(
                 + 0.15 * _score_overlap(query_metrics, _extract_metric_hints(text))
             )
 
-        best_chunk = max(chunks, key=chunk_priority)
-        for chunk in [best_chunk]:
+        ordered_chunks = sorted(
+            chunks,
+            key=lambda chunk: (_coerce_int(chunk.get("chunk_idx")) if _coerce_int(chunk.get("chunk_idx")) is not None else 10**9, chunk.get("chunk_id", "")),
+        )
+        best_chunk = max(ordered_chunks, key=chunk_priority)
+        anchor_index = ordered_chunks.index(best_chunk)
+        anchor_window = 1 if _is_field_aware_enabled() else 0
+        window_chunks = ordered_chunks[max(0, anchor_index - anchor_window) : anchor_index + anchor_window + 1]
+        window_chunks.sort(key=lambda chunk: (0 if chunk is best_chunk else 1, abs(ordered_chunks.index(chunk) - anchor_index)))
+        for chunk in window_chunks:
+            anchor_distance = abs(ordered_chunks.index(chunk) - anchor_index)
+            score = chunk_priority(chunk) - 0.01 * anchor_distance
             selected_chunks.append(
                 {
                     **chunk,
                     "doc_name": page.get("doc_name") or get_doc_name(page.get("filename", "")),
                     "page_score": page.get("page_score", 0.0),
-                    "score": chunk_priority(chunk),
-                    "rerank_score": chunk_priority(chunk),
+                    "score": score,
+                    "rerank_score": score,
                     "source": "page_first_anchor" if _is_field_aware_enabled() else "page_first",
                     "anchor_chunk_id": best_chunk.get("chunk_id", ""),
+                    "anchor_chunk_offset": ordered_chunks.index(chunk) - anchor_index,
+                    "required_field_anchor": page.get("required_field_anchor", ""),
+                    "statement_type_anchor": page.get("statement_type_anchor", ""),
+                    "matched_required_fields": page.get("matched_required_fields", {}),
+                    "statement_types": page.get("statement_types", []),
+                    "selection_scope_anchor": bool(page.get("selection_scope_anchor")),
                 }
             )
 
@@ -3040,7 +3199,14 @@ def _build_page_first_candidates(
         "page_first_enabled": True,
         "page_first_selected_documents": [item.get("filename", "") for item in selected_docs],
         "page_first_selected_pages": [
-            {"filename": item.get("filename", ""), "page_number": item.get("page_number"), "page_score": item.get("page_score", 0.0), "neighbor_page": bool(item.get("neighbor_page"))}
+            {
+                "filename": item.get("filename", ""),
+                "page_number": item.get("page_number"),
+                "page_score": item.get("page_score", 0.0),
+                "neighbor_page": bool(item.get("neighbor_page")),
+                "required_field_anchor": item.get("required_field_anchor", ""),
+                "statement_type_anchor": item.get("statement_type_anchor", ""),
+            }
             for item in selected_pages
         ],
         "page_first_page_count": len(pages),
@@ -3182,8 +3348,8 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "auto_merge_steps": 0,
     }
     started_at = time.perf_counter()
-    planner_enabled = _is_query_planner_enabled()
-    planner = plan_retrieval_queries(query) if planner_enabled else {
+    planner_enabled = False
+    planner = {
         "enabled": False,
         "intent": "",
         "must_keep_terms": [],
@@ -3196,7 +3362,7 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "constraints": [],
         "parse_error": "",
     }
-    field_aware_query = build_required_field_query(query) if _is_field_aware_enabled() else ""
+    field_aware_query = build_finance_query_rewrite(query) if _is_field_aware_enabled() else ""
     routes = _build_retrieval_routes(query, candidate_k, planner, field_aware_query)
     route_results: list[dict] = []
     per_query_retrieval_counts: list[dict] = []
@@ -3652,6 +3818,7 @@ def finalize_retrieved_documents(
         t_parse = time.perf_counter()
         query_parse = parse_finance_query(query)
         query_parse.update(infer_task_spec(query))
+        query_parse["statement_types"] = infer_statement_types(query, query_parse.get("required_fields") or [])
         query_parse["raw_question"] = query
         query_parse_ms = round((time.perf_counter() - t_parse) * 1000, 2)
         stage_two_meta["query_parse"] = query_parse
@@ -3858,11 +4025,73 @@ def retrieve_documents(
         candidates.get("docs", []),
         final_top_k=top_k,
         enable_page_merge=apply_page_merge or field_aware,
-        adjacent_page_window=0 if field_aware else None,
+        adjacent_page_window=max(0, _parse_int(os.getenv("RAG_CONTEXT_PAGE_WINDOW"), 2)) if field_aware else None,
         adjacent_chunk_window=1 if field_aware else None,
     )
     context_docs = list(finalized.get("context_docs", []) or [])
     combined_meta = {**(candidates.get("meta", {}) or {}), **(finalized.get("meta", {}) or {})}
+    task_spec = parse_finance_query(query)
+    task_spec.update(infer_task_spec(query))
+    task_spec["statement_types"] = infer_statement_types(query, task_spec.get("required_fields") or [])
+    initial_coverage = assess_required_field_coverage(task_spec, context_docs)
+    supplemental_meta = {
+        "supplemental_search_enabled": _parse_bool(os.getenv("RAG_SUPPLEMENTAL_SEARCH_ENABLED"), True),
+        "supplemental_search_attempted": False,
+        "supplemental_search_query": "",
+        "supplemental_search_filenames": [],
+        "supplemental_search_candidate_count": 0,
+        "supplemental_search_error": "",
+        "evidence_coverage_before_supplemental": initial_coverage,
+    }
+    combined_candidates = list(candidates.get("docs", []) or [])
+    supplemental_query = build_supplemental_field_query(query, initial_coverage)
+    if (
+        field_aware
+        and supplemental_meta["supplemental_search_enabled"]
+        and initial_coverage.get("status") in {"partial", "insufficient"}
+        and supplemental_query
+    ):
+        supplemental_meta["supplemental_search_attempted"] = True
+        supplemental_meta["supplemental_search_query"] = supplemental_query
+        scoped_docs = _select_doc_stage_documents(combined_candidates, 3, task_spec)
+        scoped_filenames = list(dict.fromkeys(doc.get("filename") or "" for doc in scoped_docs if doc.get("filename")))
+        supplemental_meta["supplemental_search_filenames"] = scoped_filenames
+        if scoped_filenames:
+            filter_expr = f'({_build_filename_filter(scoped_filenames)}) and (evidence_type == "text_chunk" or evidence_type == "")'
+            try:
+                supplemental = _retrieve_leaf_chunks(
+                    supplemental_query,
+                    top_k=max(1, _parse_int(os.getenv("RAG_SUPPLEMENTAL_CANDIDATE_K"), 12)),
+                    filter_expr=filter_expr,
+                    retrieval_scope="supplemental:required_fields",
+                )
+                supplemental_docs = list(supplemental.get("docs", []) or [])
+                supplemental_meta["supplemental_search_candidate_count"] = len(supplemental_docs)
+                if supplemental_docs:
+                    combined_candidates = _deduplicate_docs(combined_candidates + supplemental_docs)
+                    refreshed_candidates, supplemental_page_meta = _build_page_first_candidates(
+                        query,
+                        combined_candidates,
+                        candidate_k=max(top_k, get_finance_rag_config()["candidate_k"]),
+                        config=get_finance_rag_config(),
+                    )
+                    if refreshed_candidates:
+                        combined_candidates = refreshed_candidates
+                    supplemental_meta["supplemental_page_first_selected_pages"] = supplemental_page_meta.get(
+                        "page_first_selected_pages", []
+                    )
+                    finalized = finalize_retrieved_documents(
+                        query,
+                        combined_candidates,
+                        final_top_k=top_k,
+                        enable_page_merge=True,
+                        adjacent_page_window=max(0, _parse_int(os.getenv("RAG_CONTEXT_PAGE_WINDOW"), 2)),
+                        adjacent_chunk_window=1,
+                    )
+                    context_docs = list(finalized.get("context_docs", []) or [])
+                    combined_meta = {**combined_meta, **(finalized.get("meta", {}) or {})}
+            except (RuntimeError, ValueError, TypeError, OSError) as exc:
+                supplemental_meta["supplemental_search_error"] = f"{type(exc).__name__}: {exc}"
     evidence_group_docs, table_context_meta = _build_evidence_groups(
         query,
         context_docs,
@@ -3871,11 +4100,10 @@ def retrieve_documents(
     )
     if table_aware_config["mode"] != "off" and evidence_group_docs:
         context_docs = evidence_group_docs
-    meta = {**combined_meta, **table_context_meta}
-    task_spec = (meta.get("query_parse") or {})
-    if not task_spec.get("task_type"):
-        task_spec = infer_task_spec(query)
+    meta = {**combined_meta, **table_context_meta, **supplemental_meta}
+    meta["field_aware_enabled"] = _is_field_aware_enabled()
     meta["evidence_coverage"] = assess_required_field_coverage(task_spec, context_docs)
+    meta["evidence_coverage"]["supplemental_search_attempted"] = supplemental_meta["supplemental_search_attempted"]
     meta["latency_breakdown"] = {
         **(candidates.get("meta", {}).get("latency_breakdown", {}) or {}),
         **(finalized.get("meta", {}).get("latency_breakdown", {}) or {}),
@@ -3884,7 +4112,7 @@ def retrieve_documents(
     }
     return {
         "docs": context_docs,
-        "candidate_docs": candidates.get("docs", []),
+        "candidate_docs": combined_candidates,
         "final_retrieved_docs": finalized.get("final_retrieved_docs", []),
         "context_docs": context_docs,
         "meta": meta,

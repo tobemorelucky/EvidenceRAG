@@ -33,7 +33,7 @@ def _response_metadata(prepared: dict, usage: dict | None = None) -> dict:
         "route_reason": prepared["route_reason"],
         "citations": prepared["citations"],
         "evidence_status": prepared["evidence_status"],
-        "calculation": None,
+        "calculation": prepared.get("calculation"),
         "trace_id": prepared["trace_id"],
         "usage": usage or {},
     }
