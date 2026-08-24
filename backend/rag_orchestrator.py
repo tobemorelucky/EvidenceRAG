@@ -130,7 +130,7 @@ def _run_search(query: str) -> dict:
         raise RetrievalServiceError(f"检索服务暂不可用：{exc}") from exc
 
 
-def _open_retrieved_pages(documents: list[dict], limit: int = 10) -> tuple[list[dict], dict]:
+def _open_retrieved_pages(documents: list[dict], limit: int = 15) -> tuple[list[dict], dict]:
     """Replace retrieved snippets with full text from the same already-retrieved pages."""
     requested_pages = select_pages(documents, limit=limit)
     if not requested_pages:
@@ -236,7 +236,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
                 for document in final_docs
             ]
 
-    answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs, limit=10)
+    answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs)
     citations = build_citations(answer_docs)
     query_parse = parse_query(question)
     evidence_coverage = assess_required_field_coverage(query_parse, answer_docs)

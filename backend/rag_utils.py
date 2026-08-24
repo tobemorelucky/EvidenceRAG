@@ -1785,8 +1785,10 @@ def _year_match_score(query_parse: Dict[str, Any], filename: str, page_years: se
         return 0.0
     filename_years = _extract_years(filename)
     text_years = page_years or _extract_years(page_text)
-    if years & (filename_years | text_years):
+    if years & filename_years:
         return 1.0
+    if years & text_years:
+        return 0.5
     return 0.0
 
 

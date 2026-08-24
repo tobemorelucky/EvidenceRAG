@@ -10,6 +10,27 @@ from query_parser import (
 )
 
 
+def test_requested_years_preserve_question_order():
+    parsed = parse_query(
+        "What is the FY2019 ratio using the average balance between FY2018 and FY2019?"
+    )
+
+    assert parsed["required_periods"] == ["2019", "2018"]
+
+
+def test_ratio_directive_preserves_decimal_units_when_percent_not_requested():
+    question = "What is FY2022 return on assets? Round the ratio to two decimals."
+    parsed = {
+        "task_type": "calculation",
+        "formula": "net_income / average(total_assets)",
+        "required_periods": ["2022"],
+    }
+
+    directives = build_answer_directives(question, parsed)
+
+    assert any("decimal without a percent sign" in directive for directive in directives)
+
+
 def test_operating_cash_flow_ratio_has_required_fields():
     parsed = parse_query("What is Adobe's FY2017 operating cash flow ratio? Cash from operations / total current liabilities.")
     assert parsed["task_type"] == "calculation"
@@ -209,6 +230,64 @@ def test_capital_intensity_directive_requires_yes_no_conclusion():
     assert any("capital-intensity conclusion" in directive for directive in directives)
     assert any("universal threshold" in directive for directive in directives)
     assert all("not capital-intensive" not in directive for directive in directives)
+
+
+def test_acquisition_directive_requires_transaction_evidence():
+    directives = build_answer_directives(
+        "What are the main companies acquired during the year?",
+        parse_query("What are the main companies acquired during the year?"),
+    )
+
+    assert any("transaction statements" in directive for directive in directives)
+    assert any("glossary" in directive for directive in directives)
+
+
+def test_best_performance_directive_uses_growth_not_mix():
+    question = "Which category performed best on the top line?"
+    directives = build_answer_directives(question, parse_query(question))
+
+    assert any("change or growth measure" in directive for directive in directives)
+    assert any("revenue mix" in directive for directive in directives)
+
+
+def test_forecast_and_driver_directives_preserve_task_semantics():
+    forecast = "What production changes are expected next year?"
+    drivers = "What drove the change in operating margin?"
+
+    assert any("future action and direction" in item for item in build_answer_directives(forecast, parse_query(forecast)))
+    assert any("explicit MD&A attribution" in item for item in build_answer_directives(drivers, parse_query(drivers)))
+
+
+def test_domestic_scope_directive_excludes_international_table():
+    question = "Which category performed best in the domestic USA market?"
+
+    assert any("Do not substitute an International" in item for item in build_answer_directives(question, parse_query(question)))
+
+
+def test_parse_query_extracts_explicit_rounding_precision():
+    parsed = parse_query("Calculate ROA and round your answer to two decimal places.")
+
+    assert parsed["rounding_decimal_places"] == 2
+
+
+def test_margin_uses_percent_unit_but_roa_formula_remains_decimal():
+    margin_question = "What is FY2015 depreciation and amortization % margin?"
+    margin = parse_query(margin_question)
+    roa = parse_query("What is ROA? Round your answer to two decimal places.")
+
+    assert margin["result_unit"] == "percent"
+    assert roa["result_unit"] == "decimal"
+    assert any(
+        "multiplying the validated decimal ratio by 100" in item
+        for item in build_answer_directives(margin_question, margin)
+    )
+
+
+def test_driver_rewrite_keeps_mda_intent():
+    rewrite = build_finance_query_rewrite("What drove operating margin change in FY2022?")
+
+    assert "drivers" in rewrite
+    assert "management discussion and analysis" in rewrite
 
 
 def test_exchange_does_not_trigger_change_comparison():

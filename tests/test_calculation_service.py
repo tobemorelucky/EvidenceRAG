@@ -1,6 +1,27 @@
 from calculation_service import build_calculation_result
 
 
+def test_calculation_result_applies_only_explicit_final_rounding():
+    task_spec = {
+        "task_type": "calculation",
+        "required_fields": ["net_income", "total_assets"],
+        "formula": "net_income / total_assets",
+        "rounding_decimal_places": 2,
+    }
+    coverage = {
+        "status": "complete",
+        "field_evidence": {
+            "net_income": {"values": ["-546"], "filename": "report.pdf", "page_number": 1},
+            "total_assets": {"values": ["35663"], "filename": "report.pdf", "page_number": 2},
+        },
+    }
+
+    result = build_calculation_result(task_spec, coverage)
+
+    assert result["result"].startswith("-0.0153")
+    assert result["display_result"] == "-0.02"
+
+
 def test_build_calculation_result_uses_decimal_and_keeps_sources():
     task_spec = {
         "task_type": "calculation",
@@ -211,3 +232,219 @@ def test_operating_margin_comparison_records_validated_direction():
     assert result is not None
     assert result["comparison"]["direction"] == "decreased"
     assert result["comparison"]["reported_order"] == "latest_then_prior"
+
+
+def test_structured_rows_select_requested_year_column_instead_of_latest_column():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "cash_from_operations / current_liabilities",
+        "required_fields": ["cash_from_operations", "current_liabilities"],
+        "required_periods": ["2015"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {
+            "filename": "ADOBE_2016_10K.pdf",
+            "page_number": 60,
+            "text": "\n".join(
+                [
+                    "ADOBE SYSTEMS INCORPORATED",
+                    "CONSOLIDATED BALANCE SHEETS",
+                    "December 2, 2016",
+                    "November 27, 2015",
+                    "Total current liabilities 2,811,635 2,213,556",
+                ]
+            ),
+        },
+        {
+            "filename": "ADOBE_2016_10K.pdf",
+            "page_number": 64,
+            "text": "\n".join(
+                [
+                    "ADOBE SYSTEMS INCORPORATED",
+                    "CONSOLIDATED STATEMENTS OF CASH FLOWS",
+                    "Years Ended",
+                    "December 2, 2016",
+                    "November 27, 2015",
+                    "November 28, 2014",
+                    "Net cash provided by operating activities 2,199,728 1,469,502 1,287,010",
+                ]
+            ),
+        },
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["operands"]["cash_from_operations"]["value"] == "1469502"
+    assert result["operands"]["current_liabilities"]["value"] == "2213556"
+    assert result["operands"]["cash_from_operations"]["period"] == "2015"
+    assert result["result"].startswith("0.663")
+
+
+def test_structured_rows_reject_ambiguous_multi_column_row_without_requested_period_header():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "cash_from_operations / current_liabilities",
+        "required_fields": ["cash_from_operations", "current_liabilities"],
+        "required_periods": ["2015"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {"filename": "report.pdf", "page_number": 1, "text": "Total current liabilities 200 180"},
+        {"filename": "report.pdf", "page_number": 2, "text": "Net cash provided by operating activities 100 90"},
+    ]
+
+    assert build_calculation_result(task_spec, coverage, documents) is None
+
+
+def test_structured_rows_ignore_narrative_metric_mentions():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "operating_income / revenue",
+        "required_fields": ["operating_income", "revenue"],
+        "required_periods": ["2022"],
+        "compare_periods": True,
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {
+            "filename": "report.pdf",
+            "page_number": 20,
+            "text": "2022 2021\nForeign currency impacts decreased operating income by 271 and 103",
+        },
+        {
+            "filename": "report.pdf",
+            "page_number": 47,
+            "text": "2022 2021\nOperating income 6,539 7,369\nNet sales 34,229 35,355",
+        },
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["operands"]["operating_income"]["value"] == "6539"
+    assert result["comparison"]["values"][0].startswith("0.191")
+
+
+def test_structured_rows_calculate_average_total_assets_for_roa():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "net_income / average(total_assets)",
+        "required_fields": ["net_income", "total_assets"],
+        "required_periods": ["2022", "2021"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {
+            "filename": "AES_2022_10K.pdf",
+            "page_number": 128,
+            "text": "Consolidated Balance Sheets\n2022 2021\nTotal assets 38,237 34,122",
+        },
+        {
+            "filename": "AES_2022_10K.pdf",
+            "page_number": 130,
+            "text": "Consolidated Statements of Operations\n2022 2021\nNet income (546) (409)",
+        },
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["operands"]["total_assets"]["value"] == ["38237", "34122"]
+    assert result["result"].startswith("-0.015")
+
+
+def test_structured_rows_prefer_target_annual_filing_over_later_quarterly_comparison():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "operating_income - capital_expenditures",
+        "required_fields": ["operating_income", "capital_expenditures"],
+        "required_periods": ["2022"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {
+            "filename": "PEPSICO_2023Q1_EARNINGS.pdf",
+            "page_number": 3,
+            "text": "2023 2022\nOperating profit 6,000 5,267\nCapital spending 600 522",
+        },
+        {
+            "filename": "PEPSICO_2022_10K.pdf",
+            "page_number": 61,
+            "text": "Consolidated Statement of Income\n2022 2021\nOperating profit 11,512 11,162",
+        },
+        {
+            "filename": "PEPSICO_2022_10K.pdf",
+            "page_number": 63,
+            "text": "Consolidated Statement of Cash Flows\n2022 2021\nCapital spending (5,207) (4,625)",
+        },
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["operands"]["operating_income"]["value"] == "11512"
+    assert result["operands"]["capital_expenditures"]["value"] == "5207"
+
+
+def test_structured_rows_reject_parent_only_schedule_and_aocl_reclassification():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "net_income / average(total_assets)",
+        "required_fields": ["net_income", "total_assets"],
+        "required_periods": ["2022", "2021"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {
+            "filename": "AES_2022_10K.pdf",
+            "page_number": 180,
+            "text": "Reclassifications out of AOCL\n2022 2021\nNet income attributable 44 254",
+        },
+        {
+            "filename": "AES_2022_10K.pdf",
+            "page_number": 213,
+            "text": "SCHEDULE I CONDENSED FINANCIAL INFORMATION OF PARENT\n2022 2021\nTotal assets 7,575 7,525",
+        },
+        {
+            "filename": "AES_2022_10K.pdf",
+            "page_number": 83,
+            "text": "Selected Financial Data\n2022 2021\nNet income attributable (546) (409)\nTotal assets 38,363 32,963",
+        },
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["operands"]["net_income"]["value"] == "-546"
+    assert result["operands"]["total_assets"]["value"] == ["38363", "32963"]
+
+
+def test_structured_rows_remove_allowance_amounts_before_receivable_columns():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "accounts_receivable / current_liabilities",
+        "required_fields": ["accounts_receivable", "current_liabilities"],
+        "required_periods": ["2023"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {
+            "filename": "3M_2023Q2_10Q.pdf",
+            "page_number": 4,
+            "text": "\n".join(
+                [
+                    "Consolidated Balance Sheet",
+                    "2023 2022",
+                    "Accounts receivable — net of allowances of $160 and $174 4,947 4,532",
+                    "Total current liabilities 10,936 9,523",
+                ]
+            ),
+        }
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["operands"]["accounts_receivable"]["value"] == "4947"

@@ -269,13 +269,14 @@ def detect_company(question: str) -> Optional[CompanyMatch]:
 
 def extract_years(question: str) -> List[int]:
     text_lower = (question or "").lower()
-    years = {int(item) for item in re.findall(r"\b(20\d{2})\b", text_lower)}
-    for match in re.findall(r"\bfy\s?(\d{2,4})\b", text_lower):
-        if len(match) == 2:
-            years.add(2000 + int(match))
-        else:
-            years.add(int(match))
-    return sorted(years)
+    matches: List[tuple[int, int]] = [
+        (match.start(), int(match.group(1)))
+        for match in re.finditer(r"\b(20\d{2})\b", text_lower)
+    ]
+    for match in re.finditer(r"\bfy\s?(\d{2,4})\b", text_lower):
+        raw = match.group(1)
+        matches.append((match.start(), 2000 + int(raw) if len(raw) == 2 else int(raw)))
+    return list(dict.fromkeys(year for _, year in sorted(matches)))
 
 
 def extract_quarters(question: str) -> List[str]:
@@ -368,6 +369,22 @@ def infer_task_spec(question: str) -> Dict[str, object]:
     return {"task_type": "lookup", "required_fields": [], "formula": ""}
 
 
+def extract_rounding_decimal_places(question: str) -> int | None:
+    """Extract an explicit final-answer precision without guessing a default."""
+    text = (question or "").lower()
+    match = re.search(r"(?:round(?:ed)?(?:\s+your\s+answer)?\s+to|to)\s+(\d+)\s+decimal places?", text)
+    if match:
+        return int(match.group(1))
+    word_match = re.search(
+        r"(?:round(?:ed)?(?:\s+your\s+answer)?\s+to|to)\s+"
+        r"(one|two|three|four|five|six)\s+decimal places?",
+        text,
+    )
+    if not word_match:
+        return None
+    return {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}[word_match.group(1)]
+
+
 def infer_statement_types(question: str, required_fields: Optional[List[str]] = None) -> List[str]:
     """Infer the financial statement families most likely to contain the answer."""
     text = (question or "").lower()
@@ -382,7 +399,7 @@ def infer_statement_types(question: str, required_fields: Optional[List[str]] = 
         statement_types.append("income_statement")
     if "cash flow statement" in text or "statement of cash flows" in text:
         statement_types.append("cash_flow")
-    if any(marker in text for marker in ("why ", "explain", "reason for", "driven by")):
+    if any(marker in text for marker in ("why ", "explain", "reason for", "driven by", "what drove", "driver", "factor")):
         statement_types.append("mda")
     return list(dict.fromkeys(statement_types))
 
@@ -406,7 +423,8 @@ def build_finance_query_rewrite(question: str) -> str:
     """Add only deterministic financial anchors; never generates generic QA text."""
     parsed = parse_query(question)
     required_fields = list(parsed.get("required_fields") or [])
-    if not required_fields:
+    driver_intent = any(marker in (question or "").lower() for marker in ("what drove", "driver", "factor"))
+    if not required_fields and not driver_intent:
         return ""
     labels = [FIELD_ALIASES[field][0] for field in required_fields if FIELD_ALIASES.get(field)]
     periods = [str(value) for value in (parsed.get("required_periods") or [])]
@@ -415,7 +433,10 @@ def build_finance_query_rewrite(question: str) -> str:
         for item in (parsed.get("statement_types") or [])
     ]
     company = str(parsed.get("company") or "").replace("_", " ")
-    anchors = [company] + labels + statement_labels + periods + list(parsed.get("doc_types") or [])
+    intent_anchors = ["drivers", "management discussion and analysis"] if driver_intent else []
+    if driver_intent and "operating margin" in (question or "").lower():
+        intent_anchors.extend(["operating expenses", "cost of sales", "selling general and administrative", "special items"])
+    anchors = [company] + labels + statement_labels + periods + list(parsed.get("doc_types") or []) + intent_anchors
     return "; ".join(filter(None, dict.fromkeys(anchors)))
 
 
@@ -574,9 +595,18 @@ def parse_query(question: str) -> Dict[str, object]:
         "required_periods": [str(year) for year in extract_years(question)] + extract_quarters(question),
     }
     task_spec = infer_task_spec(question)
+    formula = str(task_spec.get("formula") or "")
+    result_unit = ""
+    if task_spec.get("task_type") == "calculation" and "/" in formula:
+        if re.search(r"(?:%|\bpercent(?:age)?\b|\bmargin\b)", question or "", re.IGNORECASE):
+            result_unit = "percent"
+        else:
+            result_unit = "decimal"
     return {
         **parsed,
         **task_spec,
+        "rounding_decimal_places": extract_rounding_decimal_places(question),
+        "result_unit": result_unit,
         "statement_types": infer_statement_types(question, list(task_spec.get("required_fields") or [])),
     }
 
@@ -599,8 +629,28 @@ def build_answer_directives(question: str, task_spec: Dict[str, object]) -> List
         directives.append("Use operating working capital: receivables + inventory + other current assets - accounts payable - other accrued liabilities; exclude cash and short-term debt.")
     if task_spec.get("formula") == "revenue / average(ppe)":
         directives.append("Keep full precision through the average-PP&E calculation and round only the final ratio to two decimals.")
+    if (
+        task_spec.get("task_type") == "calculation"
+        and "/" in str(task_spec.get("formula") or "")
+        and task_spec.get("result_unit") != "percent"
+    ):
+        directives.append("Return the requested ratio as a decimal without a percent sign unless the question explicitly requests percent or percentage units.")
+    if task_spec.get("result_unit") == "percent":
+        directives.append("Present the final ratio as a percentage by multiplying the validated decimal ratio by 100. Keep the calculation operands and formula unchanged.")
     if "capital-intensive" in text or "capital intensive" in text:
         directives.append("Compare capital spending and net PP&E with revenue, state the supported ratios, and tie any yes/no capital-intensity conclusion to the supplied evidence. Do not apply a universal threshold or infer the label from absolute spending alone.")
+    if re.search(r"\b(?:acquire|acquired|acquisition|acquisitions)\b", text):
+        directives.append("Identify acquisition targets only from transaction statements that say the company acquired or completed an acquisition. Do not infer targets from a glossary, definition list, restructuring-cost table, or an announced but not completed transaction.")
+    if re.search(r"\b(?:performed best|best performance|highest growth|top[- ]line)\b", text):
+        directives.append("Interpret performance using the table's change or growth measure, such as comparable-sales or revenue growth. Do not substitute revenue mix, share, or absolute size unless the question explicitly asks for it.")
+    if re.search(r"\b(?:domestic|usa|u\.s\.)\b", text):
+        directives.append("Use only the explicitly labeled Domestic or U.S. scope for the requested result. Do not substitute an International, foreign, or consolidated table when a Domestic table is available.")
+    if re.search(r"\b(?:international|foreign|outside the u\.s\.)\b", text):
+        directives.append("Use only the explicitly labeled International or foreign scope for the requested result. Do not substitute a Domestic or U.S. table.")
+    if re.search(r"\b(?:forecast|expected|expects|planned|plans|outlook)\b", text):
+        directives.append("For forecasts, report the future action and direction explicitly (for example increase, decrease, resume, pause, or stop), and distinguish the current rate from the forecast rate.")
+    if re.search(r"\b(?:what drove|drivers?|factors?)\b", text):
+        directives.append("For change drivers, prioritize the filing's explicit MD&A attribution and material one-off items. Do not infer drivers solely from adjacent statement rows.")
     return directives
 
 

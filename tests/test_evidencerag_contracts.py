@@ -63,7 +63,8 @@ def test_prompt_contract_requires_cited_grounded_answers():
     assert "same company, reporting period, unit, and accounting scope" in prompts.ANSWER_SYSTEM_PROMPT
     assert "including Corporate/Other rows and negative values" in prompts.ANSWER_SYSTEM_PROMPT
     assert "do not substitute a geographic, operating, or reportable segment value" in prompts.ANSWER_SYSTEM_PROMPT
-    assert "Declare it irrelevant only when the supplied evidence explicitly supports" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "Do not manufacture operating income from pretax income" in prompts.ANSWER_SYSTEM_PROMPT
+    assert 'When a "Validated calculation contract" is supplied' in prompts.ANSWER_SYSTEM_PROMPT
     assert "an explicitly labeled Total row" in prompts.ANSWER_SYSTEM_PROMPT
     assert "Keep full precision for intermediate arithmetic" in prompts.ANSWER_SYSTEM_PROMPT
     assert "do not apply a universal threshold across industries" in prompts.ANSWER_SYSTEM_PROMPT
