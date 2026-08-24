@@ -267,6 +267,7 @@ def main() -> None:
     sys.path.insert(0, str(BACKEND))
     from answer_generator import generate_answer
     from rag_orchestrator import prepare_rag_response
+    completed_run_ids: set[str] = set()
 
     @traceable(name="EvidenceRAG.retrieve", run_type="retriever")
     def retrieve(question: str) -> dict:
@@ -344,6 +345,7 @@ def main() -> None:
         if output_handle:
             output_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             output_handle.flush()
+        completed_run_ids.add(financebench_id)
         return result
 
     metadata = {
@@ -386,6 +388,18 @@ def main() -> None:
         )
         print(f"Experiment: {results.experiment_name}", flush=True)
         if not args.skip_auto_judge:
+            expected_ids = {
+                (getattr(example, "metadata", None) or {}).get("financebench_id")
+                for example in examples
+            }
+            missing_completed_ids = set(filter(None, expected_ids)) - completed_run_ids
+            if missing_completed_ids:
+                print(
+                    "[judge] skipped because target runs failed before producing answers: "
+                    + ", ".join(sorted(missing_completed_ids)),
+                    flush=True,
+                )
+                return
             judge_output = args.judge_output or (
                 ROOT / "reports" / f"{results.experiment_name}_judge.jsonl"
             )

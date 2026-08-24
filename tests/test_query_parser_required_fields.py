@@ -1,6 +1,7 @@
 from query_parser import (
     assess_required_field_coverage,
     build_answer_directives,
+    build_finance_query_rewrite,
     build_required_field_query,
     build_supplemental_field_query,
     infer_page_statement_types,
@@ -36,10 +37,10 @@ def test_ebitda_less_capex_contract_is_complete_when_operands_are_present():
     assert coverage["formula"] == "operating_income + depreciation_amortization - capital_expenditures"
 
 
-def test_required_field_query_keeps_question_and_adds_statement_labels():
+def test_required_field_query_returns_concise_statement_anchors():
     question = "What is Adobe's FY2017 operating cash flow ratio?"
     rewritten = build_required_field_query(question)
-    assert question in rewritten
+    assert question not in rewritten
     assert "net cash provided by operating activities" in rewritten
     assert "total current liabilities" in rewritten
 
@@ -130,10 +131,19 @@ def test_supplemental_query_does_not_run_for_period_only_gap():
     assert query == ""
 
 
-def test_working_capital_uses_difference_formula():
+def test_plain_working_capital_uses_standard_difference_formula():
     parsed = parse_query("Does Corning have positive working capital based on FY2022 data?")
 
     assert parsed["task_type"] == "calculation"
+    assert parsed["required_fields"] == ["current_assets", "current_liabilities"]
+    assert parsed["formula"] == "current_assets - current_liabilities"
+    assert parsed["calculation_basis"] == "standard_working_capital"
+    assert parsed["company"] == "corning"
+
+
+def test_explicit_operating_working_capital_uses_operating_formula():
+    parsed = parse_query("Calculate operating working capital for FY2022.")
+
     assert parsed["required_fields"] == [
         "accounts_receivable",
         "inventory",
@@ -142,7 +152,7 @@ def test_working_capital_uses_difference_formula():
         "other_accrued_liabilities",
     ]
     assert parsed["formula"] == "accounts_receivable + inventory + other_current_assets - accounts_payable - other_accrued_liabilities"
-    assert parsed["company"] == "corning"
+    assert parsed["calculation_basis"] == "operating_working_capital"
 
 
 def test_selection_question_requires_metric_field():
@@ -159,12 +169,21 @@ def test_fixed_asset_turnover_prefers_primary_statements():
     assert parsed["statement_types"] == ["income_statement", "balance_sheet"]
 
 
+def test_capex_lookup_requires_capital_expenditures_field():
+    parsed = parse_query("How much did the company spend in capex in FY2018?")
+
+    assert parsed["task_type"] == "lookup"
+    assert parsed["required_fields"] == ["capital_expenditures"]
+    assert parsed["statement_types"] == ["cash_flow"]
+
+
 def test_company_store_count_directive_requires_total_row():
-    question = "What was the change in Best Buy's total store count from FY2021 to FY2022?"
+    question = "What was the change in the company's total store count from FY2021 to FY2022?"
     directives = build_answer_directives(question, parse_query(question))
 
     assert any("Total row" in directive for directive in directives)
-    assert any("branded 'Best Buy' subrow" in directive for directive in directives)
+    assert any("brand, segment, geography" in directive for directive in directives)
+    assert all("Best Buy" not in directive for directive in directives)
 
 
 def test_quick_ratio_directive_requires_direct_conclusion():
@@ -175,9 +194,55 @@ def test_quick_ratio_directive_requires_direct_conclusion():
     assert any("generic business-model or cash-flow caveat" in directive for directive in directives)
 
 
+def test_comparison_directive_requires_one_conclusion_after_comparison():
+    question = "Did operating margin increase between FY2021 and FY2022?"
+    directives = build_answer_directives(question, parse_query(question))
+
+    assert any("before stating the directional conclusion" in directive for directive in directives)
+    assert any("without an initial guess or self-correction" in directive for directive in directives)
+
+
 def test_capital_intensity_directive_requires_yes_no_conclusion():
     question = "Based on capital spending, net PP&E and revenue, is the company capital-intensive?"
     directives = build_answer_directives(question, parse_query(question))
 
-    assert any("yes/no capital-intensity conclusion" in directive for directive in directives)
-    assert any("not capital-intensive" in directive for directive in directives)
+    assert any("capital-intensity conclusion" in directive for directive in directives)
+    assert any("universal threshold" in directive for directive in directives)
+    assert all("not capital-intensive" not in directive for directive in directives)
+
+
+def test_exchange_does_not_trigger_change_comparison():
+    parsed = parse_query("Which securities trade on a national securities exchange in 2022?")
+
+    assert parsed["task_type"] == "lookup"
+
+
+def test_finance_rewrite_is_concise_and_keeps_financial_anchors():
+    question = "According to the statements, what is AMD FY2015 depreciation and amortization margin?"
+    rewrite = build_finance_query_rewrite(question)
+
+    assert question not in rewrite
+    assert "amd" in rewrite
+    assert "depreciation and amortization" in rewrite
+    assert "net revenue" in rewrite
+    assert "2015" in rewrite
+
+
+def test_revenue_field_match_rejects_percentage_context():
+    text = (
+        "International sales as a percentage of net revenue were 75% in 2015.\n"
+        "The increase in net revenue from domestic products reflected demand.\n"
+        "Liquidity was $785 million."
+    )
+
+    assert match_required_fields_in_text(["revenue"], text) == {}
+
+
+def test_exchange_registered_securities_uses_cover_page_field():
+    question = "Which debt securities are registered to trade on a national securities exchange?"
+    parsed = parse_query(question)
+    directives = build_answer_directives(question, parsed)
+
+    assert parsed["task_type"] == "lookup"
+    assert parsed["required_fields"] == ["exchange_registered_securities"]
+    assert any("Section 12(b)" in directive for directive in directives)

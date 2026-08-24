@@ -31,6 +31,7 @@ def _summarize_split(label: str, answers_path: Path, judge_path: Path) -> tuple[
         raise SystemExit(f"{label}: not every answer has a matching Judge run_id.")
 
     traces = [item.get("rag_trace") or {} for item in answers]
+    usages = [item.get("usage") or {} for item in answers]
     correct = sum(int(item.get("score") or 0) for item in matched if item)
     return (
         {
@@ -42,6 +43,9 @@ def _summarize_split(label: str, answers_path: Path, judge_path: Path) -> tuple[
             "empty_retrievals": sum(trace.get("rrf_fused_candidate_count") == 0 for trace in traces),
             "rerank_providers": dict(sorted(Counter(trace.get("rerank_provider") or "unknown" for trace in traces).items())),
             "remote_rerank_input_chars": sum(int(trace.get("remote_rerank_input_chars") or 0) for trace in traces),
+            "answer_input_tokens": sum(int(usage.get("input_tokens") or 0) for usage in usages),
+            "answer_output_tokens": sum(int(usage.get("output_tokens") or 0) for usage in usages),
+            "answer_total_tokens": sum(int(usage.get("total_tokens") or 0) for usage in usages),
             "answer_file": str(answers_path.relative_to(ROOT)),
             "judge_file": str(judge_path.relative_to(ROOT)),
         },
@@ -86,6 +90,9 @@ def main() -> None:
             "accuracy": round(correct / total, 4) if total else 0.0,
             "empty_retrievals": sum(item["empty_retrievals"] for item in splits.values()),
             "remote_rerank_input_chars": sum(item["remote_rerank_input_chars"] for item in splits.values()),
+            "answer_input_tokens": sum(item["answer_input_tokens"] for item in splits.values()),
+            "answer_output_tokens": sum(item["answer_output_tokens"] for item in splits.values()),
+            "answer_total_tokens": sum(item["answer_total_tokens"] for item in splits.values()),
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

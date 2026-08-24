@@ -130,6 +130,11 @@ FIELD_ALIASES = {
     "depreciation_amortization": ["depreciation and amortization", "depreciation, amortization"],
     "capital_expenditures": ["capital expenditures", "capital expenditure", "capital spending", "purchases of property"],
     "store_count": ["total stores", "number of stores", "store count", "stores"],
+    "exchange_registered_securities": [
+        "securities registered pursuant to section 12(b)",
+        "title of each class",
+        "name of each exchange on which registered",
+    ],
 }
 
 METRIC_REQUIRED_FIELDS = {
@@ -137,6 +142,7 @@ METRIC_REQUIRED_FIELDS = {
     "revenue": ["revenue"],
     "net sales": ["revenue"],
     "store count": ["store_count"],
+    "capex": ["capital_expenditures"],
     "assets": ["total_assets"],
 }
 
@@ -311,33 +317,51 @@ def infer_task_spec(question: str) -> Dict[str, object]:
         return {"task_type": "calculation", "required_fields": ["cash_from_operations", "current_liabilities"], "formula": "cash_from_operations / current_liabilities"}
     if "working capital ratio" in text:
         return {"task_type": "calculation", "required_fields": ["current_assets", "current_liabilities"], "formula": "current_assets / current_liabilities"}
-    if "working capital" in text:
+    if "operating working capital" in text:
         return {
             "task_type": "calculation",
             "required_fields": ["accounts_receivable", "inventory", "other_current_assets", "accounts_payable", "other_accrued_liabilities"],
             "formula": "accounts_receivable + inventory + other_current_assets - accounts_payable - other_accrued_liabilities",
             "calculation_basis": "operating_working_capital",
         }
+    if "working capital" in text:
+        return {
+            "task_type": "calculation",
+            "required_fields": ["current_assets", "current_liabilities"],
+            "formula": "current_assets - current_liabilities",
+            "calculation_basis": "standard_working_capital",
+        }
     if "fixed asset turnover" in text:
         return {"task_type": "calculation", "required_fields": ["revenue", "ppe"], "formula": "revenue / average(ppe)"}
     if "return on assets" in text or re.search(r"\broa\b", text):
         return {"task_type": "calculation", "required_fields": ["net_income", "total_assets"], "formula": "net_income / average(total_assets)"}
     if "operating margin" in text:
-        return {"task_type": "calculation", "required_fields": ["operating_income", "revenue"], "formula": "operating_income / revenue"}
+        compare_periods = any(marker in text for marker in ("improv", "trend", "profile", "increase", "decrease", "change"))
+        return {
+            "task_type": "calculation",
+            "required_fields": ["operating_income", "revenue"],
+            "formula": "operating_income / revenue",
+            "compare_periods": compare_periods,
+        }
     if "depreciation" in text and "margin" in text:
         return {"task_type": "calculation", "required_fields": ["depreciation_amortization", "revenue"], "formula": "depreciation_amortization / revenue"}
     if "ebitda" in text and ("capex" in text or "capital expenditure" in text or "capital spending" in text):
         return {"task_type": "calculation", "required_fields": ["operating_income", "depreciation_amortization", "capital_expenditures"], "formula": "operating_income + depreciation_amortization - capital_expenditures"}
+    if any(marker in text for marker in ("capex", "capital expenditure", "capital spending")):
+        task_type = "comparison" if any(marker in text for marker in ("increase", "decrease", "change", "between", "versus", " vs ")) else "lookup"
+        return {"task_type": task_type, "required_fields": ["capital_expenditures"], "formula": ""}
     if any(marker in text for marker in ("pp&e", "ppe", "ppne", "property, plant and equipment", "property plant and equipment")):
         task_type = "comparison" if any(marker in text for marker in ("increase", "decrease", "change", "grow", "between", "versus", " vs ")) else "lookup"
         return {"task_type": task_type, "required_fields": ["ppe"], "formula": ""}
     if "capital-intensive" in text or "capital intensive" in text:
         return {"task_type": "judgment", "required_fields": ["capital_expenditures", "revenue", "ppe"], "formula": ""}
+    if "securit" in text and "registered" in text and "exchange" in text:
+        return {"task_type": "lookup", "required_fields": ["exchange_registered_securities"], "formula": ""}
     if any(marker in text for marker in ("highest", "lowest", "largest", "smallest", "which region", "which segment")):
         metrics = extract_metrics(question)
         required_fields = list(dict.fromkeys(field for metric in metrics for field in METRIC_REQUIRED_FIELDS.get(metric, [])))
         return {"task_type": "selection", "required_fields": required_fields, "formula": ""}
-    if any(marker in text for marker in ("increase", "decrease", "change", "compare", "between", "versus", " vs ")):
+    if any(re.search(rf"\b{re.escape(marker)}\b", text) for marker in ("increase", "decrease", "change", "compare", "between", "versus")) or " vs " in text:
         metrics = extract_metrics(question)
         required_fields = list(dict.fromkeys(field for metric in metrics for field in METRIC_REQUIRED_FIELDS.get(metric, [])))
         return {"task_type": "comparison", "required_fields": required_fields, "formula": ""}
@@ -390,8 +414,9 @@ def build_finance_query_rewrite(question: str) -> str:
         STATEMENT_TYPE_LABELS.get(item, item)
         for item in (parsed.get("statement_types") or [])
     ]
-    anchors = labels + statement_labels + periods + list(parsed.get("doc_types") or [])
-    return f"{question}\nFinancial retrieval anchors: {'; '.join(dict.fromkeys(anchors))}"
+    company = str(parsed.get("company") or "").replace("_", " ")
+    anchors = [company] + labels + statement_labels + periods + list(parsed.get("doc_types") or [])
+    return "; ".join(filter(None, dict.fromkeys(anchors)))
 
 
 def build_supplemental_field_query(question: str, coverage: Dict[str, object]) -> str:
@@ -429,6 +454,19 @@ def match_required_fields_in_text(required_fields: List[str], text: str) -> Dict
     matched: Dict[str, str] = {}
     for field in required_fields:
         for alias in FIELD_ALIASES.get(field, []):
+            if field == "revenue":
+                valid_revenue_line = False
+                for line in text.splitlines():
+                    lowered_line = line.lower()
+                    position = lowered_line.find(alias.lower())
+                    if position < 0 or "percentage of" in lowered_line or "deferred revenue" in lowered_line:
+                        continue
+                    tail = line[position + len(alias) : position + len(alias) + 120]
+                    if _FINANCIAL_NUMBER_PATTERN.search(tail):
+                        valid_revenue_line = True
+                        break
+                if not valid_revenue_line:
+                    continue
             if _nearby_financial_numbers(text, alias):
                 matched[field] = alias
                 break
@@ -551,14 +589,18 @@ def build_answer_directives(question: str, task_spec: Dict[str, object]) -> List
         directives.append("Calculate the quick ratio and give the requested healthy/not-healthy conclusion directly. Do not add or end with a generic business-model or cash-flow caveat unless the evidence explicitly states the ratio is inapplicable.")
     if task_spec.get("task_type") == "selection":
         directives.append("Compare every row in the shared candidate table, including Corporate/Other and negative values, before selecting the minimum or maximum.")
+    if task_spec.get("task_type") == "comparison" or len(task_spec.get("required_periods") or []) >= 2:
+        directives.append("Compare every requested reporting period before stating the directional conclusion. Give one final, internally consistent conclusion without an initial guess or self-correction.")
     if "store" in text and task_spec.get("task_type") == "comparison":
-        directives.append("Use the explicitly labeled Total row for this company-level store-count question. Ignore the branded 'Best Buy' subrow and report the Total counts and their change.")
+        directives.append("For a company-level store-count question, use the explicitly labeled Total row. Do not substitute a brand, segment, geography, or other subcategory row unless the question names that scope.")
+    if "securit" in text and "registered" in text and "exchange" in text:
+        directives.append("Use the filing cover-page table headed Securities registered pursuant to Section 12(b). If it lists only non-debt classes, answer that no debt securities are registered; do not treat unrelated outstanding debt tables as exchange-registration evidence.")
     if task_spec.get("calculation_basis") == "operating_working_capital":
         directives.append("Use operating working capital: receivables + inventory + other current assets - accounts payable - other accrued liabilities; exclude cash and short-term debt.")
     if task_spec.get("formula") == "revenue / average(ppe)":
         directives.append("Keep full precision through the average-PP&E calculation and round only the final ratio to two decimals.")
     if "capital-intensive" in text or "capital intensive" in text:
-        directives.append("Give the requested yes/no capital-intensity conclusion after comparing capital spending and net PP&E with revenue. Low-single-digit capital spending as a share of revenue together with net PP&E well below annual revenue supports a 'not capital-intensive' conclusion; do not stop at 'no benchmark'.")
+        directives.append("Compare capital spending and net PP&E with revenue, state the supported ratios, and tie any yes/no capital-intensity conclusion to the supplied evidence. Do not apply a universal threshold or infer the label from absolute spending alone.")
     return directives
 
 

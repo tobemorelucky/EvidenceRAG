@@ -3071,23 +3071,24 @@ def _build_page_first_candidates(
     priority_pages: list[dict] = []
     for field in query_parse.get("required_fields") or []:
         preferred_statements = set(FIELD_STATEMENT_TYPES.get(field, []))
-        match = next(
-            (
-                page
-                for page in scored_pages
-                if field in (page.get("matched_required_fields") or {})
-                and (
-                    not preferred_statements
-                    or preferred_statements & set(page.get("statement_types") or [])
-                )
-            ),
-            None,
-        )
-        if match is None:
-            match = next(
-                (page for page in scored_pages if field in (page.get("matched_required_fields") or {})),
-                None,
+        aliases = FIELD_ALIASES.get(field, [])
+        matches = [page for page in scored_pages if field in (page.get("matched_required_fields") or {})]
+
+        def _field_anchor_score(page: dict) -> tuple[int, int, int, float]:
+            matched_alias = (page.get("matched_required_fields") or {}).get(field, "")
+            try:
+                alias_quality = len(aliases) - aliases.index(matched_alias)
+            except ValueError:
+                alias_quality = 0
+            statement_quality = int(
+                bool(preferred_statements & set(page.get("statement_types") or []))
             )
+            company_quality = int(
+                not query_parse.get("company") or float(page.get("company_match_score", 0.0) or 0.0) > 0
+            )
+            return company_quality, alias_quality, statement_quality, float(page.get("page_score", 0.0) or 0.0)
+
+        match = max(matches, key=_field_anchor_score) if matches else None
         if match:
             priority_pages.append({**match, "required_field_anchor": field})
     for statement_type in query_parse.get("statement_types") or []:
@@ -3139,7 +3140,15 @@ def _build_page_first_candidates(
                             "neighbor_page": True,
                             "neighbor_anchor_page": anchor_page,
                         }
-        selected_pages = sorted(expanded_pages.values(), key=lambda page: page.get("page_score", 0.0), reverse=True)
+        selected_pages = sorted(
+            expanded_pages.values(),
+            key=lambda page: (
+                bool(page.get("required_field_anchor")),
+                bool(page.get("statement_type_anchor")),
+                float(page.get("page_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
 
     query_tokens = _extract_keyword_tokens(query) | _expand_finance_operand_tokens(query)
     query_metrics = _extract_metric_hints(query)

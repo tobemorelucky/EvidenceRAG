@@ -146,3 +146,68 @@ def test_structured_rows_prefer_net_receivables_and_total_current_liabilities():
     assert result["operands"]["accounts_receivable"]["value"] == "24506"
     assert result["operands"]["current_liabilities"]["value"] == "50171"
     assert result["result"].startswith("0.540")
+
+
+def test_cash_flow_capex_outflow_is_subtracted_once():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "operating_income + depreciation_amortization - capital_expenditures",
+        "required_fields": ["operating_income", "depreciation_amortization", "capital_expenditures"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {"filename": "report.pdf", "page_number": 1, "text": "Operating profit 11,512"},
+        {
+            "filename": "report.pdf",
+            "page_number": 2,
+            "text": "Depreciation and amortization 2,763\nCapital spending (5,207)",
+        },
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["operands"]["capital_expenditures"]["value"] == "5207"
+    assert result["result"] == "9068"
+
+
+def test_revenue_operand_rejects_percentage_of_revenue_sentence():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "depreciation_amortization / revenue",
+        "required_fields": ["depreciation_amortization", "revenue"],
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {"filename": "report.pdf", "page_number": 1, "text": "Depreciation and amortization 167"},
+        {
+            "filename": "report.pdf",
+            "page_number": 2,
+            "text": "International sales as a percentage of net revenue were 75% in 2015\nDeferred revenue 94",
+        },
+    ]
+
+    assert build_calculation_result(task_spec, coverage, documents) is None
+
+
+def test_operating_margin_comparison_records_validated_direction():
+    task_spec = {
+        "task_type": "calculation",
+        "formula": "operating_income / revenue",
+        "required_fields": ["operating_income", "revenue"],
+        "compare_periods": True,
+    }
+    coverage = {"status": "complete", "field_evidence": {}}
+    documents = [
+        {
+            "filename": "report.pdf",
+            "page_number": 53,
+            "text": "Operating income 6,098 5,802\nTotal revenue 17,606 15,785",
+        }
+    ]
+
+    result = build_calculation_result(task_spec, coverage, documents)
+
+    assert result is not None
+    assert result["comparison"]["direction"] == "decreased"
+    assert result["comparison"]["reported_order"] == "latest_then_prior"

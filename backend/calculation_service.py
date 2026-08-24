@@ -32,6 +32,10 @@ def _row_values(documents: List[dict], aliases: List[str], field: str = "") -> t
             matches = [(index, item) for index, item in enumerate(aliases) if item.lower() in lowered]
             if not matches:
                 continue
+            if field == "revenue" and re.search(r"(?:sales\s+)?(?:as a\s+)?percentage of (?:net |total )?revenue", lowered):
+                continue
+            if field == "revenue" and "deferred revenue" in lowered:
+                continue
             alias_index, alias = min(matches, key=lambda item: (item[0], -len(item[1])))
             tail = line[lowered.find(alias.lower()) + len(alias) :]
             tail = re.sub(r"\([^)]*notes?[^)]*\)", "", tail, flags=re.IGNORECASE)
@@ -84,19 +88,23 @@ def _build_row_calculation(task_spec: Dict[str, object], documents: List[dict]) 
         return None
 
     operands: Dict[str, dict] = {}
+    value_series: Dict[str, List[str]] = {}
     expression = formula
     for field in fields:
         values, source = _row_values(documents, FIELD_ALIASES.get(field, []), str(field))
         if not values:
             return None
+        value_series[str(field)] = values
         if formula == "revenue / average(ppe)" and field == "ppe":
             if len(values) < 2:
                 return None
             replacement = f"(({values[0]}) + ({values[1]})) / 2"
             operand_value: object = values[:2]
         else:
-            replacement = f"({values[0]})"
             operand_value = values[0]
+            if field == "capital_expenditures" and re.search(rf"-\s*{re.escape(str(field))}\b", formula):
+                operand_value = operand_value.lstrip("-")
+            replacement = f"({operand_value})"
         expression = re.sub(rf"\b{re.escape(str(field))}\b", replacement, expression)
         operands[field] = {"value": operand_value, **source}
 
@@ -105,7 +113,7 @@ def _build_row_calculation(task_spec: Dict[str, object], documents: List[dict]) 
         calculated = calculate(expression)
     except ValueError:
         return None
-    return {
+    result = {
         "formula": formula,
         "expression": calculated["expression"],
         "operands": operands,
@@ -113,6 +121,30 @@ def _build_row_calculation(task_spec: Dict[str, object], documents: List[dict]) 
         "status": "calculated",
         "source": "structured_row_decimal",
     }
+    if task_spec.get("compare_periods") and all(len(value_series.get(str(field), [])) >= 2 for field in fields):
+        expressions = []
+        values = []
+        for period_index in range(2):
+            period_expression = formula
+            for field in fields:
+                period_expression = re.sub(
+                    rf"\b{re.escape(str(field))}\b",
+                    f"({value_series[str(field)][period_index]})",
+                    period_expression,
+                )
+            period_result = calculate(period_expression)
+            expressions.append(period_result["expression"])
+            values.append(period_result["result"])
+        from decimal import Decimal
+
+        latest, prior = Decimal(values[0]), Decimal(values[1])
+        result["comparison"] = {
+            "reported_order": "latest_then_prior",
+            "values": values,
+            "expressions": expressions,
+            "direction": "increased" if latest > prior else "decreased" if latest < prior else "unchanged",
+        }
+    return result
 
 
 def build_calculation_result(
@@ -141,6 +173,8 @@ def build_calculation_result(
         if len(values) != 1:
             return None
         value = values[0]
+        if field == "capital_expenditures" and re.search(rf"-\s*{re.escape(str(field))}\b", formula):
+            value = value.lstrip("-")
         source_key = (str(evidence.get("filename") or ""), evidence.get("page_number"), value)
         if source_key in used_sources:
             return None
@@ -182,4 +216,11 @@ def format_calculation_evidence(calculation: Dict[str, object] | None) -> str:
             f"- Result: {calculation.get('result')}",
         ]
     )
+    comparison = calculation.get("comparison") or {}
+    if comparison:
+        lines.append(
+            "- Validated comparison (latest reported period vs prior reported period): "
+            f"{comparison.get('values', ['?', '?'])[0]} vs {comparison.get('values', ['?', '?'])[1]}; "
+            f"direction = {comparison.get('direction')}"
+        )
     return "\n".join(lines)

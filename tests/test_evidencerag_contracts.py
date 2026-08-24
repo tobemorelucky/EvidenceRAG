@@ -66,6 +66,9 @@ def test_prompt_contract_requires_cited_grounded_answers():
     assert "Declare it irrelevant only when the supplied evidence explicitly supports" in prompts.ANSWER_SYSTEM_PROMPT
     assert "an explicitly labeled Total row" in prompts.ANSWER_SYSTEM_PROMPT
     assert "Keep full precision for intermediate arithmetic" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "do not apply a universal threshold across industries" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "never emit a draft conclusion followed by a correction" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "Best Buy" not in prompts.ANSWER_SYSTEM_PROMPT
     assert prompts.PROMPT_VERSION
 
 

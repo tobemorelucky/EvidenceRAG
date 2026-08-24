@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from agent_tools import find_evidence, open_pages, select_pages
 from calculation_service import build_calculation_result, format_calculation_evidence
+from evidence_context import build_compact_evidence
 from prompts import PROMPT_VERSION
 from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
 from rag_pipeline import run_rag_graph
@@ -129,6 +130,39 @@ def _run_search(query: str) -> dict:
         raise RetrievalServiceError(f"检索服务暂不可用：{exc}") from exc
 
 
+def _open_retrieved_pages(documents: list[dict], limit: int = 10) -> tuple[list[dict], dict]:
+    """Replace retrieved snippets with full text from the same already-retrieved pages."""
+    requested_pages = select_pages(documents, limit=limit)
+    if not requested_pages:
+        return documents, {"answer_page_open_requested": 0, "answer_page_opened": 0}
+    started = time.perf_counter()
+    try:
+        opened_pages = open_pages(requested_pages, limit=limit)
+    except Exception as exc:
+        return documents, {
+            "answer_page_open_requested": len(requested_pages),
+            "answer_page_opened": 0,
+            "answer_page_open_error": f"{type(exc).__name__}: {exc}",
+            "answer_page_open_latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+    opened_by_page = {
+        (item.get("filename"), item.get("page_number")): item
+        for item in opened_pages
+    }
+    enriched = [
+        {
+            **document,
+            **opened_by_page.get((document.get("filename"), document.get("page_number")), {}),
+        }
+        for document in documents
+    ]
+    return enriched, {
+        "answer_page_open_requested": len(requested_pages),
+        "answer_page_opened": len(opened_pages),
+        "answer_page_open_latency_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
+
+
 def _agent_queries(question: str) -> list[str]:
     rewrite = build_finance_query_rewrite(question)
     return [rewrite] if rewrite and rewrite != question else []
@@ -202,14 +236,15 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
                 for document in final_docs
             ]
 
-    citations = build_citations(final_docs)
+    answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs, limit=10)
+    citations = build_citations(answer_docs)
     query_parse = parse_query(question)
-    evidence_coverage = assess_required_field_coverage(query_parse, final_docs)
+    evidence_coverage = assess_required_field_coverage(query_parse, answer_docs)
     evidence_coverage["supplemental_search_attempted"] = bool(
         trace.get("supplemental_search_attempted")
         or (trace.get("evidence_coverage") or {}).get("supplemental_search_attempted")
     )
-    calculation = build_calculation_result(query_parse, evidence_coverage, final_docs)
+    calculation = build_calculation_result(query_parse, evidence_coverage, answer_docs)
     evidence_status = _resolve_evidence_status(citations, evidence_coverage)
     trace.update(
         {
@@ -223,12 +258,26 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             "prompt_version": PROMPT_VERSION,
             "agent_tool_calls": tool_calls,
             "agent_tool_call_count": len(tool_calls),
+            **answer_page_open_trace,
         }
     )
     latency = dict(trace.get("latency_breakdown") or {})
     latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
     trace["latency_breakdown"] = latency
-    evidence = _format_evidence(final_docs)
+    evidence, answer_context_meta = build_compact_evidence(
+        question,
+        answer_docs,
+        query_parse,
+        calculation,
+    )
+    if not evidence:
+        evidence = _format_evidence(answer_docs)
+        answer_context_meta = {
+            **answer_context_meta,
+            "answer_context_chars": len(evidence),
+            "answer_context_unit_count": len(answer_docs),
+        }
+    trace.update(answer_context_meta)
     answer_directives = build_answer_directives(question, query_parse)
     if answer_directives:
         directive_text = "\n".join(f"- {directive}" for directive in answer_directives)
@@ -236,6 +285,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
     calculation_evidence = format_calculation_evidence(calculation)
     if calculation_evidence:
         evidence = f"{evidence}\n\n---\n\n{calculation_evidence}"
+    trace["answer_prompt_evidence_chars"] = len(evidence)
     return {
         "evidence": evidence,
         "docs": final_docs,
