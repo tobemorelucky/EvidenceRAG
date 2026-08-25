@@ -309,6 +309,52 @@ def extract_metrics(question: str) -> List[str]:
     return metrics
 
 
+def infer_generic_task_type(question: str) -> str:
+    """Infer the requested operation from generic language, without metric-specific rules."""
+    text = (question or "").lower()
+
+    selection_patterns = (
+        r"\b(?:highest|lowest|largest|smallest|biggest)\b",
+        r"\bwhich\b.{0,100}\b(?:most|least|best|worst)\b",
+        r"\b(?:performed|performing)\s+(?:the\s+)?(?:best|worst)\b",
+        r"\bwhich\s+(?:region|segment|category|business|period|year|quarter|item|activity)\b",
+        r"\brank(?:ed|ing)?\b",
+    )
+    if any(re.search(pattern, text) for pattern in selection_patterns):
+        return "selection"
+
+    comparison_patterns = (
+        r"\b(?:increase(?:d)?|decrease(?:d)?|decline(?:d)?|improve(?:d)?|worsen(?:ed)?|grew|growth|change(?:d)?)\b",
+        r"\b(?:higher|lower|more|less)\s+than\b",
+        r"\b(?:compare|compared|versus|between|year[- ]over[- ]year|sequentially)\b",
+        r"\bfrom\s+(?:fy\s*)?20\d{2}\s+to\s+(?:fy\s*)?20\d{2}\b",
+        r"\bvs\.?\b",
+    )
+    if any(re.search(pattern, text) for pattern in comparison_patterns):
+        return "comparison"
+
+    calculation_patterns = (
+        r"\bcalculat(?:e|ed|ing|ion)\b",
+        r"\b(?:ratio|margin|turnover|coverage|yield|rate)\b",
+        r"\b(?:what|which)\s+percent(?:age)?\b",
+        r"\bpercent(?:age)?\s+of\b",
+        r"\bper[- ]share\b",
+        r"\bhow\s+many\s+times\b",
+        r"\bwhat\s+proportion\b",
+    )
+    if any(re.search(pattern, text) for pattern in calculation_patterns):
+        return "calculation"
+
+    judgment_patterns = (
+        r"\b(?:assuming|hypothetically|under the assumption|in the event)\b",
+        r"\bif\b.+\b(?:would|could|should)\b",
+        r"\b(?:is|are|was|were)\b.+\b(?:healthy|sustainable|meaningful|appropriate|capital[- ]intensive)\b",
+    )
+    if any(re.search(pattern, text) for pattern in judgment_patterns):
+        return "judgment"
+    return "lookup"
+
+
 def infer_task_spec(question: str) -> Dict[str, object]:
     """Infer deterministic FinanceBench-style calculation requirements without an LLM call."""
     text = (question or "").lower()
@@ -358,15 +404,10 @@ def infer_task_spec(question: str) -> Dict[str, object]:
         return {"task_type": "judgment", "required_fields": ["capital_expenditures", "revenue", "ppe"], "formula": ""}
     if "securit" in text and "registered" in text and "exchange" in text:
         return {"task_type": "lookup", "required_fields": ["exchange_registered_securities"], "formula": ""}
-    if any(marker in text for marker in ("highest", "lowest", "largest", "smallest", "which region", "which segment")):
-        metrics = extract_metrics(question)
-        required_fields = list(dict.fromkeys(field for metric in metrics for field in METRIC_REQUIRED_FIELDS.get(metric, [])))
-        return {"task_type": "selection", "required_fields": required_fields, "formula": ""}
-    if any(re.search(rf"\b{re.escape(marker)}\b", text) for marker in ("increase", "decrease", "change", "compare", "between", "versus")) or " vs " in text:
-        metrics = extract_metrics(question)
-        required_fields = list(dict.fromkeys(field for metric in metrics for field in METRIC_REQUIRED_FIELDS.get(metric, [])))
-        return {"task_type": "comparison", "required_fields": required_fields, "formula": ""}
-    return {"task_type": "lookup", "required_fields": [], "formula": ""}
+    generic_task_type = infer_generic_task_type(question)
+    metrics = extract_metrics(question)
+    required_fields = list(dict.fromkeys(field for metric in metrics for field in METRIC_REQUIRED_FIELDS.get(metric, [])))
+    return {"task_type": generic_task_type, "required_fields": required_fields, "formula": ""}
 
 
 def extract_rounding_decimal_places(question: str) -> int | None:
@@ -621,6 +662,10 @@ def build_answer_directives(question: str, task_spec: Dict[str, object]) -> List
         directives.append("Compare every row in the shared candidate table, including Corporate/Other and negative values, before selecting the minimum or maximum.")
     if task_spec.get("task_type") == "comparison" or len(task_spec.get("required_periods") or []) >= 2:
         directives.append("Compare every requested reporting period before stating the directional conclusion. Give one final, internally consistent conclusion without an initial guess or self-correction.")
+    if re.search(r"\b(?:was|is|has)\s+there\s+any\s+(?:change|difference)\b", text):
+        directives.append("For the boolean question about whether any change occurred, answer Yes when the compared values differ or show a nonzero increase/decrease; answer No only when they are equal. The first sentence must agree with the stated direction.")
+    if re.search(r"\b(?:improving|improved)\b.{0,80}\bprofile\b", text):
+        directives.append("For the boolean improving-profile question, answer Yes only when the latest comparable value is above the prior value; answer No when it is below or unchanged. The first sentence must agree with the calculated direction.")
     if "store" in text and task_spec.get("task_type") == "comparison":
         directives.append("For a company-level store-count question, use the explicitly labeled Total row. Do not substitute a brand, segment, geography, or other subcategory row unless the question names that scope.")
     if "securit" in text and "registered" in text and "exchange" in text:

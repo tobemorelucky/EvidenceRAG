@@ -1,0 +1,9 @@
+{
+  "task_type": "comparison",
+  "instructions": [
+    "Extract every requested period or object before concluding.",
+    "Align entity, period basis, unit, scale, scope, and accounting basis.",
+    "Compute the requested change while preserving signs and zero values.",
+    "Make the first conclusion match the computed direction; any nonzero increase or decrease means that a change occurred."
+  ]
+}

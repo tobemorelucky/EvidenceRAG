@@ -56,7 +56,12 @@ def chat_with_agent(
     if prepared["evidence_status"] == "insufficient":
         response_content, usage = INSUFFICIENT_EVIDENCE_MESSAGE, {}
     else:
-        response_content, usage = generate_answer(user_text, prepared["evidence"], history)
+        response_content, usage = generate_answer(
+            user_text,
+            prepared["evidence"],
+            history,
+            prepared.get("task_policy", ""),
+        )
 
     messages.append(AIMessage(content=response_content))
     rag_trace = prepared["rag_trace"]
@@ -139,7 +144,12 @@ async def chat_with_agent_stream(
         full_response = INSUFFICIENT_EVIDENCE_MESSAGE
         yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
     else:
-        async for content, chunk_usage in stream_answer(user_text, prepared["evidence"], history):
+        async for content, chunk_usage in stream_answer(
+            user_text,
+            prepared["evidence"],
+            history,
+            prepared.get("task_policy", ""),
+        ):
             full_response += content
             usage = chunk_usage or usage
             yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"

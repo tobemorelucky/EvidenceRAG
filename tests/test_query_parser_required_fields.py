@@ -325,3 +325,63 @@ def test_exchange_registered_securities_uses_cover_page_field():
     assert parsed["task_type"] == "lookup"
     assert parsed["required_fields"] == ["exchange_registered_securities"]
     assert any("Section 12(b)" in directive for directive in directives)
+
+
+def test_generic_selection_is_inferred_from_requested_ranking_operation():
+    parsed = parse_query("Which activity brought in the most cash during the period?")
+
+    assert parsed["task_type"] == "selection"
+
+
+def test_generic_comparison_is_inferred_without_registered_metric_name():
+    parsed = parse_query("Did the disclosed expense rate improve year-over-year?")
+
+    assert parsed["task_type"] == "comparison"
+
+
+def test_generic_calculation_is_inferred_without_registered_formula():
+    parsed = parse_query("Calculate the disclosed book value per share for the period.")
+
+    assert parsed["task_type"] == "calculation"
+    assert parsed["formula"] == ""
+    assert parsed["required_fields"] == []
+
+
+def test_generic_hypothetical_is_inferred_as_judgment():
+    parsed = parse_query("If all assets were liquidated, how much could investors receive?")
+
+    assert parsed["task_type"] == "judgment"
+
+
+def test_calculation_intent_precedes_secondary_metric_relevance_caveat():
+    parsed = parse_query(
+        "How many times was inventory sold? If that measure is not meaningful, explain why."
+    )
+
+    assert parsed["task_type"] == "calculation"
+
+
+def test_company_name_with_best_does_not_trigger_selection():
+    parsed = parse_query("Was there any change in the number of Best Buy stores between FY2024 and FY2023?")
+
+    assert parsed["task_type"] == "comparison"
+
+
+def test_any_change_question_gets_boolean_consistency_directive():
+    question = "Was there any change in the disclosed count between FY2024 and FY2023?"
+    parsed = parse_query(question)
+
+    directives = build_answer_directives(question, parsed)
+
+    assert any("answer Yes when the compared values differ" in item for item in directives)
+    assert any("answer No only when they are equal" in item for item in directives)
+
+
+def test_improving_profile_question_gets_directional_boolean_directive():
+    question = "Does the business have an improving disclosed margin profile as of FY2023?"
+    parsed = parse_query(question)
+
+    directives = build_answer_directives(question, parsed)
+
+    assert any("answer Yes only when the latest comparable value is above" in item for item in directives)
+    assert any("answer No when it is below or unchanged" in item for item in directives)

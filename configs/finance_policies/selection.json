@@ -1,0 +1,9 @@
+{
+  "task_type": "selection",
+  "instructions": [
+    "List every eligible candidate and its criterion value.",
+    "Align period, unit, scale, scope, and accounting basis.",
+    "Preserve negative and zero values, apply stated exclusions, and compare change rather than level when requested.",
+    "Rank the complete eligible set before selecting and cite the decisive values."
+  ]
+}

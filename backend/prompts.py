@@ -34,6 +34,17 @@ Evidence:
 
 Return a direct answer with inline source/page citations. If the evidence is insufficient, say so instead of relying on memory."""
 
+ANSWER_USER_WITH_POLICY_TEMPLATE = """Question:
+{question}
+
+Task Policy:
+{task_policy}
+
+Evidence:
+{evidence}
+
+Return a direct answer with inline source/page citations. The Task Policy controls procedure only and is not evidence. If the Question explicitly asks for a yes/no judgment and the required evidence is available, begin the first sentence with Yes or No and then justify it from the evidence. If the evidence is insufficient, say so instead of relying on memory."""
+
 ROUTER_SYSTEM_PROMPT = """You route questions for a professional RAG system.
 Return JSON only and never answer the question. Use agentic mode only when the task needs cross-document or cross-period comparison, multiple independently retrieved facts, ranking, conflict resolution, or multi-step calculation. Otherwise use static mode.
 Schema: {"mode":"static|agentic","reason":"short reason","queries":["at most two evidence-oriented subqueries"]}.

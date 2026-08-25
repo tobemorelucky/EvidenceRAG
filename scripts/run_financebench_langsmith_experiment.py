@@ -49,6 +49,7 @@ def _configure_static_baseline(
     field_aware: bool,
     enable_rerank: bool,
     local_rerank_fallback: bool,
+    finance_policy: bool,
 ) -> None:
     """Freeze the baseline before importing any backend module."""
     settings = {
@@ -80,6 +81,7 @@ def _configure_static_baseline(
             "ANSWER_THINKING_MODE": thinking_mode,
             "ANSWER_TEMPERATURE": "0",
             "RAG_RETRIEVAL_DEBUG": "true" if diagnose else "false",
+            "FINANCE_POLICY_ENABLED": "true" if finance_policy else "false",
     }
     if not enable_rerank:
         settings.update(
@@ -138,6 +140,12 @@ def main() -> None:
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--max-completion-tokens", type=int, default=512)
     parser.add_argument("--thinking", choices=("disabled", "auto", "enabled"), default="disabled")
+    parser.add_argument(
+        "--finance-policy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add the local Financial Task Policy to answer prompts (default: disabled for v14 compatibility).",
+    )
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval and generation stage timing.")
     parser.add_argument(
         "--field-aware",
@@ -188,6 +196,7 @@ def main() -> None:
         args.field_aware,
         args.enable_rerank,
         not args.disable_local_rerank_fallback,
+        args.finance_policy,
     )
     with DATA_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
         source_rows = list(csv.DictReader(handle))
@@ -283,14 +292,16 @@ def main() -> None:
         )
 
     @traceable(name="EvidenceRAG.generate", run_type="llm")
-    def generate(question: str, evidence: str) -> tuple[str, dict]:
-        return generate_answer(question, evidence, [])
+    def generate(question: str, evidence: str, task_policy: str) -> tuple[str, dict]:
+        return generate_answer(question, evidence, [], task_policy)
 
     @traceable(name="EvidenceRAG.financebench_static", run_type="chain")
     def target(inputs: dict) -> dict:
         question = str(inputs.get("question") or "")
         financebench_id = id_by_question.get(question, "")
+        question_started = time.perf_counter()
         started = time.perf_counter()
+        generation_seconds = 0.0
         if args.diagnose:
             print(f"[question] {financebench_id} retrieve starting", flush=True)
         if args.slow_question_seconds > 0:
@@ -321,12 +332,17 @@ def main() -> None:
             if args.slow_question_seconds > 0:
                 faulthandler.dump_traceback_later(args.slow_question_seconds, repeat=False)
             try:
-                answer, usage = generate(question, prepared["evidence"])
+                answer, usage = generate(
+                    question,
+                    prepared["evidence"],
+                    prepared.get("task_policy", ""),
+                )
             finally:
                 if args.slow_question_seconds > 0:
                     faulthandler.cancel_dump_traceback_later()
+            generation_seconds = time.perf_counter() - started
             if args.diagnose:
-                print(f"[question] {financebench_id} generate finished in {time.perf_counter() - started:.2f}s", flush=True)
+                print(f"[question] {financebench_id} generate finished in {generation_seconds:.2f}s", flush=True)
         run_tree = get_current_run_tree()
         result = {
             "financebench_id": financebench_id,
@@ -339,6 +355,11 @@ def main() -> None:
             "route_reason": prepared["route_reason"],
             "rag_trace": prepared["rag_trace"],
             "usage": usage,
+            "evaluation_latency": {
+                "retrieval_ms": round(retrieval_seconds * 1000, 2),
+                "generation_ms": round(generation_seconds * 1000, 2),
+                "total_ms": round((time.perf_counter() - question_started) * 1000, 2),
+            },
             "application_trace_id": prepared["trace_id"],
             "langsmith_trace_id": str(run_tree.id) if run_tree else "",
         }
@@ -364,6 +385,7 @@ def main() -> None:
         "thinking": args.thinking,
         "max_completion_tokens": args.max_completion_tokens,
         "temperature": 0,
+        "finance_policy": args.finance_policy,
         "candidate_k": 40,
         "final_evidence_k": 5,
         "model": os.getenv("MODEL", ""),
@@ -371,7 +393,7 @@ def main() -> None:
     }
     print(
         f"[setup] dataset={args.dataset_name} split={args.split} examples={len(examples)} "
-        f"planner=false thinking={args.thinking}",
+        f"planner=false policy={str(args.finance_policy).lower()} thinking={args.thinking}",
         flush=True,
     )
     try:

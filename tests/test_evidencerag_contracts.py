@@ -73,6 +73,59 @@ def test_prompt_contract_requires_cited_grounded_answers():
     assert prompts.PROMPT_VERSION
 
 
+def test_policy_prompt_is_separate_from_evidence_and_legacy_template_is_unchanged():
+    from backend import prompts
+
+    legacy = prompts.ANSWER_USER_TEMPLATE.format(question="Q", evidence="E")
+    enhanced = prompts.ANSWER_USER_WITH_POLICY_TEMPLATE.format(
+        question="Q",
+        task_policy="P",
+        evidence="E",
+    )
+
+    assert "Task Policy:" not in legacy
+    assert "Question:\nQ\n\nEvidence:\nE" in legacy
+    assert "Question:\nQ\n\nTask Policy:\nP\n\nEvidence:\nE" in enhanced
+    assert "Task Policy controls procedure only and is not evidence" in enhanced
+    assert "begin the first sentence with Yes or No" in enhanced
+
+
+def test_boolean_answer_contract_fixes_any_change_contradiction():
+    from backend.answer_generator import normalize_boolean_answer_contract
+
+    answer, changed = normalize_boolean_answer_contract(
+        "Was there any change in the disclosed count between the periods?",
+        "No, the count decreased from 982 to 969.",
+    )
+
+    assert changed is True
+    assert answer == "Yes, the count decreased from 982 to 969."
+
+
+def test_boolean_answer_contract_fixes_improving_profile_contradiction():
+    from backend.answer_generator import normalize_boolean_answer_contract
+
+    answer, changed = normalize_boolean_answer_contract(
+        "Does the business have an improving margin profile?",
+        "Yes, the margin did not improve; it decreased.",
+    )
+
+    assert changed is True
+    assert answer == "No, the margin did not improve; it decreased."
+
+
+def test_boolean_answer_contract_does_not_touch_subjective_judgment():
+    from backend.answer_generator import normalize_boolean_answer_contract
+
+    answer, changed = normalize_boolean_answer_contract(
+        "Is the business capital intensive?",
+        "Yes, based on the supported ratios.",
+    )
+
+    assert changed is False
+    assert answer == "Yes, based on the supported ratios."
+
+
 def test_decimal_calculator_allows_only_safe_arithmetic():
     tools = _load_agent_tools()
 

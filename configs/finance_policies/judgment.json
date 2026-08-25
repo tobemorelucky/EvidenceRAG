@@ -1,0 +1,9 @@
+{
+  "task_type": "judgment",
+  "instructions": [
+    "Map the judgment or scenario to the facts and calculations needed to evaluate it.",
+    "When inputs are available, state the requested conclusion directly and separate facts from inference.",
+    "Evaluate supported hypothetical scenarios instead of refusing merely because analysis is required.",
+    "When a necessary input is absent, name that limitation without inventing a value."
+  ]
+}

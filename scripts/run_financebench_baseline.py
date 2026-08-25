@@ -54,7 +54,12 @@ def main() -> None:
             if prepared["evidence_status"] == "insufficient":
                 answer, usage = "未检索到足够证据，无法基于当前知识库可靠回答。", {}
             else:
-                answer, usage = generate_answer(row["question"], prepared["evidence"], [])
+                answer, usage = generate_answer(
+                    row["question"],
+                    prepared["evidence"],
+                    [],
+                    prepared.get("task_policy", ""),
+                )
             record = {
                 "financebench_id": row.get("financebench_id"),
                 "question": row["question"],

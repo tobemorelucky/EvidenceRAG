@@ -1,12 +1,13 @@
 """Export completed FinanceBench answers and Judge feedback to a compact Markdown review file."""
 
 import argparse
+import csv
 import json
-from collections import Counter
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REFERENCE_CSV = ROOT / "data" / "financebench_top40_100_langsmith_with_evidence.csv"
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -16,6 +17,18 @@ def _read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Invalid JSONL file: {path}") from exc
+
+
+def _read_reference_answers(path: Path) -> dict[str, str]:
+    if not path.exists():
+        raise SystemExit(f"Missing reference CSV: {path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    references = {
+        str(row.get("financebench_id") or "").strip(): str(row.get("answer") or "").strip()
+        for row in rows
+    }
+    return {financebench_id: answer for financebench_id, answer in references.items() if financebench_id}
 
 
 def _citations(record: dict) -> str:
@@ -29,7 +42,12 @@ def _citations(record: dict) -> str:
     return "; ".join(dict.fromkeys(values)) or "None"
 
 
-def _split_records(label: str, answers_path: Path, judge_path: Path) -> tuple[list[dict], int]:
+def _split_records(
+    label: str,
+    answers_path: Path,
+    judge_path: Path,
+    reference_answers: dict[str, str],
+) -> tuple[list[dict], int]:
     answers = _read_jsonl(answers_path)
     judges = {str(item.get("run_id") or ""): item for item in _read_jsonl(judge_path)}
     rows = []
@@ -38,12 +56,16 @@ def _split_records(label: str, answers_path: Path, judge_path: Path) -> tuple[li
         judge = judges.get(str(answer.get("langsmith_trace_id") or ""))
         if not financebench_id or judge is None:
             raise SystemExit(f"{label}: answer/Judge records cannot be matched.")
+        reference_answer = reference_answers.get(financebench_id, "")
+        if not reference_answer:
+            raise SystemExit(f"{label}: missing reference answer for {financebench_id}.")
         trace = answer.get("rag_trace") or {}
         rows.append(
             {
                 "financebench_id": financebench_id,
                 "question": str(answer.get("question") or ""),
-                "answer": str(answer.get("answer") or ""),
+                "reference_answer": reference_answer,
+                "model_answer": str(answer.get("answer") or ""),
                 "citations": _citations(answer),
                 "verdict": str(judge.get("verdict") or "incorrect"),
                 "score": int(judge.get("score") or 0),
@@ -71,8 +93,14 @@ def main() -> None:
     grouped = []
     all_ids: set[str] = set()
     total_correct = 0
+    reference_answers = _read_reference_answers(REFERENCE_CSV)
     for label, answers_name, judge_name in args.split:
-        rows, correct = _split_records(label, ROOT / answers_name, ROOT / judge_name)
+        rows, correct = _split_records(
+            label,
+            ROOT / answers_name,
+            ROOT / judge_name,
+            reference_answers,
+        )
         ids = {row["financebench_id"] for row in rows}
         if len(ids) != len(rows) or all_ids & ids:
             raise SystemExit(f"{label}: duplicate FinanceBench IDs detected.")
@@ -89,7 +117,7 @@ def main() -> None:
             f"- Accuracy: {total_correct / total:.1%}" if total else "- Accuracy: n/a",
             "- Judge: DeepSeek-V4-Pro",
             "",
-            "Each entry retains only the question, generated answer, citations, Judge result, and exceptional retrieval state.",
+            "Each entry contains the question, FinanceBench reference answer, model answer, citations, Judge result, and exceptional retrieval state.",
         ]
     )
     for label, rows, correct in grouped:
@@ -101,13 +129,15 @@ def main() -> None:
                     "",
                     f"### {index}. {row['financebench_id']} — {verdict}",
                     "",
-                    f"**Question:** {row['question']}",
+                    f"**问题：** {row['question']}",
                     "",
-                    f"**Answer:** {row['answer']}",
+                    f"**参考答案：** {row['reference_answer']}",
                     "",
-                    f"**Citations:** {row['citations']}",
+                    f"**模型答案：** {row['model_answer']}",
                     "",
-                    f"**Judge:** {row['judge_reason']}",
+                    f"**引用：** {row['citations']}",
+                    "",
+                    f"**Judge：** {row['judge_reason']}",
                 ]
             )
             if row["evidence_status"] != "sufficient" or row["rerank_provider"] != "remote":

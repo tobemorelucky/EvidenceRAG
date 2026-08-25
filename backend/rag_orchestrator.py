@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from agent_tools import find_evidence, open_pages, select_pages
 from calculation_service import build_calculation_result, format_calculation_evidence
+from finance_policy import load_finance_policy
 from evidence_context import build_compact_evidence
 from prompts import PROMPT_VERSION
 from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
@@ -239,6 +240,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
     answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs)
     citations = build_citations(answer_docs)
     query_parse = parse_query(question)
+    finance_policy = load_finance_policy(str(query_parse.get("task_type") or "lookup"))
     evidence_coverage = assess_required_field_coverage(query_parse, answer_docs)
     evidence_coverage["supplemental_search_attempted"] = bool(
         trace.get("supplemental_search_attempted")
@@ -256,6 +258,13 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             "calculation": calculation,
             "trace_id": str(uuid.uuid4()),
             "prompt_version": PROMPT_VERSION,
+            "task_type": finance_policy["task_type"],
+            "finance_policy_enabled": finance_policy["enabled"],
+            "policy": finance_policy["policy_file"],
+            "finance_policy_chars": finance_policy["chars"],
+            "finance_policy_estimated_tokens": finance_policy["estimated_tokens"],
+            "finance_policy_cache_hit": finance_policy["cache_hit"],
+            "finance_policy_load_ms": finance_policy["load_ms"],
             "agent_tool_calls": tool_calls,
             "agent_tool_call_count": len(tool_calls),
             **answer_page_open_trace,
@@ -286,8 +295,11 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
     if calculation_evidence:
         evidence = f"{evidence}\n\n---\n\n{calculation_evidence}"
     trace["answer_prompt_evidence_chars"] = len(evidence)
+    trace["answer_prompt_policy_chars"] = finance_policy["chars"]
+    trace["answer_prompt_total_chars"] = len(evidence) + finance_policy["chars"]
     return {
         "evidence": evidence,
+        "task_policy": finance_policy["text"],
         "docs": final_docs,
         "rag_trace": trace,
         "profile": config.profile,

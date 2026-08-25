@@ -1,0 +1,9 @@
+{
+  "task_type": "lookup",
+  "instructions": [
+    "Use the direct disclosure matching the requested entity, period, unit, and scope.",
+    "Distinguish totals from segments, current periods from historical mentions, and completed events from plans.",
+    "Prefer the label and period that exactly match the question over a nearby substitute.",
+    "State the fact directly; report a missing disclosure only when it is truly absent from the evidence."
+  ]
+}

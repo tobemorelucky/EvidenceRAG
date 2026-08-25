@@ -1,0 +1,9 @@
+{
+  "task_type": "calculation",
+  "instructions": [
+    "Identify the result and all required operands.",
+    "Align entity, period, unit, scale, scope, and accounting basis.",
+    "When all operands are evidenced, calculate, cite them, show one formula, and round only the final result.",
+    "When an operand is missing or conflicting, name it instead of estimating or substituting it."
+  ]
+}

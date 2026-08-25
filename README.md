@@ -40,6 +40,7 @@ python backend/app.py
 ```dotenv
 RAG_PROFILE=finance
 RAG_EXECUTION_MODE=auto
+FINANCE_POLICY_ENABLED=false
 RAG_AGENT_MAX_ROUNDS=3
 RAG_AGENT_MAX_TOOL_CALLS=5
 MILVUS_SPARSE_MODE=milvus_bm25
@@ -49,6 +50,21 @@ ANSWER_TEMPERATURE=0.1
 ```
 
 项目固定 `transformers>=4.49,<5`，以避免本地 BGE-M3 与 Transformers 5 的兼容问题。新金融集合使用 Milvus analyzer/BM25，不再依赖应用侧可变词表文件。
+
+### Financial Task Policy Layer
+
+金融任务策略层可在回答生成前，根据已有的 `task_type` 加载 `calculation`、`comparison`、`lookup`、`selection` 或 `judgment` 通用处理规范。策略来自 `configs/finance_policies/`，只描述证据处理步骤，不包含具体公司、指标、数据集答案，也不作为事实来源。
+
+- 默认 `FINANCE_POLICY_ENABLED=false`，关闭时继续使用原有 v14 回答模板。当前 dev20 A/B 未证明 Policy 能提高准确率，因此正式 holdout 仍建议保持关闭；该功能保留为实验开关。
+- 开启后仅增加一次带缓存的本地配置读取；不会新增 LLM 调用、检索、重排或 Agent 循环。
+- trace 会记录 `task_type`、`policy`、策略字符数、估算 token、缓存命中和本地加载耗时。
+- LangSmith 评测脚本使用 `--finance-policy` 开启，使用 `--no-finance-policy` 或省略参数关闭，便于执行同样本 A/B。
+
+示例：
+
+```powershell
+conda run --no-capture-output -n rag python -u scripts/run_financebench_langsmith_experiment.py --split dev --limit 10 --finance-policy --experiment-prefix evidencerag-finance-policy-smoke
+```
 
 ## 重建 40 份金融文档索引
 
