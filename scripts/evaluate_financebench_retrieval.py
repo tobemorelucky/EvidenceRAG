@@ -242,6 +242,11 @@ def evaluate(
                 "remote_anchor_count": (retrieval.get("meta") or {}).get("remote_rerank_anchor_count"),
                 "remote_input_chars": (retrieval.get("meta") or {}).get("remote_rerank_input_chars"),
                 "remote_rate_limited": bool((retrieval.get("meta") or {}).get("remote_rerank_rate_limited")),
+                "remote_attempt_count": int((retrieval.get("meta") or {}).get("remote_attempt_count") or 0),
+                "remote_success": bool((retrieval.get("meta") or {}).get("remote_success")),
+                "cache_hit": bool((retrieval.get("meta") or {}).get("rerank_cache_hit")),
+                "fallback_used": bool((retrieval.get("meta") or {}).get("rerank_fallback_used")),
+                "fallback_reason": (retrieval.get("meta") or {}).get("rerank_fallback_reason") or "",
                 "local_enabled": bool((retrieval.get("meta") or {}).get("local_rerank_enabled")),
                 "local_applied": bool((retrieval.get("meta") or {}).get("local_rerank_applied")),
                 "local_error": (retrieval.get("meta") or {}).get("local_rerank_error"),
@@ -263,6 +268,12 @@ def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     counts = Counter(record["candidate_failure"] for record in records)
     final_counts = Counter(record["final_failure"] for record in records)
     context_counts = Counter(record.get("context_failure", "") for record in records)
+    rerank_records = [record.get("rerank") or {} for record in records]
+    fallback_reasons = Counter(
+        str(item.get("fallback_reason") or "unknown")
+        for item in rerank_records
+        if item.get("fallback_used")
+    )
     candidate_depth = max((max(map(int, record["candidate_page_hit_at"].keys())) for record in records), default=0)
     return {
         "questions": total,
@@ -287,6 +298,12 @@ def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_failure_counts": dict(sorted(counts.items())),
         "final_failure_counts": dict(sorted(final_counts.items())),
         "context_failure_counts": dict(sorted(context_counts.items())),
+        "remote_rerank_successes": sum(item.get("provider") == "remote" for item in rerank_records),
+        "remote_rerank_result_uses": sum(bool(item.get("remote_success")) for item in rerank_records),
+        "remote_rerank_attempts": sum(int(item.get("remote_attempt_count") or 0) for item in rerank_records),
+        "rerank_cache_hits": sum(bool(item.get("cache_hit")) for item in rerank_records),
+        "local_fallbacks": sum(bool(item.get("fallback_used")) for item in rerank_records),
+        "rerank_fallback_reasons": dict(sorted(fallback_reasons.items())),
         "note": "Primary page-hit metrics use exact benchmark page numbers. The offset metric is diagnostic only for detecting an index convention mismatch.",
     }
 

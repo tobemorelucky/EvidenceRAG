@@ -105,6 +105,153 @@ def _install_rag_utils_stubs():
     return module
 
 
+class _RerankResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+class _RerankCache:
+    def __init__(self, value=None):
+        self.value = value
+        self.saved = None
+        self.deleted = []
+
+    def get_json(self, key):
+        return self.value
+
+    def set_json(self, key, value, ttl=None):
+        self.saved = (key, value, ttl)
+
+    def delete(self, key):
+        self.deleted.append(key)
+
+
+def _configure_remote_rerank(module, monkeypatch, *, cache_enabled=False):
+    monkeypatch.setattr(module, "RERANK_MODEL", "test-reranker")
+    monkeypatch.setattr(module, "RERANK_API_KEY", "test-key")
+    monkeypatch.setattr(module, "RERANK_BINDING_HOST", "https://rerank.example/v1/rerank")
+    monkeypatch.setattr(module, "RERANK_REMOTE_CANDIDATE_K", 4)
+    monkeypatch.setattr(module, "RERANK_REMOTE_MAX_CHARS", 1000)
+    monkeypatch.setattr(module, "RERANK_REMOTE_MIN_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(module, "RERANK_REMOTE_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(module, "RERANK_REMOTE_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(module, "RERANK_CACHE_ENABLED", cache_enabled)
+    monkeypatch.setattr(module, "_local_reranker", type("DisabledLocal", (), {"enabled": False})())
+
+
+def _rerank_docs():
+    return [
+        {"chunk_id": "a", "filename": "report.pdf", "page_number": 1, "text": "first"},
+        {"chunk_id": "b", "filename": "report.pdf", "page_number": 2, "text": "second"},
+    ]
+
+
+def test_remote_rerank_retries_invalid_response_then_succeeds(monkeypatch):
+    module = _install_rag_utils_stubs()
+    _configure_remote_rerank(module, monkeypatch)
+    responses = iter(
+        [
+            _RerankResponse(payload={"results": []}),
+            _RerankResponse(
+                payload={
+                    "results": [
+                        {"index": 1, "relevance_score": 0.9},
+                        {"index": 0, "relevance_score": 0.4},
+                    ]
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(module.requests, "post", lambda *args, **kwargs: next(responses))
+
+    ranked, meta = module._rerank_documents("question", _rerank_docs(), top_k=2)
+
+    assert [item["chunk_id"] for item in ranked] == ["b", "a"]
+    assert meta["remote_attempt_count"] == 2
+    assert meta["remote_success"] is True
+    assert meta["rerank_provider"] == "remote"
+    assert meta["rerank_trace"]["fallback_used"] is False
+
+
+def test_remote_rerank_falls_back_locally_only_after_two_failures(monkeypatch):
+    module = _install_rag_utils_stubs()
+    _configure_remote_rerank(module, monkeypatch)
+    attempts = []
+
+    def fail(*args, **kwargs):
+        attempts.append(1)
+        raise TimeoutError("remote timeout")
+
+    class LocalFallback:
+        enabled = True
+        model_path = "local-model"
+
+        def rerank(self, query, docs, top_k):
+            return [{**docs[0], "rerank_score": 0.8}]
+
+    monkeypatch.setattr(module.requests, "post", fail)
+    monkeypatch.setattr(module, "_local_reranker", LocalFallback())
+
+    ranked, meta = module._rerank_documents("question", _rerank_docs(), top_k=1)
+
+    assert len(attempts) == 2
+    assert ranked[0]["chunk_id"] == "a"
+    assert meta["rerank_provider"] == "local_fallback"
+    assert meta["rerank_fallback_used"] is True
+    assert "remote timeout" in meta["rerank_fallback_reason"]
+    assert meta["rerank_trace"]["remote_attempt_count"] == 2
+
+
+def test_remote_rerank_does_not_retry_non_retryable_http_error(monkeypatch):
+    module = _install_rag_utils_stubs()
+    _configure_remote_rerank(module, monkeypatch)
+    attempts = []
+
+    def unauthorized(*args, **kwargs):
+        attempts.append(1)
+        return _RerankResponse(status_code=401, text="unauthorized")
+
+    monkeypatch.setattr(module.requests, "post", unauthorized)
+
+    _, meta = module._rerank_documents("question", _rerank_docs(), top_k=2)
+
+    assert len(attempts) == 1
+    assert meta["remote_attempt_count"] == 1
+    assert meta["remote_success"] is False
+    assert "HTTP 401" in meta["rerank_error"]
+
+
+def test_remote_rerank_cache_uses_ordered_candidate_identity(monkeypatch):
+    module = _install_rag_utils_stubs()
+    _configure_remote_rerank(module, monkeypatch, cache_enabled=True)
+    cached = [
+        {"index": 0, "relevance_score": 0.8},
+        {"index": 1, "relevance_score": 0.3},
+    ]
+    monkeypatch.setattr(module, "cache", _RerankCache(cached))
+    monkeypatch.setattr(
+        module.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cache hit must skip remote request")),
+    )
+    docs = _rerank_docs()
+
+    ranked, meta = module._rerank_documents("question", docs, top_k=2)
+
+    assert [item["chunk_id"] for item in ranked] == ["a", "b"]
+    assert meta["rerank_provider"] == "remote_cache"
+    assert meta["rerank_cache_hit"] is True
+    assert meta["remote_attempt_count"] == 0
+    assert module._build_rerank_cache_key("question", "model", docs, 2) != module._build_rerank_cache_key(
+        "question", "model", list(reversed(docs)), 2
+    )
+
+
 def test_table_aware_retrieval_off_does_not_call_evidence_search(monkeypatch):
     module = _install_rag_utils_stubs()
 

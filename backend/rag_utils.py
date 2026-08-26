@@ -1,4 +1,5 @@
 from collections import defaultdict
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import json
@@ -12,6 +13,7 @@ import requests
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 
+from cache import cache
 from document_page_store import DocumentPageStore
 from embedding import embedding_service as _embedding_service
 from local_reranker import LocalReranker
@@ -71,6 +73,10 @@ RERANK_TIMEOUT_SECONDS = max(1.0, float(os.getenv("RERANK_TIMEOUT_SECONDS", "5")
 RERANK_REMOTE_CANDIDATE_K = max(1, int(os.getenv("RERANK_REMOTE_CANDIDATE_K", "16")))
 RERANK_REMOTE_MAX_CHARS = max(256, int(os.getenv("RERANK_REMOTE_MAX_CHARS", "1600")))
 RERANK_REMOTE_MIN_INTERVAL_SECONDS = max(0.0, float(os.getenv("RERANK_REMOTE_MIN_INTERVAL_SECONDS", "4")))
+RERANK_REMOTE_MAX_ATTEMPTS = max(1, int(os.getenv("RERANK_REMOTE_MAX_ATTEMPTS", "2")))
+RERANK_REMOTE_BACKOFF_SECONDS = max(0.0, float(os.getenv("RERANK_REMOTE_BACKOFF_SECONDS", "0.8")))
+RERANK_CACHE_ENABLED = os.getenv("RERANK_CACHE_ENABLED", "true").lower() == "true"
+RERANK_CACHE_TTL_SECONDS = max(60, int(os.getenv("RERANK_CACHE_TTL_SECONDS", "604800")))
 
 AUTO_MERGE_ENABLED = os.getenv("AUTO_MERGE_ENABLED", "false").lower() == "true"
 AUTO_MERGE_THRESHOLD = int(os.getenv("AUTO_MERGE_THRESHOLD", "2"))
@@ -1837,6 +1843,78 @@ def _get_rerank_endpoint() -> str:
     return host if host.endswith("/v1/rerank") else f"{host}/v1/rerank"
 
 
+def _rerank_candidate_hash(doc: dict) -> str:
+    existing = str(doc.get("content_hash") or doc.get("embedding_cache_key") or "").strip()
+    if existing:
+        return existing
+    identity = {
+        "chunk_id": doc.get("chunk_id") or "",
+        "filename": doc.get("filename") or "",
+        "page_number": doc.get("page_number"),
+        "chunk_idx": doc.get("chunk_idx"),
+        "text": doc.get("text") or "",
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_rerank_cache_key(query: str, model: str, docs: List[dict], top_n: int) -> str:
+    identity = {
+        "version": 1,
+        "query": str(query or "").strip(),
+        "model": str(model or "").strip(),
+        "top_n": int(top_n),
+        "candidate_hashes": [_rerank_candidate_hash(doc) for doc in docs],
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"rerank:v1:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _validate_remote_rerank_results(payload: Any, candidate_count: int, expected_count: int) -> List[dict]:
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_response_payload")
+    items = payload.get("results")
+    if not isinstance(items, list):
+        raise ValueError("missing_rerank_results")
+    if len(items) != expected_count:
+        raise ValueError(f"result_count_mismatch:{len(items)}!={expected_count}")
+    normalized: List[dict] = []
+    seen_indices: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("invalid_rerank_result")
+        index = item.get("index")
+        score = item.get("relevance_score")
+        if not isinstance(index, int) or not 0 <= index < candidate_count:
+            raise ValueError(f"invalid_rerank_index:{index}")
+        if index in seen_indices:
+            raise ValueError(f"duplicate_rerank_index:{index}")
+        if not isinstance(score, (int, float)):
+            raise ValueError(f"invalid_rerank_score:{score}")
+        seen_indices.add(index)
+        normalized.append({"index": index, "relevance_score": float(score)})
+    return normalized
+
+
+def _sync_rerank_trace(meta: Dict[str, Any]) -> None:
+    meta["rerank_trace"] = {
+        "remote_attempt_count": int(meta.get("remote_attempt_count") or 0),
+        "remote_success": bool(meta.get("remote_success")),
+        "fallback_used": bool(meta.get("rerank_fallback_used")),
+        "fallback_reason": str(meta.get("rerank_fallback_reason") or ""),
+        "rerank_cache_hit": bool(meta.get("rerank_cache_hit")),
+    }
+
+
+def _remote_rerank_from_items(remote_docs: List[dict], items: List[dict], top_k: int) -> List[dict]:
+    reranked: List[dict] = []
+    for item in items:
+        doc = dict(remote_docs[item["index"]])
+        doc["rerank_score"] = item["relevance_score"]
+        reranked.append(doc)
+    return reranked[:top_k]
+
+
 def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[dict], int]:
     groups: Dict[str, List[dict]] = defaultdict(list)
     for doc in docs:
@@ -1912,11 +1990,18 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         "remote_rerank_anchor_count": 0,
         "remote_rerank_input_chars": 0,
         "remote_rerank_rate_limited": False,
+        "remote_attempt_count": 0,
+        "remote_success": False,
+        "remote_errors": [],
+        "rerank_cache_hit": False,
+        "rerank_fallback_used": False,
+        "rerank_fallback_reason": "",
         "rerank_provider": "none",
         "local_rerank_enabled": _local_reranker.enabled,
         "local_rerank_applied": False,
         "local_rerank_error": None,
     }
+    _sync_rerank_trace(meta)
     if not docs_with_rank:
         return docs_with_rank[:top_k], meta
     if meta["rerank_enabled"]:
@@ -1966,39 +2051,71 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
             "return_documents": False,
         }
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {RERANK_API_KEY}"}
-        try:
-            global _last_remote_rerank_started_at
-            with _rerank_request_lock:
-                remaining = RERANK_REMOTE_MIN_INTERVAL_SECONDS - (time.monotonic() - _last_remote_rerank_started_at)
-                if remaining > 0:
-                    time.sleep(remaining)
-                _last_remote_rerank_started_at = time.monotonic()
-                response = requests.post(
-                    meta["rerank_endpoint"],
-                    headers=headers,
-                    json=payload,
-                    timeout=RERANK_TIMEOUT_SECONDS,
+        expected_count = int(payload["top_n"])
+        cache_key = _build_rerank_cache_key(query, str(RERANK_MODEL), remote_docs, expected_count)
+        cached_items = cache.get_json(cache_key) if RERANK_CACHE_ENABLED else None
+        if cached_items is not None:
+            try:
+                items = _validate_remote_rerank_results(
+                    {"results": cached_items},
+                    candidate_count=len(remote_docs),
+                    expected_count=expected_count,
                 )
-            if response.status_code >= 400:
-                meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
-                meta["remote_rerank_rate_limited"] = response.status_code == 429
-            else:
-                items = response.json().get("results", [])
-                reranked = []
-                for item in items:
-                    idx = item.get("index")
-                    if isinstance(idx, int) and 0 <= idx < len(remote_docs):
-                        doc = dict(remote_docs[idx])
-                        if item.get("relevance_score") is not None:
-                            doc["rerank_score"] = item["relevance_score"]
-                        reranked.append(doc)
-                if reranked:
-                    meta["rerank_applied"] = True
-                    meta["rerank_provider"] = "remote"
-                    return reranked[:top_k], meta
-                meta["rerank_error"] = "empty_rerank_results"
-        except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
-            meta["rerank_error"] = str(exc)
+                meta["rerank_cache_hit"] = True
+                meta["remote_success"] = True
+                meta["rerank_applied"] = True
+                meta["rerank_provider"] = "remote_cache"
+                _sync_rerank_trace(meta)
+                return _remote_rerank_from_items(remote_docs, items, top_k), meta
+            except (KeyError, ValueError, TypeError) as exc:
+                meta["remote_errors"].append(f"cache_invalid:{exc}")
+                cache.delete(cache_key)
+
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        for attempt in range(1, RERANK_REMOTE_MAX_ATTEMPTS + 1):
+            if attempt > 1 and RERANK_REMOTE_BACKOFF_SECONDS > 0:
+                time.sleep(RERANK_REMOTE_BACKOFF_SECONDS * (2 ** (attempt - 2)))
+            status_code = None
+            try:
+                global _last_remote_rerank_started_at
+                with _rerank_request_lock:
+                    remaining = RERANK_REMOTE_MIN_INTERVAL_SECONDS - (time.monotonic() - _last_remote_rerank_started_at)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    _last_remote_rerank_started_at = time.monotonic()
+                    response = requests.post(
+                        meta["rerank_endpoint"],
+                        headers=headers,
+                        json=payload,
+                        timeout=RERANK_TIMEOUT_SECONDS,
+                    )
+                status_code = response.status_code
+                meta["remote_attempt_count"] = attempt
+                if response.status_code >= 400:
+                    error = f"HTTP {response.status_code}: {response.text}"
+                    meta["remote_rerank_rate_limited"] = response.status_code == 429
+                    raise RuntimeError(error)
+                items = _validate_remote_rerank_results(
+                    response.json(),
+                    candidate_count=len(remote_docs),
+                    expected_count=expected_count,
+                )
+                if RERANK_CACHE_ENABLED:
+                    cache.set_json(cache_key, items, ttl=RERANK_CACHE_TTL_SECONDS)
+                meta["remote_success"] = True
+                meta["rerank_applied"] = True
+                meta["rerank_provider"] = "remote"
+                meta["rerank_error"] = None
+                _sync_rerank_trace(meta)
+                return _remote_rerank_from_items(remote_docs, items, top_k), meta
+            except Exception as exc:
+                meta["remote_attempt_count"] = attempt
+                error = f"{type(exc).__name__}: {exc}"
+                meta["rerank_error"] = error
+                meta["remote_errors"].append(error)
+                if isinstance(status_code, int) and status_code >= 400 and status_code not in retryable_statuses:
+                    break
+        _sync_rerank_trace(meta)
 
     if _local_reranker.enabled:
         try:
@@ -2009,10 +2126,15 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
                 meta["rerank_model"] = str(_local_reranker.model_path)
                 meta["rerank_endpoint"] = "local_cross_encoder"
                 meta["rerank_provider"] = "local_fallback" if meta["rerank_error"] else "local"
+                if meta["rerank_error"]:
+                    meta["rerank_fallback_used"] = True
+                    meta["rerank_fallback_reason"] = str(meta["rerank_error"])
+                _sync_rerank_trace(meta)
                 return reranked, meta
             meta["local_rerank_error"] = "empty_rerank_results"
         except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError) as exc:
             meta["local_rerank_error"] = str(exc)
+    _sync_rerank_trace(meta)
     return docs_with_rank[:top_k], meta
 
 

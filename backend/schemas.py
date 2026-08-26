@@ -75,6 +75,14 @@ class RagTrace(BaseModel):
     rerank_model: Optional[str] = None
     rerank_endpoint: Optional[str] = None
     rerank_error: Optional[str] = None
+    rerank_provider: Optional[str] = None
+    remote_attempt_count: Optional[int] = None
+    remote_success: Optional[bool] = None
+    remote_errors: Optional[List[str]] = None
+    rerank_cache_hit: Optional[bool] = None
+    rerank_fallback_used: Optional[bool] = None
+    rerank_fallback_reason: Optional[str] = None
+    rerank_trace: Optional[dict] = None
     retrieval_mode: Optional[str] = None
     query_planner_enabled: Optional[bool] = None
     planner_intent: Optional[str] = None
