@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from agent_tools import find_evidence, open_pages, select_pages
 from calculation_service import build_calculation_result, format_calculation_evidence
 from evidence_frame import build_evidence_frames
+from evidence_coverage import assess_structured_coverage, structured_coverage_enabled
 from finance_policy import load_finance_policy
 from evidence_context import build_compact_evidence
 from prompts import PROMPT_VERSION
@@ -315,6 +316,13 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
     )
     finance_policy = load_finance_policy(str(query_parse.get("task_type") or "lookup"))
     evidence_coverage = assess_required_field_coverage(query_parse, answer_docs)
+    if structured_coverage_enabled():
+        evidence_coverage = assess_structured_coverage(
+            query_parse,
+            answer_docs,
+            evidence_frames,
+            evidence_coverage,
+        )
     evidence_coverage["supplemental_search_attempted"] = bool(
         trace.get("supplemental_search_attempted")
         or (trace.get("evidence_coverage") or {}).get("supplemental_search_attempted")

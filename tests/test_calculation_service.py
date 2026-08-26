@@ -96,6 +96,31 @@ def test_structured_executor_disabled_preserves_existing_path(monkeypatch):
     assert build_calculation_result(task_spec, {"status": "partial"}, [], evidence_frames=frames) is None
 
 
+def test_structured_coverage_blocks_execution_until_operands_are_validated(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_EXECUTOR_ENABLED", "true")
+    monkeypatch.setenv("STRUCTURED_COVERAGE_ENABLED", "true")
+    task_spec = {
+        "task_type": "calculation",
+        "company": "Example Co",
+        "required_periods": ["2024"],
+        "required_fields": ["operating_income", "revenue"],
+        "formula": "operating_income / revenue",
+    }
+    frames = [
+        _evidence_frame("ef_income", "Operating income", "25"),
+        _evidence_frame("ef_revenue", "Revenue", "100"),
+    ]
+
+    assert build_calculation_result(task_spec, {"status": "partial", "operands_validated": False}, [], evidence_frames=frames) is None
+    result = build_calculation_result(
+        task_spec,
+        {"status": "complete", "operands_validated": True},
+        [],
+        evidence_frames=frames,
+    )
+    assert result["executor"] == "evidence_frame"
+
+
 def test_calculation_result_applies_only_explicit_final_rounding():
     task_spec = {
         "task_type": "calculation",

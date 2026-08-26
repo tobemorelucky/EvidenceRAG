@@ -60,7 +60,7 @@ def _normalized_label(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
-def _matching_frames(field: str, frames: List[dict]) -> List[dict]:
+def matching_evidence_frames(field: str, frames: List[dict]) -> List[dict]:
     """Return alias-matched frames, preferring an exact row-label match."""
     from query_parser import FIELD_ALIASES
 
@@ -78,7 +78,7 @@ def _matching_frames(field: str, frames: List[dict]) -> List[dict]:
     return [frame for score, frame in candidates if score == best_score]
 
 
-def _select_frame_operands(
+def resolve_frame_operands(
     task_spec: Dict[str, object],
     evidence_frames: List[dict],
 ) -> Dict[str, List[dict]] | None:
@@ -88,7 +88,7 @@ def _select_frame_operands(
     formula = str(task_spec.get("formula") or "")
     selected: Dict[str, List[dict]] = {}
     for field in task_spec.get("required_fields") or []:
-        candidates = _matching_frames(str(field), evidence_frames)
+        candidates = matching_evidence_frames(str(field), evidence_frames)
         if expected_company:
             candidates = [
                 frame for frame in candidates
@@ -142,7 +142,7 @@ def _build_frame_calculation(
     formula = str(task_spec.get("formula") or "").strip()
     if not formula or not evidence_frames:
         return None
-    selected = _select_frame_operands(task_spec, evidence_frames)
+    selected = resolve_frame_operands(task_spec, evidence_frames)
     if not selected:
         return None
     operand_frames = [frame for field_frames in selected.values() for frame in field_frames]
@@ -453,7 +453,12 @@ def build_calculation_result(
     """Calculate only when every required field resolves to one unambiguous numeric value."""
     if task_spec.get("task_type") != "calculation":
         return None
-    frame_calculation = _build_frame_calculation(task_spec, evidence_frames or [])
+    structured_coverage_required = os.getenv("STRUCTURED_COVERAGE_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    frame_calculation = None
+    if not structured_coverage_required or coverage.get("operands_validated") is True:
+        frame_calculation = _build_frame_calculation(task_spec, evidence_frames or [])
     if frame_calculation:
         return frame_calculation
     if coverage.get("status") != "complete":
