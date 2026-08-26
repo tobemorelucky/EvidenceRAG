@@ -9,13 +9,17 @@ from dataclasses import dataclass
 from agent_tools import find_evidence, open_pages, select_pages
 from calculation_service import build_calculation_result, format_calculation_evidence
 from evidence_frame import build_evidence_frames
-from evidence_coverage import assess_structured_coverage, structured_coverage_enabled
+from evidence_coverage import (
+    assess_structured_coverage,
+    build_document_scoped_supplemental_query,
+    structured_coverage_enabled,
+)
 from finance_policy import load_finance_policy
 from evidence_context import build_compact_evidence
 from prompts import PROMPT_VERSION
 from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
 from rag_pipeline import run_rag_graph
-from rag_utils import finalize_retrieved_documents, get_finance_rag_config
+from rag_utils import finalize_retrieved_documents, get_finance_rag_config, retrieve_document_scoped_candidates
 from table_store import TableStore
 
 
@@ -239,6 +243,72 @@ def _build_evidence_frames_for_documents(documents: list[dict], company: str) ->
     }
 
 
+def _supplement_partial_evidence(
+    question: str,
+    query_parse: dict,
+    documents: list[dict],
+    coverage: dict,
+) -> tuple[list[dict], dict]:
+    """Perform at most one deterministic retrieval inside selected documents."""
+    enabled = os.getenv("SUPPLEMENTAL_FIND_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    trace = {
+        "supplemental_find_enabled": enabled,
+        "supplemental_triggered": False,
+        "missing_evidence": list(coverage.get("missing_fields") or coverage.get("structured_missing") or []),
+        "supplemental_query": "",
+        "searched_documents": [],
+        "new_pages": [],
+        "new_evidence_frames": 0,
+        "coverage_before": coverage,
+        "coverage_after": coverage,
+    }
+    if not enabled or coverage.get("status") not in {"partial", "insufficient", "incomplete"}:
+        return documents, trace
+    filenames = list(dict.fromkeys(str(doc.get("filename") or "") for doc in documents if doc.get("filename")))
+    if not filenames:
+        return documents, trace
+    supplemental_query = build_document_scoped_supplemental_query(question, query_parse, coverage)
+    if not supplemental_query:
+        return documents, trace
+    trace.update({
+        "supplemental_triggered": True,
+        "supplemental_query": supplemental_query,
+        "searched_documents": filenames,
+    })
+    try:
+        hits = retrieve_document_scoped_candidates(
+            supplemental_query,
+            filenames,
+            top_k=max(1, int(os.getenv("SUPPLEMENTAL_FIND_CANDIDATE_K", "12"))),
+        )
+        page_requests = []
+        seen_pages = set()
+        for hit in hits[: max(1, int(os.getenv("SUPPLEMENTAL_FIND_TOP_PAGES", "3")))]:
+            filename = str(hit.get("filename") or "")
+            try:
+                page = int(hit.get("page_number") or 0)
+            except (TypeError, ValueError):
+                continue
+            for adjacent in (page - 1, page, page + 1):
+                key = (filename, adjacent)
+                if filename in filenames and adjacent > 0 and key not in seen_pages:
+                    seen_pages.add(key)
+                    page_requests.append({"filename": filename, "page_number": adjacent})
+        opened = open_pages(page_requests, limit=len(page_requests)) if page_requests else []
+        existing_pages = {(doc.get("filename"), doc.get("page_number")) for doc in documents}
+        new_pages = [doc for doc in opened if (doc.get("filename"), doc.get("page_number")) not in existing_pages]
+        trace["new_pages"] = [
+            {"filename": doc.get("filename"), "page_number": doc.get("page_number")}
+            for doc in new_pages
+        ]
+        return _deduplicate_docs([*documents, *new_pages]), trace
+    except Exception as exc:
+        # Supplemental retrieval is optional. Preserve the primary answer path
+        # and expose the exact failure in trace instead of hiding it as no hit.
+        trace["supplemental_error"] = f"{type(exc).__name__}: {exc}"
+        return documents, trace
+
+
 def prepare_rag_response(question: str, profile: str | None = None, mode: str | None = None) -> dict:
     started = time.perf_counter()
     config = resolve_execution_config(profile, mode)
@@ -327,6 +397,33 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         trace.get("supplemental_search_attempted")
         or (trace.get("evidence_coverage") or {}).get("supplemental_search_attempted")
     )
+    frames_before_supplement = {str(frame.get("evidence_id") or "") for frame in evidence_frames}
+    answer_docs, supplemental_trace = _supplement_partial_evidence(
+        question,
+        query_parse,
+        answer_docs,
+        evidence_coverage,
+    )
+    if supplemental_trace["supplemental_triggered"]:
+        citations = build_citations(answer_docs)
+        evidence_frames, evidence_frame_trace = _build_evidence_frames_for_documents(
+            answer_docs,
+            str(query_parse.get("company") or ""),
+        )
+        evidence_coverage = assess_required_field_coverage(query_parse, answer_docs)
+        if structured_coverage_enabled():
+            evidence_coverage = assess_structured_coverage(
+                query_parse,
+                answer_docs,
+                evidence_frames,
+                evidence_coverage,
+            )
+        evidence_coverage["supplemental_search_attempted"] = True
+        supplemental_trace["new_evidence_frames"] = sum(
+            str(frame.get("evidence_id") or "") not in frames_before_supplement
+            for frame in evidence_frames
+        )
+        supplemental_trace["coverage_after"] = evidence_coverage
     calculation = build_calculation_result(
         query_parse,
         evidence_coverage,
@@ -357,6 +454,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             "finance_policy_load_ms": finance_policy["load_ms"],
             "agent_tool_calls": tool_calls,
             "agent_tool_call_count": len(tool_calls),
+            **supplemental_trace,
             **evidence_frame_trace,
             **answer_page_open_trace,
         }

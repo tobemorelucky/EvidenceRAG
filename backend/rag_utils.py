@@ -4168,7 +4168,10 @@ def retrieve_documents(
     task_spec["statement_types"] = infer_statement_types(query, task_spec.get("required_fields") or [])
     initial_coverage = assess_required_field_coverage(task_spec, context_docs)
     supplemental_meta = {
-        "supplemental_search_enabled": _parse_bool(os.getenv("RAG_SUPPLEMENTAL_SEARCH_ENABLED"), True),
+        "supplemental_search_enabled": (
+            _parse_bool(os.getenv("RAG_SUPPLEMENTAL_SEARCH_ENABLED"), True)
+            and not _parse_bool(os.getenv("SUPPLEMENTAL_FIND_ENABLED"), False)
+        ),
         "supplemental_search_attempted": False,
         "supplemental_search_query": "",
         "supplemental_search_filenames": [],
@@ -4250,6 +4253,29 @@ def retrieve_documents(
         "context_docs": context_docs,
         "meta": meta,
     }
+
+
+def retrieve_document_scoped_candidates(
+    query: str,
+    filenames: list[str],
+    *,
+    top_k: int = 12,
+) -> list[dict[str, Any]]:
+    """Run one leaf retrieval restricted to an already-selected document set."""
+    scoped_filenames = list(dict.fromkeys(str(item).strip() for item in filenames if str(item).strip()))
+    if not query.strip() or not scoped_filenames:
+        return []
+    filter_expr = (
+        f'({_build_filename_filter(scoped_filenames)}) and '
+        '(evidence_type == "text_chunk" or evidence_type == "")'
+    )
+    result = _retrieve_leaf_chunks(
+        query,
+        top_k=max(1, top_k),
+        filter_expr=filter_expr,
+        retrieval_scope="supplemental:document_scoped_once",
+    )
+    return list(result.get("docs") or [])
 
 
 def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:

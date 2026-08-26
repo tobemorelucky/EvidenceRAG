@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 from calculation_service import resolve_frame_operands
+from query_parser import FIELD_ALIASES, STATEMENT_TYPE_LABELS
 
 
 STRUCTURED_TASKS = {"calculation", "comparison", "selection"}
@@ -122,3 +123,27 @@ def assess_structured_coverage(
         "coverage_basis": "evidence_frame",
         "structured_relevant_frame_count": len(relevant_frames),
     }
+
+
+def build_document_scoped_supplemental_query(
+    question: str,
+    task_spec: dict[str, Any],
+    coverage: dict[str, Any],
+) -> str:
+    """Build one deterministic query from missing concepts and constraints."""
+    missing_fields = [str(item) for item in coverage.get("missing_fields") or []]
+    structured_missing = set(coverage.get("structured_missing") or [])
+    if not missing_fields and structured_missing & {
+        "row_supported", "period_supported", "unit_scale_supported", "scope_supported", "operands_validated",
+    }:
+        missing_fields = [str(item) for item in task_spec.get("required_fields") or []]
+    labels = [FIELD_ALIASES[field][0] for field in missing_fields if FIELD_ALIASES.get(field)]
+    periods = [str(item) for item in task_spec.get("required_periods") or []]
+    statements = [
+        STATEMENT_TYPE_LABELS.get(str(item), str(item))
+        for item in task_spec.get("statement_types") or []
+    ]
+    anchors = list(dict.fromkeys([*labels, *periods, *statements]))
+    if not anchors:
+        return ""
+    return f"{question}\nMissing financial evidence: {'; '.join(anchors)}"
