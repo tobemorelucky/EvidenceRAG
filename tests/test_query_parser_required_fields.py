@@ -198,15 +198,6 @@ def test_capex_lookup_requires_capital_expenditures_field():
     assert parsed["statement_types"] == ["cash_flow"]
 
 
-def test_company_store_count_directive_requires_total_row():
-    question = "What was the change in the company's total store count from FY2021 to FY2022?"
-    directives = build_answer_directives(question, parse_query(question))
-
-    assert any("Total row" in directive for directive in directives)
-    assert any("brand, segment, geography" in directive for directive in directives)
-    assert all("Best Buy" not in directive for directive in directives)
-
-
 def test_quick_ratio_directive_requires_direct_conclusion():
     question = "Calculate the FY2022 quick ratio and say whether it is healthy."
     directives = build_answer_directives(question, parse_query(question))
@@ -223,45 +214,12 @@ def test_comparison_directive_requires_one_conclusion_after_comparison():
     assert any("without an initial guess or self-correction" in directive for directive in directives)
 
 
-def test_capital_intensity_directive_requires_yes_no_conclusion():
-    question = "Based on capital spending, net PP&E and revenue, is the company capital-intensive?"
-    directives = build_answer_directives(question, parse_query(question))
-
-    assert any("capital-intensity conclusion" in directive for directive in directives)
-    assert any("universal threshold" in directive for directive in directives)
-    assert all("not capital-intensive" not in directive for directive in directives)
-
-
-def test_acquisition_directive_requires_transaction_evidence():
-    directives = build_answer_directives(
-        "What are the main companies acquired during the year?",
-        parse_query("What are the main companies acquired during the year?"),
-    )
-
-    assert any("transaction statements" in directive for directive in directives)
-    assert any("glossary" in directive for directive in directives)
-
-
-def test_best_performance_directive_uses_growth_not_mix():
-    question = "Which category performed best on the top line?"
-    directives = build_answer_directives(question, parse_query(question))
-
-    assert any("change or growth measure" in directive for directive in directives)
-    assert any("revenue mix" in directive for directive in directives)
-
-
 def test_forecast_and_driver_directives_preserve_task_semantics():
     forecast = "What production changes are expected next year?"
     drivers = "What drove the change in operating margin?"
 
     assert any("future action and direction" in item for item in build_answer_directives(forecast, parse_query(forecast)))
     assert any("explicit MD&A attribution" in item for item in build_answer_directives(drivers, parse_query(drivers)))
-
-
-def test_domestic_scope_directive_excludes_international_table():
-    question = "Which category performed best in the domestic USA market?"
-
-    assert any("Do not substitute an International" in item for item in build_answer_directives(question, parse_query(question)))
 
 
 def test_parse_query_extracts_explicit_rounding_precision():
@@ -320,11 +278,9 @@ def test_revenue_field_match_rejects_percentage_context():
 def test_exchange_registered_securities_uses_cover_page_field():
     question = "Which debt securities are registered to trade on a national securities exchange?"
     parsed = parse_query(question)
-    directives = build_answer_directives(question, parsed)
 
     assert parsed["task_type"] == "lookup"
     assert parsed["required_fields"] == ["exchange_registered_securities"]
-    assert any("Section 12(b)" in directive for directive in directives)
 
 
 def test_generic_selection_is_inferred_from_requested_ranking_operation():
@@ -361,27 +317,7 @@ def test_calculation_intent_precedes_secondary_metric_relevance_caveat():
     assert parsed["task_type"] == "calculation"
 
 
-def test_company_name_with_best_does_not_trigger_selection():
-    parsed = parse_query("Was there any change in the number of Best Buy stores between FY2024 and FY2023?")
+def test_company_name_containing_best_does_not_trigger_selection():
+    parsed = parse_query("Was there any change in the number of Best Holdings stores between FY2024 and FY2023?")
 
     assert parsed["task_type"] == "comparison"
-
-
-def test_any_change_question_gets_boolean_consistency_directive():
-    question = "Was there any change in the disclosed count between FY2024 and FY2023?"
-    parsed = parse_query(question)
-
-    directives = build_answer_directives(question, parsed)
-
-    assert any("answer Yes when the compared values differ" in item for item in directives)
-    assert any("answer No only when they are equal" in item for item in directives)
-
-
-def test_improving_profile_question_gets_directional_boolean_directive():
-    question = "Does the business have an improving disclosed margin profile as of FY2023?"
-    parsed = parse_query(question)
-
-    directives = build_answer_directives(question, parsed)
-
-    assert any("answer Yes only when the latest comparable value is above" in item for item in directives)
-    assert any("answer No when it is below or unchanged" in item for item in directives)

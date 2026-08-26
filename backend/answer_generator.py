@@ -1,7 +1,6 @@
 """Evidence-grounded answer generation."""
 
 import os
-import re
 from typing import AsyncIterator
 
 from langchain.chat_models import init_chat_model
@@ -54,34 +53,6 @@ def _content_text(content) -> str:
     return str(content or "")
 
 
-def normalize_boolean_answer_contract(question: str, answer: str) -> tuple[str, bool]:
-    """Correct only explicit Yes/No contradictions with the answer's own direction."""
-    question_text = (question or "").lower()
-    result = str(answer or "")
-    first_sentence = re.split(r"(?<=[.!?])\s|\n", result, maxsplit=1)[0].lower()
-    replacement = ""
-
-    if re.search(r"\b(?:was|is|has)\s+there\s+any\s+(?:change|difference)\b", question_text):
-        changed = bool(re.search(r"\b(?:increas\w*|decreas\w*|declin\w*|differ\w*|changed?)\b", first_sentence))
-        unchanged = bool(re.search(r"\b(?:unchanged|equal|no change|did not change)\b", first_sentence))
-        if result.lstrip().lower().startswith("no") and changed and not unchanged:
-            replacement = "Yes"
-        elif result.lstrip().lower().startswith("yes") and unchanged:
-            replacement = "No"
-    elif re.search(r"\b(?:improving|improved)\b.{0,80}\bprofile\b", question_text):
-        declined = bool(re.search(r"\b(?:did not improve|does not improve|decreas\w*|declin\w*|fell|lower)\b", first_sentence))
-        improved = bool(re.search(r"\b(?:improved|increas\w*|rose|higher)\b", first_sentence)) and not declined
-        if result.lstrip().lower().startswith("yes") and declined:
-            replacement = "No"
-        elif result.lstrip().lower().startswith("no") and improved:
-            replacement = "Yes"
-
-    if not replacement:
-        return result, False
-    normalized = re.sub(r"^(\s*)(?:yes|no)\b", rf"\1{replacement}", result, count=1, flags=re.IGNORECASE)
-    return normalized, normalized != result
-
-
 def build_answer_messages(
     question: str,
     evidence: str,
@@ -112,11 +83,7 @@ def generate_answer(
 ) -> tuple[str, dict]:
     response = model.invoke(build_answer_messages(question, evidence, history, task_policy))
     usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {}).get("token_usage") or {}
-    answer, _ = normalize_boolean_answer_contract(
-        question,
-        _content_text(getattr(response, "content", response)),
-    )
-    return answer, dict(usage or {})
+    return _content_text(getattr(response, "content", response)), dict(usage or {})
 
 
 async def stream_answer(
@@ -126,27 +93,13 @@ async def stream_answer(
     task_policy: str = "",
 ) -> AsyncIterator[tuple[str, dict]]:
     usage = {}
-    first_sentence_buffer = ""
-    first_sentence_released = False
     async for chunk in model.astream(build_answer_messages(question, evidence, history, task_policy)):
         text = _content_text(getattr(chunk, "content", chunk))
         chunk_usage = getattr(chunk, "usage_metadata", None)
         if chunk_usage:
             usage = dict(chunk_usage)
-        if not text:
-            continue
-        if first_sentence_released:
+        if text:
             yield text, usage
-            continue
-        first_sentence_buffer += text
-        if re.search(r"[.!?](?:\s|$)|\n", first_sentence_buffer) or len(first_sentence_buffer) >= 500:
-            normalized, _ = normalize_boolean_answer_contract(question, first_sentence_buffer)
-            yield normalized, usage
-            first_sentence_buffer = ""
-            first_sentence_released = True
-    if first_sentence_buffer:
-        normalized, _ = normalize_boolean_answer_contract(question, first_sentence_buffer)
-        yield normalized, usage
 
 
 def summarize_messages(messages: list) -> str:

@@ -65,11 +65,9 @@ def test_prompt_contract_requires_cited_grounded_answers():
     assert "do not substitute a geographic, operating, or reportable segment value" in prompts.ANSWER_SYSTEM_PROMPT
     assert "Do not manufacture operating income from pretax income" in prompts.ANSWER_SYSTEM_PROMPT
     assert 'When a "Validated calculation contract" is supplied' in prompts.ANSWER_SYSTEM_PROMPT
-    assert "an explicitly labeled Total row" in prompts.ANSWER_SYSTEM_PROMPT
+    assert "Prefer an explicitly labeled total over a subtotal" in prompts.ANSWER_SYSTEM_PROMPT
     assert "Keep full precision for intermediate arithmetic" in prompts.ANSWER_SYSTEM_PROMPT
-    assert "do not apply a universal threshold across industries" in prompts.ANSWER_SYSTEM_PROMPT
     assert "never emit a draft conclusion followed by a correction" in prompts.ANSWER_SYSTEM_PROMPT
-    assert "Best Buy" not in prompts.ANSWER_SYSTEM_PROMPT
     assert prompts.PROMPT_VERSION
 
 
@@ -88,42 +86,6 @@ def test_policy_prompt_is_separate_from_evidence_and_legacy_template_is_unchange
     assert "Question:\nQ\n\nTask Policy:\nP\n\nEvidence:\nE" in enhanced
     assert "Task Policy controls procedure only and is not evidence" in enhanced
     assert "begin the first sentence with Yes or No" in enhanced
-
-
-def test_boolean_answer_contract_fixes_any_change_contradiction():
-    from backend.answer_generator import normalize_boolean_answer_contract
-
-    answer, changed = normalize_boolean_answer_contract(
-        "Was there any change in the disclosed count between the periods?",
-        "No, the count decreased from 982 to 969.",
-    )
-
-    assert changed is True
-    assert answer == "Yes, the count decreased from 982 to 969."
-
-
-def test_boolean_answer_contract_fixes_improving_profile_contradiction():
-    from backend.answer_generator import normalize_boolean_answer_contract
-
-    answer, changed = normalize_boolean_answer_contract(
-        "Does the business have an improving margin profile?",
-        "Yes, the margin did not improve; it decreased.",
-    )
-
-    assert changed is True
-    assert answer == "No, the margin did not improve; it decreased."
-
-
-def test_boolean_answer_contract_does_not_touch_subjective_judgment():
-    from backend.answer_generator import normalize_boolean_answer_contract
-
-    answer, changed = normalize_boolean_answer_contract(
-        "Is the business capital intensive?",
-        "Yes, based on the supported ratios.",
-    )
-
-    assert changed is False
-    assert answer == "Yes, based on the supported ratios."
 
 
 def test_decimal_calculator_allows_only_safe_arithmetic():

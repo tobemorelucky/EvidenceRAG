@@ -662,14 +662,6 @@ def build_answer_directives(question: str, task_spec: Dict[str, object]) -> List
         directives.append("Compare every row in the shared candidate table, including Corporate/Other and negative values, before selecting the minimum or maximum.")
     if task_spec.get("task_type") == "comparison" or len(task_spec.get("required_periods") or []) >= 2:
         directives.append("Compare every requested reporting period before stating the directional conclusion. Give one final, internally consistent conclusion without an initial guess or self-correction.")
-    if re.search(r"\b(?:was|is|has)\s+there\s+any\s+(?:change|difference)\b", text):
-        directives.append("For the boolean question about whether any change occurred, answer Yes when the compared values differ or show a nonzero increase/decrease; answer No only when they are equal. The first sentence must agree with the stated direction.")
-    if re.search(r"\b(?:improving|improved)\b.{0,80}\bprofile\b", text):
-        directives.append("For the boolean improving-profile question, answer Yes only when the latest comparable value is above the prior value; answer No when it is below or unchanged. The first sentence must agree with the calculated direction.")
-    if "store" in text and task_spec.get("task_type") == "comparison":
-        directives.append("For a company-level store-count question, use the explicitly labeled Total row. Do not substitute a brand, segment, geography, or other subcategory row unless the question names that scope.")
-    if "securit" in text and "registered" in text and "exchange" in text:
-        directives.append("Use the filing cover-page table headed Securities registered pursuant to Section 12(b). If it lists only non-debt classes, answer that no debt securities are registered; do not treat unrelated outstanding debt tables as exchange-registration evidence.")
     if task_spec.get("calculation_basis") == "operating_working_capital":
         directives.append("Use operating working capital: receivables + inventory + other current assets - accounts payable - other accrued liabilities; exclude cash and short-term debt.")
     if task_spec.get("formula") == "revenue / average(ppe)":
@@ -682,16 +674,6 @@ def build_answer_directives(question: str, task_spec: Dict[str, object]) -> List
         directives.append("Return the requested ratio as a decimal without a percent sign unless the question explicitly requests percent or percentage units.")
     if task_spec.get("result_unit") == "percent":
         directives.append("Present the final ratio as a percentage by multiplying the validated decimal ratio by 100. Keep the calculation operands and formula unchanged.")
-    if "capital-intensive" in text or "capital intensive" in text:
-        directives.append("Compare capital spending and net PP&E with revenue, state the supported ratios, and tie any yes/no capital-intensity conclusion to the supplied evidence. Do not apply a universal threshold or infer the label from absolute spending alone.")
-    if re.search(r"\b(?:acquire|acquired|acquisition|acquisitions)\b", text):
-        directives.append("Identify acquisition targets only from transaction statements that say the company acquired or completed an acquisition. Do not infer targets from a glossary, definition list, restructuring-cost table, or an announced but not completed transaction.")
-    if re.search(r"\b(?:performed best|best performance|highest growth|top[- ]line)\b", text):
-        directives.append("Interpret performance using the table's change or growth measure, such as comparable-sales or revenue growth. Do not substitute revenue mix, share, or absolute size unless the question explicitly asks for it.")
-    if re.search(r"\b(?:domestic|usa|u\.s\.)\b", text):
-        directives.append("Use only the explicitly labeled Domestic or U.S. scope for the requested result. Do not substitute an International, foreign, or consolidated table when a Domestic table is available.")
-    if re.search(r"\b(?:international|foreign|outside the u\.s\.)\b", text):
-        directives.append("Use only the explicitly labeled International or foreign scope for the requested result. Do not substitute a Domestic or U.S. table.")
     if re.search(r"\b(?:forecast|expected|expects|planned|plans|outlook)\b", text):
         directives.append("For forecasts, report the future action and direction explicitly (for example increase, decrease, resume, pause, or stop), and distinguish the current rate from the forecast rate.")
     if re.search(r"\b(?:what drove|drivers?|factors?)\b", text):
