@@ -1,6 +1,101 @@
 from calculation_service import build_calculation_result
 
 
+def _evidence_frame(evidence_id, row_label, value, *, period="2024"):
+    return {
+        "evidence_id": evidence_id,
+        "source_type": "table_cell",
+        "company": "Example Co",
+        "document": "report.pdf",
+        "page_number": 8,
+        "statement_type": "income_statement",
+        "table_id": "table-1",
+        "row_label": row_label,
+        "period": period,
+        "normalized_value": str(value),
+        "currency": "USD",
+        "scale": "millions",
+        "scope": "consolidated",
+        "citation": "[source: report.pdf, page 8]",
+    }
+
+
+def test_structured_executor_precedes_text_row_parser(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_EXECUTOR_ENABLED", "true")
+    task_spec = {
+        "task_type": "calculation",
+        "company": "Example Co",
+        "required_periods": ["2024"],
+        "required_fields": ["operating_income", "revenue"],
+        "formula": "operating_income / revenue",
+    }
+    frames = [
+        _evidence_frame("ef_income", "Operating income", "25"),
+        _evidence_frame("ef_revenue", "Revenue", "100"),
+    ]
+
+    result = build_calculation_result(task_spec, {"status": "partial"}, [], evidence_frames=frames)
+
+    assert result["executor"] == "evidence_frame"
+    assert result["result"] == "0.25"
+    assert result["operand_evidence_ids"] == ["ef_income", "ef_revenue"]
+
+
+def test_structured_executor_does_not_guess_missing_period(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_EXECUTOR_ENABLED", "true")
+    task_spec = {
+        "task_type": "calculation",
+        "company": "Example Co",
+        "required_periods": ["2024"],
+        "required_fields": ["operating_income", "revenue"],
+        "formula": "operating_income / revenue",
+    }
+    frames = [
+        _evidence_frame("ef_income", "Operating income", "25", period=None),
+        _evidence_frame("ef_revenue", "Revenue", "100", period=None),
+    ]
+
+    assert build_calculation_result(task_spec, {"status": "partial"}, [], evidence_frames=frames) is None
+
+
+def test_structured_executor_averages_target_and_nearest_prior_explicit_period(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_EXECUTOR_ENABLED", "true")
+    task_spec = {
+        "task_type": "calculation",
+        "company": "Example Co",
+        "required_periods": ["2024"],
+        "required_fields": ["net_income", "total_assets"],
+        "formula": "net_income / average(total_assets)",
+    }
+    frames = [
+        _evidence_frame("ef_income", "Net income", "30", period="2024"),
+        _evidence_frame("ef_assets_2024", "Total assets", "120", period="2024"),
+        _evidence_frame("ef_assets_2023", "Total assets", "80", period="2023"),
+        _evidence_frame("ef_assets_2022", "Total assets", "60", period="2022"),
+    ]
+
+    result = build_calculation_result(task_spec, {"status": "partial"}, [], evidence_frames=frames)
+
+    assert result["result"] == "0.3"
+    assert result["operands"]["total_assets"]["value"] == ["120", "80"]
+    assert result["operand_evidence_ids"] == ["ef_income", "ef_assets_2024", "ef_assets_2023"]
+
+
+def test_structured_executor_disabled_preserves_existing_path(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_EXECUTOR_ENABLED", "false")
+    task_spec = {
+        "task_type": "calculation",
+        "required_fields": ["operating_income", "revenue"],
+        "formula": "operating_income / revenue",
+    }
+    frames = [
+        _evidence_frame("ef_income", "Operating income", "25"),
+        _evidence_frame("ef_revenue", "Revenue", "100"),
+    ]
+
+    assert build_calculation_result(task_spec, {"status": "partial"}, [], evidence_frames=frames) is None
+
+
 def test_calculation_result_applies_only_explicit_final_rounding():
     task_spec = {
         "task_type": "calculation",

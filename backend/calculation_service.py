@@ -1,10 +1,12 @@
 """Build conservative, auditable Decimal calculations from validated evidence fields."""
 
+import os
 import re
 from decimal import Decimal, DecimalException, ROUND_HALF_UP
 from typing import Dict, List
 
 from agent_tools import calculate
+from financial_executor import FinancialExecutionError, execute_financial_operation
 
 
 _SUPPORTED_FORMULA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\s*[+\-*/]\s*[A-Za-z_][A-Za-z0-9_]*)*$")
@@ -52,6 +54,168 @@ def _requested_years(task_spec: Dict[str, object]) -> List[str]:
         for period in (task_spec.get("required_periods") or [])
         for year in _YEAR_PATTERN.findall(str(period))
     ))
+
+
+def _normalized_label(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+
+def _matching_frames(field: str, frames: List[dict]) -> List[dict]:
+    """Return alias-matched frames, preferring an exact row-label match."""
+    from query_parser import FIELD_ALIASES
+
+    aliases = [_normalized_label(alias) for alias in FIELD_ALIASES.get(field, []) if _normalized_label(alias)]
+    candidates: List[tuple[int, dict]] = []
+    for frame in frames:
+        label = _normalized_label(frame.get("row_label"))
+        scores = [300 if label == alias else 200 if label.startswith(alias) else 100 if alias in label else 0 for alias in aliases]
+        score = max(scores, default=0)
+        if score:
+            candidates.append((score, frame))
+    if not candidates:
+        return []
+    best_score = max(score for score, _ in candidates)
+    return [frame for score, frame in candidates if score == best_score]
+
+
+def _select_frame_operands(
+    task_spec: Dict[str, object],
+    evidence_frames: List[dict],
+) -> Dict[str, List[dict]] | None:
+    """Resolve formula fields conservatively; ambiguity always falls back."""
+    requested_years = _requested_years(task_spec)
+    expected_company = _normalized_label(task_spec.get("company"))
+    formula = str(task_spec.get("formula") or "")
+    selected: Dict[str, List[dict]] = {}
+    for field in task_spec.get("required_fields") or []:
+        candidates = _matching_frames(str(field), evidence_frames)
+        if expected_company:
+            candidates = [
+                frame for frame in candidates
+                if _normalized_label(frame.get("company")) == expected_company
+            ]
+        average_field = bool(re.search(rf"average\(\s*{re.escape(str(field))}\s*\)", formula))
+        if requested_years:
+            # Explicit periods may never be inferred from column order.
+            matching = [frame for frame in candidates if str(frame.get("period") or "") in requested_years]
+            if average_field and matching:
+                anchor = matching[0] if len(matching) == 1 else None
+                peers = [
+                    frame for frame in candidates
+                    if anchor
+                    and frame.get("table_id") == anchor.get("table_id")
+                    and frame.get("row_label") == anchor.get("row_label")
+                    and frame.get("period")
+                    and frame.get("period") != anchor.get("period")
+                ]
+                try:
+                    anchor_year = int(str(anchor.get("period"))) if anchor else 0
+                    prior = [frame for frame in peers if int(str(frame.get("period"))) < anchor_year]
+                    prior.sort(key=lambda frame: int(str(frame.get("period"))), reverse=True)
+                except (TypeError, ValueError):
+                    prior = []
+                candidates = [anchor, prior[0]] if anchor and prior else []
+            else:
+                candidates = matching
+        elif average_field:
+            # Without a requested period, exactly two explicitly-labelled cells
+            # from one row/table are required.
+            groups: Dict[tuple, List[dict]] = {}
+            for frame in candidates:
+                if frame.get("period"):
+                    groups.setdefault((frame.get("table_id"), frame.get("row_label")), []).append(frame)
+            valid_groups = [items for items in groups.values() if len(items) == 2]
+            candidates = valid_groups[0] if len(valid_groups) == 1 else []
+        if (average_field and len(candidates) != 2) or (not average_field and len(candidates) != 1):
+            return None
+        selected[str(field)] = candidates
+    return selected
+
+
+def _build_frame_calculation(
+    task_spec: Dict[str, object],
+    evidence_frames: List[dict],
+) -> Dict[str, object] | None:
+    """Execute a QuerySpec formula only when every EvidenceFrame is auditable."""
+    if os.getenv("STRUCTURED_EXECUTOR_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    formula = str(task_spec.get("formula") or "").strip()
+    if not formula or not evidence_frames:
+        return None
+    selected = _select_frame_operands(task_spec, evidence_frames)
+    if not selected:
+        return None
+    operand_frames = [frame for field_frames in selected.values() for frame in field_frames]
+    ids = [str(frame.get("evidence_id") or "") for frame in operand_frames]
+    if not all(ids):
+        return None
+
+    # The select operation performs the shared provenance/metadata checks. A
+    # cross-table formula with unknown units/scopes is intentionally rejected.
+    table_ids = {str(frame.get("table_id") or "") for frame in operand_frames}
+    for field in ("currency", "scale", "scope"):
+        known = [frame.get(field) for frame in operand_frames if frame.get(field) not in (None, "")]
+        if len(table_ids) > 1 and (len(known) != len(operand_frames) or len(set(known)) != 1):
+            return None
+    expected: Dict[str, object] = {}
+    if task_spec.get("company"):
+        expected["company"] = task_spec.get("company")
+    requested_years = _requested_years(task_spec)
+    if len(requested_years) == 1 and "average(" not in formula:
+        expected["period"] = requested_years[0]
+    try:
+        validation = execute_financial_operation(
+            "select",
+            evidence_frames,
+            operand_evidence_ids=ids,
+            constraints={"expected": expected},
+        )
+    except FinancialExecutionError:
+        return None
+
+    expression = formula
+    operands: Dict[str, dict] = {}
+    for field, frames in selected.items():
+        if len(frames) == 2:
+            values = [str(frame["normalized_value"]) for frame in frames]
+            expression = re.sub(
+                rf"average\(\s*{re.escape(field)}\s*\)",
+                f"((({values[0]}) + ({values[1]})) / 2)",
+                expression,
+            )
+            operand_value: object = values
+        else:
+            operand_value = str(frames[0]["normalized_value"])
+            expression = re.sub(rf"\b{re.escape(field)}\b", f"({operand_value})", expression)
+        first = frames[0]
+        operands[field] = {
+            "value": operand_value,
+            "filename": first.get("document") or "",
+            "page_number": first.get("page_number"),
+            "period": first.get("period") or "",
+            "matched_alias": first.get("row_label") or "",
+            "evidence_ids": [frame["evidence_id"] for frame in frames],
+        }
+    try:
+        calculated = calculate(expression)
+    except ValueError:
+        return None
+    root_operation = "divide" if "/" in formula else "multiply" if "*" in formula else "subtract" if "-" in formula else "sum"
+    return _with_display_result({
+        "formula": formula,
+        "operation": root_operation,
+        "expression": calculated["expression"],
+        "operands": operands,
+        "normalized_operands": [str(frame["normalized_value"]) for frame in operand_frames],
+        "operand_evidence_ids": ids,
+        "citations": validation["citations"],
+        "result": calculated["result"],
+        "full_precision_result": calculated["result"],
+        "status": "calculated",
+        "executor": "evidence_frame",
+        "source": "evidence_frame_decimal",
+        "result_unit": task_spec.get("result_unit") or "",
+    }, task_spec)
 
 
 def _header_periods(lines: List[str], row_index: int, value_count: int) -> List[str]:
@@ -284,9 +448,15 @@ def build_calculation_result(
     task_spec: Dict[str, object],
     coverage: Dict[str, object],
     documents: List[dict] | None = None,
+    evidence_frames: List[dict] | None = None,
 ) -> Dict[str, object] | None:
     """Calculate only when every required field resolves to one unambiguous numeric value."""
-    if task_spec.get("task_type") != "calculation" or coverage.get("status") != "complete":
+    if task_spec.get("task_type") != "calculation":
+        return None
+    frame_calculation = _build_frame_calculation(task_spec, evidence_frames or [])
+    if frame_calculation:
+        return frame_calculation
+    if coverage.get("status") != "complete":
         return None
     formula = str(task_spec.get("formula") or "").strip()
     if documents:

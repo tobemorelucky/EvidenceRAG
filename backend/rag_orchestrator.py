@@ -319,7 +319,16 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         trace.get("supplemental_search_attempted")
         or (trace.get("evidence_coverage") or {}).get("supplemental_search_attempted")
     )
-    calculation = build_calculation_result(query_parse, evidence_coverage, answer_docs)
+    calculation = build_calculation_result(
+        query_parse,
+        evidence_coverage,
+        answer_docs,
+        evidence_frames=evidence_frames,
+    )
+    if calculation and calculation.get("executor") == "evidence_frame":
+        evidence_frame_trace["frames_used_for_execution"] = len(
+            calculation.get("operand_evidence_ids") or []
+        )
     evidence_status = _resolve_evidence_status(citations, evidence_coverage)
     trace.update(
         {
