@@ -70,6 +70,32 @@ def test_table_store_upsert_updates_existing_record(monkeypatch):
     assert rows[0]["columns"] == ["A"]
 
 
+def test_table_store_prefers_normalized_financial_structure(monkeypatch):
+    store = _make_store(monkeypatch)
+
+    store.upsert_tables(
+        [
+            {
+                "table_id": "normalized-1",
+                "filename": "report.pdf",
+                "title": "Raw title",
+                "columns": ["raw_a", "raw_b"],
+                "rows": [{"raw_a": "Cash", "raw_b": "100"}],
+                "normalized_title": "Consolidated Balance Sheets",
+                "normalized_unit": "USD millions",
+                "normalized_columns": ["Metric", "2024"],
+                "normalized_rows": [{"Metric": "Cash", "2024": "100"}],
+            }
+        ]
+    )
+
+    table = store.get_tables_by_ids(["normalized-1"])[0]
+    assert table["title"] == "Consolidated Balance Sheets"
+    assert table["before_context"] == "USD millions"
+    assert table["columns"] == ["Metric", "2024"]
+    assert table["rows"] == [{"Metric": "Cash", "2024": "100"}]
+
+
 def test_table_store_get_by_filename_orders_by_page_and_index(monkeypatch):
     store = _make_store(monkeypatch)
 

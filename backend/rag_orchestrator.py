@@ -8,16 +8,19 @@ from dataclasses import dataclass
 
 from agent_tools import find_evidence, open_pages, select_pages
 from calculation_service import build_calculation_result, format_calculation_evidence
+from evidence_frame import build_evidence_frames
 from finance_policy import load_finance_policy
 from evidence_context import build_compact_evidence
 from prompts import PROMPT_VERSION
 from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
 from rag_pipeline import run_rag_graph
 from rag_utils import finalize_retrieved_documents, get_finance_rag_config
+from table_store import TableStore
 
 
 VALID_PROFILES = {"general", "finance"}
 VALID_MODES = {"static", "agentic", "auto"}
+_table_store = TableStore()
 
 
 class RetrievalServiceError(RuntimeError):
@@ -169,6 +172,72 @@ def _agent_queries(question: str) -> list[str]:
     return [rewrite] if rewrite and rewrite != question else []
 
 
+def _build_evidence_frames_for_documents(documents: list[dict], company: str) -> tuple[list[dict], dict]:
+    enabled = os.getenv("EVIDENCE_FRAME_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    base_trace = {
+        "evidence_frame_enabled": enabled,
+        "evidence_frame_count": 0,
+        "table_frame_count": 0,
+        "evidence_frame_tables_considered": 0,
+        "evidence_frame_tables_accepted": 0,
+        "frames_with_period": 0,
+        "frames_with_unit_scale": 0,
+        "frames_used_for_execution": 0,
+        "evidence_frame_skipped": {},
+        "evidence_frame_load_errors": [],
+        "evidence_frame_page_window": 0,
+        "evidence_frame_adjacent_page_tables": 0,
+        "evidence_frame_load_ms": 0.0,
+    }
+    if not enabled or not documents:
+        return [], base_trace
+    started = time.perf_counter()
+    max_tables = max(1, int(os.getenv("EVIDENCE_FRAME_MAX_TABLES", "8")))
+    max_frames = max(1, int(os.getenv("EVIDENCE_FRAME_MAX_FRAMES", "500")))
+    page_window = max(0, int(os.getenv("EVIDENCE_FRAME_PAGE_WINDOW", "1")))
+    pages_by_filename: dict[str, set[int]] = {}
+    for document in documents:
+        filename = str(document.get("filename") or "").strip()
+        try:
+            page_number = int(document.get("page_number") or 0)
+        except (TypeError, ValueError):
+            continue
+        if filename and page_number > 0:
+            pages_by_filename.setdefault(filename, set()).add(page_number)
+    tables: list[dict] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+    for filename, pages in pages_by_filename.items():
+        try:
+            candidates = _table_store.get_tables_by_filename(filename) or []
+        except Exception as exc:
+            errors.append(f"{filename}:{type(exc).__name__}:{exc}")
+            continue
+        for table in candidates:
+            table_id = str(table.get("table_id") or "")
+            table_page = int(table.get("page_number") or 0)
+            if not any(abs(table_page - page) <= page_window for page in pages) or table_id in seen:
+                continue
+            seen.add(table_id)
+            tables.append(table)
+            if len(tables) >= max_tables:
+                break
+        if len(tables) >= max_tables:
+            break
+    frames, frame_trace = build_evidence_frames(tables, company=company or None, max_frames=max_frames)
+    return frames, {
+        **base_trace,
+        **frame_trace,
+        "evidence_frame_load_errors": errors,
+        "evidence_frame_page_window": page_window,
+        "evidence_frame_adjacent_page_tables": sum(
+            int(table.get("page_number") or 0) not in pages_by_filename.get(str(table.get("filename") or ""), set())
+            for table in tables
+        ),
+        "evidence_frame_load_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
+
+
 def prepare_rag_response(question: str, profile: str | None = None, mode: str | None = None) -> dict:
     started = time.perf_counter()
     config = resolve_execution_config(profile, mode)
@@ -240,6 +309,10 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
     answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs)
     citations = build_citations(answer_docs)
     query_parse = parse_query(question)
+    evidence_frames, evidence_frame_trace = _build_evidence_frames_for_documents(
+        answer_docs,
+        str(query_parse.get("company") or ""),
+    )
     finance_policy = load_finance_policy(str(query_parse.get("task_type") or "lookup"))
     evidence_coverage = assess_required_field_coverage(query_parse, answer_docs)
     evidence_coverage["supplemental_search_attempted"] = bool(
@@ -267,6 +340,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             "finance_policy_load_ms": finance_policy["load_ms"],
             "agent_tool_calls": tool_calls,
             "agent_tool_call_count": len(tool_calls),
+            **evidence_frame_trace,
             **answer_page_open_trace,
         }
     )
@@ -308,5 +382,6 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         "citations": citations,
         "evidence_status": evidence_status,
         "calculation": calculation,
+        "evidence_frames": evidence_frames,
         "trace_id": trace["trace_id"],
     }

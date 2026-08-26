@@ -61,6 +61,10 @@ class TableStore:
                     continue
 
                 record = db.query(DocumentTable).filter(DocumentTable.table_id == table_id).first()
+                normalized_unit = self._normalize_string(table.get("normalized_unit")).strip()
+                before_context = self._normalize_string(table.get("before_context"))
+                if normalized_unit and normalized_unit not in before_context:
+                    before_context = f"{normalized_unit}\n{before_context}".strip()
                 payload = {
                     "filename": filename,
                     "doc_name": self._normalize_string(table.get("doc_name")),
@@ -68,12 +72,12 @@ class TableStore:
                     "file_path": self._normalize_string(table.get("file_path")),
                     "page_number": self._normalize_int(table.get("page_number")),
                     "table_index": self._normalize_int(table.get("table_index")),
-                    "title": self._normalize_string(table.get("title")),
+                    "title": self._normalize_string(table.get("normalized_title") or table.get("title")),
                     "caption": self._normalize_string(table.get("caption")),
-                    "before_context": self._normalize_string(table.get("before_context")),
+                    "before_context": before_context,
                     "after_context": self._normalize_string(table.get("after_context")),
-                    "columns": self._normalize_list(table.get("columns")),
-                    "rows": self._normalize_list(table.get("rows")),
+                    "columns": self._normalize_list(table.get("normalized_columns") or table.get("columns")),
+                    "rows": self._normalize_list(table.get("normalized_rows") or table.get("rows")),
                     "html": self._normalize_string(table.get("html")),
                     "csv_text": self._normalize_string(table.get("csv_text")),
                     "updated_at": datetime.utcnow(),
