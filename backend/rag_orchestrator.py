@@ -224,7 +224,31 @@ def _build_evidence_frames_for_documents(documents: list[dict], company: str) ->
             if not any(abs(table_page - page) <= page_window for page in pages) or table_id in seen:
                 continue
             seen.add(table_id)
-            tables.append(table)
+            row_labels = [
+                str(next(iter(row.values()), "")).strip()
+                for row in (table.get("normalized_rows") or table.get("rows") or [])
+                if isinstance(row, dict) and row
+            ][:5]
+            matched_document = next(
+                (
+                    document
+                    for document in documents
+                    if str(document.get("filename") or "") == filename
+                    and sum(
+                        bool(label) and label.casefold() in str(document.get("text") or document.get("page_text") or "").casefold()
+                        for label in row_labels
+                    ) >= min(2, len(row_labels))
+                ),
+                None,
+            )
+            tables.append({
+                **table,
+                "evidence_page_context": (
+                    str(matched_document.get("text") or matched_document.get("page_text") or "")
+                    if matched_document else ""
+                ),
+                "evidence_page_number": matched_document.get("page_number") if matched_document else None,
+            })
             if len(tables) >= max_tables:
                 break
         if len(tables) >= max_tables:

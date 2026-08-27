@@ -113,6 +113,7 @@ def _table_text(table: dict[str, Any], normalized: dict[str, Any]) -> str:
             _clean(table.get("caption")),
             _clean(table.get("before_context")),
             _clean(table.get("after_context")),
+            _clean(table.get("evidence_page_context")),
             *(
                 " | ".join(_clean(value) for value in row.values() if _clean(value))
                 for row in rows
@@ -193,16 +194,70 @@ def _period(column_label: str, column_path: list[str]) -> str | None:
     return f"{quarter.group(0)} {years[-1]}" if quarter else years[-1]
 
 
-def _column_schema(normalized: dict[str, Any], value_columns: list[str]) -> dict[str, dict[str, Any]]:
+def _explicit_header_periods(
+    table: dict[str, Any],
+    normalized: dict[str, Any],
+    value_columns: list[str],
+) -> list[str]:
+    """Recover periods only from an explicit table header on the matched page."""
+    if not value_columns or not all(re.fullmatch(r"value_\d+", column, re.IGNORECASE) for column in value_columns):
+        return []
+    context = str(table.get("evidence_page_context") or "").strip()
+    rows = normalized.get("normalized_rows") or table.get("rows") or []
+    first_label = ""
+    if rows and isinstance(rows[0], dict):
+        first_label = _clean(next(iter(rows[0].values()), ""))
+    if not context or not first_label:
+        return []
+    position = context.casefold().find(first_label.casefold())
+    if position < 0:
+        return []
+    prefix = context[:position]
+    # Require a primary-statement heading near the header. A narrative with
+    # multiple years is not sufficient evidence for column alignment.
+    if not infer_page_statement_types(prefix[-1500:]):
+        return []
+    header_lines = [item.strip() for item in prefix[-1200:].splitlines() if item.strip()]
+    recovered: list[str] = []
+    for line in header_lines:
+        years = list(dict.fromkeys(_YEAR.findall(line)))
+        explicit_dates = bool(re.search(
+            r"\b(?:fiscal\s+year|year\s+ended|as\s+of|"
+            r"january|february|march|april|may|june|july|august|september|october|november|december)\b",
+            line,
+            re.IGNORECASE,
+        ))
+        only_year_columns = bool(re.fullmatch(r"(?:\s*(?:FY\s*)?(?:19|20)\d{2}\s*)+", line, re.IGNORECASE))
+        if len(years) == len(value_columns) and (explicit_dates or only_year_columns):
+            return years
+        if len(years) == 1 and (explicit_dates or only_year_columns):
+            recovered.extend(years)
+    recovered = list(dict.fromkeys(recovered))
+    if len(recovered) == len(value_columns):
+        return recovered
+    return []
+
+
+def _column_schema(
+    table: dict[str, Any],
+    normalized: dict[str, Any],
+    value_columns: list[str],
+) -> dict[str, dict[str, Any]]:
     schema_by_label = {
         _clean(item.get("label")): item
         for item in (normalized.get("column_schema") or [])
         if isinstance(item, dict) and _clean(item.get("label"))
     }
-    return {
+    schema = {
         column: schema_by_label.get(column, {"label": column, "path": [column], "value_type": "unknown", "unit": ""})
         for column in value_columns
     }
+    recovered_periods = _explicit_header_periods(table, normalized, value_columns)
+    if recovered_periods:
+        for column, period in zip(value_columns, recovered_periods):
+            if not _YEAR.search(" | ".join([*schema[column].get("path", []), str(schema[column].get("label") or "")])):
+                schema[column] = {**schema[column], "label": period, "path": [period]}
+    return schema
 
 
 def is_evidence_frame_eligible_table(table: dict[str, Any]) -> bool:
@@ -241,11 +296,11 @@ def build_evidence_frames(
         accepted_tables += 1
         metric_column = columns[0]
         value_columns = list(columns[1:])
-        schema = _column_schema(normalized, value_columns)
+        schema = _column_schema(table, normalized, value_columns)
         context = _table_text(table, normalized)
         table_id = _clean(table.get("table_id"))
         filename = _clean(table.get("filename"))
-        page_number = int(table.get("page_number") or 0)
+        page_number = int(table.get("evidence_page_number") or table.get("page_number") or 0)
         section = _clean(normalized.get("normalized_title") or table.get("title") or table.get("caption")) or None
         scope = _scope(context)
         for row_index, row in enumerate(rows):
@@ -274,7 +329,7 @@ def build_evidence_frames(
                         ],
                     )
                 )
-                scale = _scale(raw_value, unit_context)
+                scale = _scale(raw_value, f"{unit_context} {context}")
                 value_type = "percentage" if scale == "percent" else _clean(schema_item.get("value_type")) or "number"
                 identity = json.dumps(
                     [table_id, row_index, row_label, column_label, raw_value],
@@ -297,7 +352,7 @@ def build_evidence_frames(
                     period=period,
                     raw_value=raw_value,
                     normalized_value=normalized_value,
-                    currency=_currency(raw_value, unit_context),
+                    currency=_currency(raw_value, context),
                     scale=scale,
                     scope=scope,
                     sign=sign,

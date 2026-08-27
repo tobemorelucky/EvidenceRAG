@@ -73,6 +73,63 @@ def test_column_without_explicit_period_remains_unknown():
     assert all(frame["statement_type"] == "cash_flow" for frame in frames)
 
 
+def test_generic_value_columns_recover_only_explicit_matched_page_headers():
+    table = {
+        "table_id": "balance-1",
+        "filename": "report.pdf",
+        "page_number": 10,
+        "evidence_page_number": 9,
+        "title": "See accompanying notes.",
+        "columns": ["Metric", "value_1", "value_2"],
+        "rows": [
+            {"Metric": "Cash and cash equivalents", "value_1": "$120", "value_2": "$100"},
+            {"Metric": "Total assets", "value_1": "500", "value_2": "450"},
+        ],
+        "evidence_page_context": (
+            "Consolidated Balance Sheets\n"
+            "(USD in millions)\n"
+            "December 31, 2024\n"
+            "December 31, 2023\n"
+            "ASSETS\n"
+            "Cash and cash equivalents $120 $100\n"
+            "Total assets 500 450"
+        ),
+    }
+
+    frames, _ = build_evidence_frames([table], company="Example Co")
+
+    assert {frame["period"] for frame in frames} == {"2024", "2023"}
+    assert all(frame["page_number"] == 9 for frame in frames)
+    assert all(frame["currency"] == "USD" for frame in frames)
+    assert all(frame["scale"] == "millions" for frame in frames)
+    assert all(frame["scope"] == "consolidated" for frame in frames)
+
+
+def test_narrative_years_do_not_define_generic_value_columns():
+    table = {
+        "table_id": "balance-2",
+        "filename": "report.pdf",
+        "page_number": 10,
+        "title": "Consolidated Balance Sheets",
+        "columns": ["Metric", "value_1", "value_2"],
+        "rows": [
+            {"Metric": "Cash and cash equivalents", "value_1": "120", "value_2": "100"},
+            {"Metric": "Total assets", "value_1": "500", "value_2": "450"},
+        ],
+        "evidence_page_context": (
+            "Consolidated Balance Sheets\n"
+            "Revenue changed during 2024 compared with 2023.\n"
+            "Cash and cash equivalents 120 100\n"
+            "Total assets 500 450"
+        ),
+    }
+
+    frames, _ = build_evidence_frames([table])
+
+    assert frames
+    assert all(frame["period"] is None for frame in frames)
+
+
 def test_ambiguous_or_unsupported_table_does_not_create_frames():
     table = {
         "table_id": "note-1",
