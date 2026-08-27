@@ -35,6 +35,7 @@ def test_calculation_complete_requires_valid_structured_operands():
     assert result["operands_validated"] is True
     assert result["answerable"] is True
     assert result["status"] == "complete"
+    assert result["base_status"] == "partial"
 
 
 def test_unknown_period_and_units_remain_partial_not_complete():

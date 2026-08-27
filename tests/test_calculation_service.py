@@ -121,6 +121,30 @@ def test_structured_coverage_blocks_execution_until_operands_are_validated(monke
     assert result["executor"] == "evidence_frame"
 
 
+def test_incomplete_frames_still_allow_validated_text_row_fallback(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_EXECUTOR_ENABLED", "true")
+    monkeypatch.setenv("STRUCTURED_COVERAGE_ENABLED", "true")
+    task_spec = {
+        "task_type": "calculation",
+        "required_fields": ["operating_income", "revenue"],
+        "formula": "operating_income / revenue",
+    }
+    coverage = {
+        "status": "partial",
+        "base_status": "complete",
+        "operands_validated": False,
+        "field_evidence": {
+            "operating_income": {"values": ["25"], "filename": "report.pdf", "page_number": 4},
+            "revenue": {"values": ["100"], "filename": "report.pdf", "page_number": 4},
+        },
+    }
+
+    result = build_calculation_result(task_spec, coverage, [], evidence_frames=[])
+
+    assert result["result"] == "0.25"
+    assert result.get("executor") is None
+
+
 def test_calculation_result_applies_only_explicit_final_rounding():
     task_spec = {
         "task_type": "calculation",

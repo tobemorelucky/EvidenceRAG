@@ -461,7 +461,10 @@ def build_calculation_result(
         frame_calculation = _build_frame_calculation(task_spec, evidence_frames or [])
     if frame_calculation:
         return frame_calculation
-    if coverage.get("status") != "complete":
+    # Structured coverage may be partial solely because the table adapter
+    # could not recover metadata. Preserve the documented second-priority
+    # fallback to the existing, independently validated text-row calculator.
+    if coverage.get("base_status", coverage.get("status")) != "complete":
         return None
     formula = str(task_spec.get("formula") or "").strip()
     if documents:

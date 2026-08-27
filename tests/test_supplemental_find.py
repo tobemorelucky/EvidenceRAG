@@ -96,3 +96,29 @@ def test_supplement_does_not_run_for_complete_coverage(monkeypatch):
 
     assert len(documents) == 1
     assert trace["supplemental_triggered"] is False
+
+
+def test_structural_parser_metadata_gap_does_not_trigger_retrieval(monkeypatch):
+    monkeypatch.setenv("SUPPLEMENTAL_FIND_ENABLED", "true")
+    monkeypatch.setattr(
+        rag_orchestrator,
+        "retrieve_document_scoped_candidates",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not retrieve")),
+    )
+
+    _, trace = rag_orchestrator._supplement_partial_evidence(
+        "Calculate the 2024 ratio.",
+        {"required_fields": ["revenue"], "required_periods": ["2024"]},
+        [{"filename": "selected.pdf", "page_number": 2}],
+        {
+            "status": "partial",
+            "base_status": "complete",
+            "missing_fields": [],
+            "missing_periods": [],
+            "structured_missing": ["period_supported", "unit_scale_supported"],
+            "page_supported": True,
+        },
+    )
+
+    assert trace["supplemental_triggered"] is False
+    assert trace["supplemental_skip_reason"] == "structural_metadata_gap_not_retrieval_actionable"

@@ -261,8 +261,13 @@ def _supplement_partial_evidence(
         "new_evidence_frames": 0,
         "coverage_before": coverage,
         "coverage_after": coverage,
+        "supplemental_skip_reason": "",
     }
     if not enabled or coverage.get("status") not in {"partial", "insufficient", "incomplete"}:
+        return documents, trace
+    actionable_missing = list(coverage.get("missing_fields") or []) + list(coverage.get("missing_periods") or [])
+    if not actionable_missing and coverage.get("page_supported") is not False:
+        trace["supplemental_skip_reason"] = "structural_metadata_gap_not_retrieval_actionable"
         return documents, trace
     filenames = list(dict.fromkeys(str(doc.get("filename") or "") for doc in documents if doc.get("filename")))
     if not filenames:

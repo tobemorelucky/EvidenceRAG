@@ -55,6 +55,7 @@ def assess_structured_coverage(
     page_supported = bool(documents)
     base = {
         **base_coverage,
+        "base_status": base_coverage.get("status"),
         "structured_coverage_enabled": True,
         "page_supported": page_supported,
         "row_supported": None,
