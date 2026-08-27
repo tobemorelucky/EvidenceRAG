@@ -50,6 +50,10 @@ def _configure_static_baseline(
     enable_rerank: bool,
     local_rerank_fallback: bool,
     finance_policy: bool,
+    evidence_frame: bool,
+    structured_executor: bool,
+    structured_coverage: bool,
+    supplemental_find: bool,
 ) -> None:
     """Freeze the baseline before importing any backend module."""
     settings = {
@@ -82,6 +86,10 @@ def _configure_static_baseline(
             "ANSWER_TEMPERATURE": "0",
             "RAG_RETRIEVAL_DEBUG": "true" if diagnose else "false",
             "FINANCE_POLICY_ENABLED": "true" if finance_policy else "false",
+            "EVIDENCE_FRAME_ENABLED": "true" if evidence_frame else "false",
+            "STRUCTURED_EXECUTOR_ENABLED": "true" if structured_executor else "false",
+            "STRUCTURED_COVERAGE_ENABLED": "true" if structured_coverage else "false",
+            "SUPPLEMENTAL_FIND_ENABLED": "true" if supplemental_find else "false",
     }
     if not enable_rerank:
         settings.update(
@@ -146,6 +154,10 @@ def main() -> None:
         default=False,
         help="Add the local Financial Task Policy to answer prompts (default: disabled for v14 compatibility).",
     )
+    parser.add_argument("--evidence-frame", action="store_true", help="Enable EvidenceFrame Lite table adaptation.")
+    parser.add_argument("--structured-executor", action="store_true", help="Prefer the audited EvidenceFrame Decimal executor.")
+    parser.add_argument("--structured-coverage", action="store_true", help="Use structured answerability coverage for numeric tasks.")
+    parser.add_argument("--supplemental-find", action="store_true", help="Allow one document-scoped retrieval only for partial evidence.")
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval and generation stage timing.")
     parser.add_argument(
         "--field-aware",
@@ -189,6 +201,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.structured_executor and not args.evidence_frame:
+        parser.error("--structured-executor requires --evidence-frame.")
+    if args.structured_coverage and not args.evidence_frame:
+        parser.error("--structured-coverage requires --evidence-frame.")
+    if args.supplemental_find and not args.structured_coverage:
+        parser.error("--supplemental-find requires --structured-coverage.")
+
     _configure_static_baseline(
         args.max_completion_tokens,
         args.thinking,
@@ -197,6 +216,10 @@ def main() -> None:
         args.enable_rerank,
         not args.disable_local_rerank_fallback,
         args.finance_policy,
+        args.evidence_frame,
+        args.structured_executor,
+        args.structured_coverage,
+        args.supplemental_find,
     )
     with DATA_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
         source_rows = list(csv.DictReader(handle))
@@ -378,7 +401,8 @@ def main() -> None:
         "statement_aware": args.field_aware,
         "required_field_page_scoring": args.field_aware,
         "required_period_page_scoring": args.field_aware,
-        "supplemental_search": args.field_aware,
+        "legacy_supplemental_search": args.field_aware and not args.supplemental_find,
+        "supplemental_find": args.supplemental_find,
         "page_neighbor_window": 2 if args.field_aware else 0,
         "context_page_window": 2 if args.field_aware else 0,
         "rerank": args.enable_rerank,
@@ -390,6 +414,10 @@ def main() -> None:
         "max_completion_tokens": args.max_completion_tokens,
         "temperature": 0,
         "finance_policy": args.finance_policy,
+        "evidence_frame": args.evidence_frame,
+        "structured_executor": args.structured_executor,
+        "structured_coverage": args.structured_coverage,
+        "benchmark_status": "fixed_seen_regression",
         "candidate_k": 40,
         "final_evidence_k": 5,
         "model": os.getenv("MODEL", ""),
@@ -397,7 +425,10 @@ def main() -> None:
     }
     print(
         f"[setup] dataset={args.dataset_name} split={args.split} examples={len(examples)} "
-        f"planner=false policy={str(args.finance_policy).lower()} thinking={args.thinking}",
+        f"planner=false policy={str(args.finance_policy).lower()} frames={str(args.evidence_frame).lower()} "
+        f"executor={str(args.structured_executor).lower()} coverage={str(args.structured_coverage).lower()} "
+        f"supplemental={str(args.supplemental_find).lower()} thinking={args.thinking} "
+        "benchmark=fixed_seen_regression",
         flush=True,
     )
     try:
@@ -406,7 +437,7 @@ def main() -> None:
             data=examples,
             evaluators=[citation_document_hit],
             experiment_prefix=args.experiment_prefix,
-            description="Controlled EvidenceRAG static FinanceBench baseline.",
+            description="Controlled EvidenceRAG fixed, previously-seen FinanceBench regression.",
             metadata=metadata,
             max_concurrency=max(1, args.max_concurrency),
             client=client,

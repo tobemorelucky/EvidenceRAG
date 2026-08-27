@@ -153,6 +153,9 @@ def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "failure_types": dict(sorted(Counter(record.get("failure_type") or "unknown" for record in records).items())),
         "calculation_questions": sum(bool(record.get("is_calculation")) for record in records),
         "calculations_executed": sum(bool(record.get("calculation")) for record in records),
+        "evidence_frames": sum(int(record.get("evidence_frame_count") or 0) for record in records),
+        "structured_calculations": sum(int(record.get("frames_used_for_execution") or 0) > 0 for record in records),
+        "answerable": sum((record.get("coverage_dimensions") or {}).get("answerable") is True for record in records),
         "answer_input_tokens": sum(int(record.get("answer_input_tokens") or 0) for record in records),
         "answer_total_tokens": sum(int((record.get("usage") or {}).get("total_tokens") or 0) for record in records),
         "average_latency_ms": round(
@@ -175,7 +178,15 @@ def main() -> None:
     parser.add_argument("--judge-interval-seconds", type=float, default=0.0)
     parser.add_argument("--thinking", choices=("enabled", "disabled", "auto"), default="disabled")
     parser.add_argument("--max-completion-tokens", type=int, default=512)
+    parser.add_argument("--evidence-frame", action="store_true", help="Load existing table records for gold pages.")
+    parser.add_argument("--structured-executor", action="store_true", help="Use validated gold-page EvidenceFrames before text-row fallback.")
+    parser.add_argument("--structured-coverage", action="store_true", help="Apply structured coverage dimensions to oracle evidence.")
     args = parser.parse_args()
+
+    if args.structured_executor and not args.evidence_frame:
+        parser.error("--structured-executor requires --evidence-frame.")
+    if args.structured_coverage and not args.evidence_frame:
+        parser.error("--structured-coverage requires --evidence-frame.")
 
     os.environ.update(
         {
@@ -183,6 +194,9 @@ def main() -> None:
             "ANSWER_THINKING_MODE": args.thinking,
             "ANSWER_MAX_COMPLETION_TOKENS": str(max(64, args.max_completion_tokens)),
             "ANSWER_TEMPERATURE": "0",
+            "EVIDENCE_FRAME_ENABLED": "true" if args.evidence_frame else "false",
+            "STRUCTURED_EXECUTOR_ENABLED": "true" if args.structured_executor else "false",
+            "STRUCTURED_COVERAGE_ENABLED": "true" if args.structured_coverage else "false",
         }
     )
     with args.dataset.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -220,7 +234,9 @@ def main() -> None:
     from answer_generator import generate_answer
     from calculation_service import build_calculation_result, format_calculation_evidence
     from evidence_context import build_compact_evidence
+    from evidence_coverage import assess_structured_coverage
     from query_parser import assess_required_field_coverage, build_answer_directives, parse_query
+    from rag_orchestrator import _build_evidence_frames_for_documents
 
     judge_model = None
     judge_prompt = None
@@ -246,7 +262,21 @@ def main() -> None:
             documents = parse_gold_pages(row, args.mode)
             task_spec = parse_query(question)
             coverage = assess_required_field_coverage(task_spec, documents)
-            calculation = build_calculation_result(task_spec, coverage, documents)
+            evidence_frames: list[dict[str, Any]] = []
+            frame_trace: dict[str, Any] = {}
+            if args.evidence_frame:
+                evidence_frames, frame_trace = _build_evidence_frames_for_documents(
+                    documents,
+                    str(task_spec.get("company") or ""),
+                )
+            if args.structured_coverage:
+                coverage = assess_structured_coverage(task_spec, documents, evidence_frames, coverage)
+            calculation = build_calculation_result(
+                task_spec,
+                coverage,
+                documents,
+                evidence_frames=evidence_frames,
+            )
             evidence, compression = build_compact_evidence(question, documents, task_spec, calculation)
             if not evidence:
                 evidence = _format_evidence(documents)
@@ -300,7 +330,18 @@ def main() -> None:
                 "task_type": str(task_spec.get("task_type") or "lookup"),
                 "is_calculation": task_spec.get("task_type") == "calculation",
                 "calculation": calculation,
+                "oracle_path": "gold_page_evidence_frame" if args.evidence_frame else "gold_page_current_pipeline",
+                "evidence_frame_count": len(evidence_frames),
+                "frames_used_for_execution": len((calculation or {}).get("operand_evidence_ids") or []),
+                "evidence_frame_trace": frame_trace,
                 "coverage_status": coverage.get("status"),
+                "coverage_dimensions": {
+                    key: coverage.get(key)
+                    for key in (
+                        "page_supported", "row_supported", "period_supported", "unit_scale_supported",
+                        "scope_supported", "operands_validated", "answerable",
+                    )
+                },
                 "coverage_missing_fields": coverage.get("missing_fields") or [],
                 "compression": compression,
                 "answer_input_tokens": _input_tokens(usage),

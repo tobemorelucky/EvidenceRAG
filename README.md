@@ -107,7 +107,18 @@ conda run -n rag python scripts/rebuild_financebench_index.py --execute
 conda run -n rag python -m pytest tests -q
 ```
 
-评测顺序建议固定为：flat hybrid、页面优先 hierarchical hybrid、hierarchical + rerank、static 与自适应 agentic。先固定 20 题开发集和 80 题 holdout，再运行完整 100 题并记录 LangSmith。第一阶段验收目标：空检索率为 0、page hit@10 ≥ 65%、100 题正确率 ≥ 50%，且每个引用都可解析到真实文件和页码。
+当前 FinanceBench 100 题已经被多次查看，统一作为 `fixed_seen_regression`，历史 20/80 划分只用于与 v14/v7 按 ID 对齐，不再称为未见 holdout，也不以分数上涨直接证明泛化能力。新功能应先通过结构化单元测试和 Oracle 诊断，再运行完整 100 题。
+
+结构化金融链路默认关闭，可分别回退：
+
+```dotenv
+EVIDENCE_FRAME_ENABLED=false
+STRUCTURED_EXECUTOR_ENABLED=false
+STRUCTURED_COVERAGE_ENABLED=false
+SUPPLEMENTAL_FIND_ENABLED=false
+```
+
+启用后流程仍保留现有 Dense/BM25、RRF、Jina、页面选择和压缩，只在回答前增加 EvidenceFrame、Decimal executor 和 coverage；仅当 coverage 不完整时允许一次目标文档内补搜。正式运行及 v14/Oracle 对比命令见 [`docs/financebench_fixed_regression_protocol.md`](docs/financebench_fixed_regression_protocol.md)。
 
 ## 数据与迁移说明
 
