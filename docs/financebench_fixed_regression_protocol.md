@@ -6,9 +6,11 @@
 
 结构化增强不改变现有 Dense/BM25、RRF、Jina rerank、页面选择和 evidence compression。正式路径为：
 
-`Question → QuerySpec → Hybrid Retrieval → Jina → Compression → EvidenceFrame Lite → Structured Coverage / Decimal Executor → Answer`
+`Question → QuerySpec → Hybrid Retrieval → Jina → EvidenceFrame alignment → Advisory Coverage / Decimal Executor → Protected-slot Compression → Answer → Local Consistency Check`
 
 coverage 为 partial/insufficient 时，`SUPPLEMENTAL_FIND_ENABLED` 最多在已经选定的文档集合内补搜一次，并打开命中页及 ±1 页。它不会搜索互联网、扩大公司范围或进入 Agent 循环。
+
+分阶段开关均默认关闭（advisory 语义本身默认开启，但只有 `STRUCTURED_COVERAGE_ENABLED=true` 时生效）：`FRAME_ALIGNMENT_ENABLED`、`STRUCTURED_TASK_EXECUTOR_ENABLED`、`ANSWER_CONSISTENCY_VALIDATOR_ENABLED`、`RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED`、`SUPPLEMENTAL_FIND_ENABLED`。
 
 ## 0. 前置检查
 
@@ -44,7 +46,7 @@ conda run --no-capture-output -n rag python -u scripts/evaluate_financebench_ora
 先跑 1 题端到端 smoke，成功后脚本会自动 Judge：
 
 ```powershell
-conda run --no-capture-output -n rag python -u scripts/run_financebench_langsmith_experiment.py --split dev --limit 1 --experiment-prefix evidencerag-structured-smoke --max-concurrency 1 --thinking disabled --max-completion-tokens 512 --enable-rerank --evidence-frame --structured-executor --structured-coverage --supplemental-find --output reports/evidencerag_structured_smoke_answers.jsonl --judge-output reports/evidencerag_structured_smoke_judge.jsonl
+conda run --no-capture-output -n rag python -u scripts/run_financebench_langsmith_experiment.py --split dev --limit 1 --experiment-prefix evidencerag-alignment-smoke --max-concurrency 1 --thinking disabled --max-completion-tokens 512 --enable-rerank --evidence-frame --structured-executor --structured-coverage --frame-alignment --structured-task-executor --answer-consistency-validator --protected-evidence-slots --output reports/evidencerag_alignment_smoke_answers.jsonl --judge-output reports/evidencerag_alignment_smoke_judge.jsonl
 ```
 
 完整 100 题可以一次运行 `--split all`。为了保留历史 20/80 文件结构并降低中断损失，也可以分别运行：

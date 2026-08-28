@@ -12,6 +12,7 @@ import time
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from answer_generator import generate_answer, stream_answer, summarize_messages
+from calculation_service import validate_or_repair_structured_answer
 from conversation_service import storage
 from rag_orchestrator import RetrievalServiceError, prepare_rag_response
 from tools import set_rag_step_queue
@@ -62,6 +63,12 @@ def chat_with_agent(
             history,
             prepared.get("task_policy", ""),
         )
+        response_content, consistency_trace = validate_or_repair_structured_answer(
+            response_content,
+            prepared.get("query_spec") or {},
+            prepared.get("calculation"),
+        )
+        prepared["rag_trace"]["answer_consistency"] = consistency_trace
 
     messages.append(AIMessage(content=response_content))
     rag_trace = prepared["rag_trace"]
@@ -142,6 +149,23 @@ async def chat_with_agent_stream(
     usage = {}
     if prepared["evidence_status"] == "insufficient":
         full_response = INSUFFICIENT_EVIDENCE_MESSAGE
+        yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
+    elif (prepared.get("calculation") or {}).get("authoritative"):
+        generated = ""
+        async for content, chunk_usage in stream_answer(
+            user_text,
+            prepared["evidence"],
+            history,
+            prepared.get("task_policy", ""),
+        ):
+            generated += content
+            usage = chunk_usage or usage
+        full_response, consistency_trace = validate_or_repair_structured_answer(
+            generated,
+            prepared.get("query_spec") or {},
+            prepared.get("calculation"),
+        )
+        prepared["rag_trace"]["answer_consistency"] = consistency_trace
         yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
     else:
         async for content, chunk_usage in stream_answer(

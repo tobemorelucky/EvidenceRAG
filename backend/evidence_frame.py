@@ -47,6 +47,7 @@ class EvidenceFrame:
     currency: str | None
     scale: str | None
     scope: str | None
+    descriptor: str
     sign: str
     value_type: str
     citation: str
@@ -194,6 +195,29 @@ def _period(column_label: str, column_path: list[str]) -> str | None:
     return f"{quarter.group(0)} {years[-1]}" if quarter else years[-1]
 
 
+def _descriptor(
+    row_label: str,
+    row_path: list[str],
+    column_path: list[str],
+    table_title: str | None,
+    section: str | None,
+    statement_type: str,
+    scope: str | None,
+) -> str:
+    """Build one stable, auditable short-text representation per frame."""
+    statement_label = statement_type.replace("_", " ")
+    values = [
+        row_label,
+        " > ".join(row_path),
+        " > ".join(column_path),
+        table_title or "",
+        section or "",
+        statement_label,
+        scope or "",
+    ]
+    return " | ".join(dict.fromkeys(value for value in values if value))
+
+
 def _explicit_header_periods(
     table: dict[str, Any],
     normalized: dict[str, Any],
@@ -302,6 +326,7 @@ def build_evidence_frames(
         filename = _clean(table.get("filename"))
         page_number = int(table.get("evidence_page_number") or table.get("page_number") or 0)
         section = _clean(normalized.get("normalized_title") or table.get("title") or table.get("caption")) or None
+        table_title = _clean(table.get("title") or table.get("caption") or normalized.get("normalized_title")) or None
         scope = _scope(context)
         for row_index, row in enumerate(rows):
             if not isinstance(row, dict):
@@ -355,6 +380,15 @@ def build_evidence_frames(
                     currency=_currency(raw_value, context),
                     scale=scale,
                     scope=scope,
+                    descriptor=_descriptor(
+                        row_label,
+                        [row_label],
+                        column_path or [column_label],
+                        table_title,
+                        section,
+                        statement_type,
+                        scope,
+                    ),
                     sign=sign,
                     value_type=value_type,
                     citation=f"[source: {filename}, page {page_number}]",

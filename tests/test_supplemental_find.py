@@ -7,8 +7,10 @@ def test_supplemental_query_uses_missing_fields_periods_and_statement_anchors():
         "Calculate the ratio.",
         {
             "required_fields": ["operating_income", "revenue"],
+            "required_concepts": ["operating income", "net revenue"],
             "required_periods": ["2024"],
             "statement_types": ["income_statement"],
+            "scope": "consolidated",
         },
         {"missing_fields": ["revenue"], "structured_missing": ["row_supported"]},
     )
@@ -16,6 +18,8 @@ def test_supplemental_query_uses_missing_fields_periods_and_statement_anchors():
     assert "revenue" in query.lower()
     assert "2024" in query
     assert "income statement" in query.lower()
+    assert "net revenue" in query.lower()
+    assert "consolidated" in query.lower()
 
 
 def test_document_scoped_retrieval_applies_filename_filter_once(monkeypatch):
@@ -77,6 +81,33 @@ def test_partial_supplement_opens_hit_and_adjacent_pages_within_document(monkeyp
     assert trace["searched_documents"] == ["selected.pdf"]
     assert [item["page_number"] for item in trace["new_pages"]] == [7, 8, 9]
     assert len(documents) == 4
+    assert len(trace["new_evidence_hashes"]) == 3
+    assert trace["supplemental_effective"] is True
+
+
+def test_supplement_discards_duplicate_content_hash(monkeypatch):
+    monkeypatch.setenv("SUPPLEMENTAL_FIND_ENABLED", "true")
+    monkeypatch.setattr(
+        rag_orchestrator,
+        "retrieve_document_scoped_candidates",
+        lambda *args, **kwargs: [{"filename": "selected.pdf", "page_number": 8}],
+    )
+    monkeypatch.setattr(
+        rag_orchestrator,
+        "open_pages",
+        lambda *args, **kwargs: [{"filename": "selected.pdf", "page_number": 8, "text": "same evidence"}],
+    )
+
+    documents, trace = rag_orchestrator._supplement_partial_evidence(
+        "Find 2024 revenue.",
+        {"required_fields": ["revenue"], "required_periods": ["2024"]},
+        [{"filename": "selected.pdf", "page_number": 2, "text": "same evidence"}],
+        {"status": "partial", "missing_fields": ["revenue"]},
+    )
+
+    assert len(documents) == 1
+    assert trace["supplemental_effective"] is False
+    assert trace["supplemental_skip_reason"] == "no_new_evidence_hash"
 
 
 def test_supplement_does_not_run_for_complete_coverage(monkeypatch):

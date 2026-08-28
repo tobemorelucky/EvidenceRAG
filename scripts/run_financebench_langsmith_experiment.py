@@ -53,6 +53,10 @@ def _configure_static_baseline(
     evidence_frame: bool,
     structured_executor: bool,
     structured_coverage: bool,
+    frame_alignment: bool,
+    structured_task_executor: bool,
+    answer_consistency_validator: bool,
+    protected_evidence_slots: bool,
     supplemental_find: bool,
 ) -> None:
     """Freeze the baseline before importing any backend module."""
@@ -89,6 +93,11 @@ def _configure_static_baseline(
             "EVIDENCE_FRAME_ENABLED": "true" if evidence_frame else "false",
             "STRUCTURED_EXECUTOR_ENABLED": "true" if structured_executor else "false",
             "STRUCTURED_COVERAGE_ENABLED": "true" if structured_coverage else "false",
+            "FRAME_ALIGNMENT_ENABLED": "true" if frame_alignment else "false",
+            "STRUCTURED_COVERAGE_ADVISORY_ENABLED": "true",
+            "STRUCTURED_TASK_EXECUTOR_ENABLED": "true" if structured_task_executor else "false",
+            "ANSWER_CONSISTENCY_VALIDATOR_ENABLED": "true" if answer_consistency_validator else "false",
+            "RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED": "true" if protected_evidence_slots else "false",
             "SUPPLEMENTAL_FIND_ENABLED": "true" if supplemental_find else "false",
     }
     if not enable_rerank:
@@ -157,6 +166,10 @@ def main() -> None:
     parser.add_argument("--evidence-frame", action="store_true", help="Enable EvidenceFrame Lite table adaptation.")
     parser.add_argument("--structured-executor", action="store_true", help="Prefer the audited EvidenceFrame Decimal executor.")
     parser.add_argument("--structured-coverage", action="store_true", help="Use structured answerability coverage for numeric tasks.")
+    parser.add_argument("--frame-alignment", action="store_true", help="Enable layered QuerySpec-to-EvidenceFrame matching.")
+    parser.add_argument("--structured-task-executor", action="store_true", help="Execute high-confidence comparison and selection matrices.")
+    parser.add_argument("--answer-consistency-validator", action="store_true", help="Repair answer conflicts with authoritative local results.")
+    parser.add_argument("--protected-evidence-slots", action="store_true", help="Reserve existing context slots for operands, periods, and candidate matrices.")
     parser.add_argument("--supplemental-find", action="store_true", help="Allow one document-scoped retrieval only for partial evidence.")
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval and generation stage timing.")
     parser.add_argument(
@@ -205,6 +218,12 @@ def main() -> None:
         parser.error("--structured-executor requires --evidence-frame.")
     if args.structured_coverage and not args.evidence_frame:
         parser.error("--structured-coverage requires --evidence-frame.")
+    if args.frame_alignment and not args.evidence_frame:
+        parser.error("--frame-alignment requires --evidence-frame.")
+    if args.structured_task_executor and not (args.evidence_frame and args.frame_alignment and args.structured_coverage):
+        parser.error("--structured-task-executor requires --evidence-frame, --frame-alignment, and --structured-coverage.")
+    if args.answer_consistency_validator and not (args.structured_executor or args.structured_task_executor):
+        parser.error("--answer-consistency-validator requires a structured executor.")
     if args.supplemental_find and not args.structured_coverage:
         parser.error("--supplemental-find requires --structured-coverage.")
 
@@ -219,6 +238,10 @@ def main() -> None:
         args.evidence_frame,
         args.structured_executor,
         args.structured_coverage,
+        args.frame_alignment,
+        args.structured_task_executor,
+        args.answer_consistency_validator,
+        args.protected_evidence_slots,
         args.supplemental_find,
     )
     with DATA_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -298,6 +321,7 @@ def main() -> None:
     # Do not load the local embedding model until the remote experiment service is reachable.
     sys.path.insert(0, str(BACKEND))
     from answer_generator import generate_answer
+    from calculation_service import validate_or_repair_structured_answer
     from rag_orchestrator import prepare_rag_response
     completed_run_ids: set[str] = set()
 
@@ -360,6 +384,12 @@ def main() -> None:
                     prepared["evidence"],
                     prepared.get("task_policy", ""),
                 )
+                answer, consistency_trace = validate_or_repair_structured_answer(
+                    answer,
+                    prepared.get("query_spec") or {},
+                    prepared.get("calculation"),
+                )
+                prepared["rag_trace"]["answer_consistency"] = consistency_trace
             finally:
                 if args.slow_question_seconds > 0:
                     faulthandler.cancel_dump_traceback_later()
@@ -417,6 +447,10 @@ def main() -> None:
         "evidence_frame": args.evidence_frame,
         "structured_executor": args.structured_executor,
         "structured_coverage": args.structured_coverage,
+        "frame_alignment": args.frame_alignment,
+        "structured_task_executor": args.structured_task_executor,
+        "answer_consistency_validator": args.answer_consistency_validator,
+        "protected_evidence_slots": args.protected_evidence_slots,
         "benchmark_status": "fixed_seen_regression",
         "candidate_k": 40,
         "final_evidence_k": 5,
@@ -427,6 +461,8 @@ def main() -> None:
         f"[setup] dataset={args.dataset_name} split={args.split} examples={len(examples)} "
         f"planner=false policy={str(args.finance_policy).lower()} frames={str(args.evidence_frame).lower()} "
         f"executor={str(args.structured_executor).lower()} coverage={str(args.structured_coverage).lower()} "
+        f"alignment={str(args.frame_alignment).lower()} task_executor={str(args.structured_task_executor).lower()} "
+        f"validator={str(args.answer_consistency_validator).lower()} protected={str(args.protected_evidence_slots).lower()} "
         f"supplemental={str(args.supplemental_find).lower()} thinking={args.thinking} "
         "benchmark=fixed_seen_regression",
         flush=True,

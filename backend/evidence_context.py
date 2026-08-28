@@ -248,6 +248,9 @@ def build_compact_evidence(
     )
     max_context_chars = _parse_int("RAG_ANSWER_MAX_CONTEXT_CHARS", 24000, 2000)
     max_unit_chars = _parse_int("RAG_ANSWER_MAX_UNIT_CHARS", 2000, 400)
+    protected_slots_enabled = os.getenv("RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     query_terms = _query_terms(question)
     aliases = _required_aliases(task_spec)
     periods = {str(value) for value in task_spec.get("required_periods") or []}
@@ -352,15 +355,56 @@ def build_compact_evidence(
     ranked_by_retrieval = sorted(candidates, key=lambda item: item[1])
     selected = []
     selected_pages: set[tuple[str, object]] = set()
+    protected_reasons: dict[tuple[str, object], set[str]] = {}
+    dropped_protected: List[dict] = []
+
+    def protect(item: tuple, reason: str) -> None:
+        page_key = (str(item[2].get("filename") or ""), item[2].get("page_number"))
+        protected_reasons.setdefault(page_key, set()).add(reason)
+        if page_key in selected_pages:
+            return
+        if len(selected) >= max_units:
+            dropped_protected.append({"filename": page_key[0], "page_number": page_key[1], "reason": "unit_budget"})
+            return
+        selected.append(item)
+        selected_pages.add(page_key)
+
     for field in task_spec.get("required_fields") or []:
         field_candidates = [item for item in candidates if str(field) in item[4]]
         if not field_candidates:
             continue
         best = max(field_candidates, key=lambda item: (item[0], -item[1]))
         page_key = (str(best[2].get("filename") or ""), best[2].get("page_number"))
-        if page_key not in selected_pages and len(selected) < max_units:
+        if protected_slots_enabled:
+            protect(best, f"required_operand:{field}")
+        elif page_key not in selected_pages and len(selected) < max_units:
             selected.append(best)
             selected_pages.add(page_key)
+    if protected_slots_enabled and task_spec.get("task_type") == "comparison":
+        for period in periods:
+            period_candidates = [
+                item for item in candidates
+                if period.casefold() in str(item[2].get("text") or "").casefold()
+            ]
+            if period_candidates:
+                protect(max(period_candidates, key=lambda item: (item[0], -item[1])), f"required_period:{period}")
+    if protected_slots_enabled and task_spec.get("task_type") == "selection":
+        matrix_pages = {
+            (str(item.get("document") or ""), item.get("page_number"))
+            for item in (calculation or {}).get("candidate_matrix") or []
+            if item.get("document") and item.get("page_number") is not None
+        }
+        selection_candidates = [
+            item for item in candidates
+            if (str(item[2].get("filename") or ""), item[2].get("page_number")) in matrix_pages
+        ]
+        if not selection_candidates:
+            selection_candidates = [
+                item for item in candidates
+                if len(_FINANCIAL_NUMBER.findall(str(item[2].get("text") or ""))) >= 2
+            ]
+        if selection_candidates:
+            protect(max(selection_candidates, key=lambda item: (item[0], -item[1])), "selection_candidate_matrix")
     # Enumeration and numeric-table questions are especially vulnerable to
     # glossary, contents, and nearby-but-irrelevant pages occupying the answer
     # budget. Preserve a small retrieval-order safety net, then let task-aware
@@ -387,12 +431,20 @@ def build_compact_evidence(
     pages: List[dict] = []
     used_chars = 0
     retained_required_fields: set[str] = set()
-    for _, _, document, snippet, field_hits in selected:
+    for selected_index, (_, _, document, snippet, field_hits) in enumerate(selected):
         filename = str(document.get("filename") or "Unknown")
         page = document.get("page_number", "N/A")
         header = f"Source: {filename} | Page: {page}\n"
         remaining = max_context_chars - used_chars - len(header)
         if remaining < 100:
+            for _, _, dropped_document, _, _ in selected[selected_index:]:
+                dropped_key = (str(dropped_document.get("filename") or ""), dropped_document.get("page_number"))
+                if dropped_key in protected_reasons:
+                    dropped_protected.append({
+                        "filename": dropped_key[0],
+                        "page_number": dropped_key[1],
+                        "reason": "character_budget",
+                    })
             break
         body = snippet[:remaining]
         block = header + body
@@ -418,5 +470,12 @@ def build_compact_evidence(
         "answer_context_company_filtered_count": company_filtered_count,
         "answer_context_scope_filtered_count": max(0, scope_source_count - len(source_documents)),
         "answer_context_rank_reserved_units": effective_rank_reserved,
+        "answer_context_protected_slots_enabled": protected_slots_enabled,
+        "answer_context_protected_evidence": [
+            {"filename": key[0], "page_number": key[1], "reasons": sorted(reasons)}
+            for key, reasons in protected_reasons.items()
+            if key in {(item["filename"], item["page_number"]) for item in pages}
+        ],
+        "answer_context_dropped_protected_evidence": dropped_protected,
         "answer_context_reduction_ratio": round(1 - compressed_chars / original_chars, 4) if original_chars else 0.0,
     }

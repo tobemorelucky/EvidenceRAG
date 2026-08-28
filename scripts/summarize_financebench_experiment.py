@@ -141,8 +141,16 @@ def _summarize_split(
             "citation_gold_page_hits": citation_page_hits,
             "candidate_to_context_losses": candidate_context_losses,
             "evidence_frame_questions": sum(int(trace.get("evidence_frame_count") or 0) > 0 for trace in traces),
+            "queryspec_related_frame_questions": sum(int(trace.get("relevant_frame_count") or 0) > 0 for trace in traces),
+            "structured_answerable_questions": sum(bool((trace.get("evidence_coverage") or {}).get("structured_answerable")) for trace in traces),
+            "structured_execution_ready_questions": sum(bool((trace.get("evidence_coverage") or {}).get("structured_execution_ready")) for trace in traces),
             "structured_executions": sum(int(trace.get("frames_used_for_execution") or 0) > 0 for trace in traces),
+            "answer_consistency_checked": sum(bool((trace.get("answer_consistency") or {}).get("checked")) for trace in traces),
+            "answer_consistency_repaired": sum(bool((trace.get("answer_consistency") or {}).get("repaired")) for trace in traces),
+            "protected_evidence_questions": sum(bool(trace.get("answer_context_protected_evidence")) for trace in traces),
+            "dropped_protected_evidence": sum(len(trace.get("answer_context_dropped_protected_evidence") or []) for trace in traces),
             "supplemental_triggered": sum(bool(trace.get("supplemental_triggered")) for trace in traces),
+            "supplemental_effective": sum(bool(trace.get("supplemental_effective")) for trace in traces),
             "supplemental_recovered": sum(
                 bool(trace.get("supplemental_triggered"))
                 and not bool((trace.get("coverage_before") or {}).get("answerable"))
@@ -212,8 +220,16 @@ def main() -> None:
             "citation_gold_page_hits": sum(item["citation_gold_page_hits"] for item in splits.values()),
             "candidate_to_context_losses": sum(item["candidate_to_context_losses"] for item in splits.values()),
             "evidence_frame_questions": sum(item["evidence_frame_questions"] for item in splits.values()),
+            "queryspec_related_frame_questions": sum(item["queryspec_related_frame_questions"] for item in splits.values()),
+            "structured_answerable_questions": sum(item["structured_answerable_questions"] for item in splits.values()),
+            "structured_execution_ready_questions": sum(item["structured_execution_ready_questions"] for item in splits.values()),
             "structured_executions": sum(item["structured_executions"] for item in splits.values()),
+            "answer_consistency_checked": sum(item["answer_consistency_checked"] for item in splits.values()),
+            "answer_consistency_repaired": sum(item["answer_consistency_repaired"] for item in splits.values()),
+            "protected_evidence_questions": sum(item["protected_evidence_questions"] for item in splits.values()),
+            "dropped_protected_evidence": sum(item["dropped_protected_evidence"] for item in splits.values()),
             "supplemental_triggered": sum(item["supplemental_triggered"] for item in splits.values()),
+            "supplemental_effective": sum(item["supplemental_effective"] for item in splits.values()),
             "supplemental_recovered": sum(item["supplemental_recovered"] for item in splits.values()),
         },
     }
@@ -236,11 +252,18 @@ def main() -> None:
     if args.baseline_summary:
         baseline_payload = json.loads(args.baseline_summary.read_text(encoding="utf-8"))
         baseline = baseline_payload.get("combined", baseline_payload)
+        baseline_questions = int(baseline.get("questions") or baseline.get("unique_financebench_ids") or 0)
+        comparable = not baseline_questions or baseline_questions == total
         payload["baseline_comparison"] = {
             "baseline_file": str(args.baseline_summary),
-            "accuracy_delta": round(combined["accuracy"] - float(baseline.get("accuracy") or 0), 4),
-            "answer_tokens_delta": combined["answer_total_tokens"] - int(baseline.get("answer_total_tokens") or 0),
-            "average_latency_ms_delta": round(combined["average_latency_ms"] - float(baseline.get("average_latency_ms") or 0), 2),
+            "comparable_question_count": comparable,
+            "baseline_questions": baseline_questions or None,
+            "accuracy_delta": round(combined["accuracy"] - float(baseline.get("accuracy") or 0), 4) if comparable else None,
+            "answer_tokens_delta": combined["answer_total_tokens"] - int(baseline.get("answer_total_tokens") or 0) if comparable else None,
+            "average_latency_ms_delta": (
+                round(combined["average_latency_ms"] - float(baseline.get("average_latency_ms") or 0), 2)
+                if comparable and baseline.get("average_latency_ms") is not None else None
+            ),
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -261,7 +284,10 @@ def main() -> None:
         f"- Jina input chars: {combined['remote_rerank_input_chars']}",
         f"- Remote rerank attempts / cache hits / local fallbacks: {combined['remote_rerank_attempts']} / {combined['rerank_cache_hits']} / {combined['local_fallbacks']}",
         f"- EvidenceFrame questions / structured executions: {combined['evidence_frame_questions']} / {combined['structured_executions']}",
-        f"- Supplemental triggered / recovered: {combined['supplemental_triggered']} / {combined['supplemental_recovered']}",
+        f"- QuerySpec-related frames / structured answerable / execution ready: {combined['queryspec_related_frame_questions']} / {combined['structured_answerable_questions']} / {combined['structured_execution_ready_questions']}",
+        f"- Consistency checked / repaired: {combined['answer_consistency_checked']} / {combined['answer_consistency_repaired']}",
+        f"- Protected evidence questions / dropped protected units: {combined['protected_evidence_questions']} / {combined['dropped_protected_evidence']}",
+        f"- Supplemental triggered / effective / recovered: {combined['supplemental_triggered']} / {combined['supplemental_effective']} / {combined['supplemental_recovered']}",
         "",
         "## Split results",
         "",

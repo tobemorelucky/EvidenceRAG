@@ -60,22 +60,158 @@ def _normalized_label(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
-def matching_evidence_frames(field: str, frames: List[dict]) -> List[dict]:
-    """Return alias-matched frames, preferring an exact row-label match."""
+def _label_tokens(value: object) -> set[str]:
+    return {
+        token
+        for token in _normalized_label(value).split()
+        if len(token) > 1 and token not in {"and", "the", "of", "total", "net"}
+    }
+
+
+def match_evidence_frames_detailed(
+    field: str,
+    frames: List[dict],
+    *,
+    concepts: List[str] | None = None,
+    statement_types: List[str] | None = None,
+    scope: str = "",
+) -> tuple[List[dict], Dict[str, object]]:
+    """Layered short-text frame recall; metadata validation remains downstream."""
     from query_parser import FIELD_ALIASES
 
-    aliases = [_normalized_label(alias) for alias in FIELD_ALIASES.get(field, []) if _normalized_label(alias)]
-    candidates: List[tuple[int, dict]] = []
+    field_label = str(field or "").replace("_", " ")
+    canonical_aliases = list(dict.fromkeys([
+        field_label,
+        *[str(item) for item in FIELD_ALIASES.get(field, [])],
+    ]))
+    query_concepts = list(dict.fromkeys([
+        *[str(item) for item in (concepts or []) if str(item).strip()],
+        *canonical_aliases,
+    ]))
+    normalized_concepts = [_normalized_label(item) for item in query_concepts if _normalized_label(item)]
+    normalized_aliases = {_normalized_label(item) for item in canonical_aliases if _normalized_label(item)}
+    expected_statements = {str(item) for item in (statement_types or []) if item}
+    expected_scope = _normalized_label(scope)
+    alignment_enabled = os.getenv("FRAME_ALIGNMENT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if not alignment_enabled:
+        aliases = [_normalized_label(alias) for alias in canonical_aliases if _normalized_label(alias)]
+        legacy = []
+        for frame in frames:
+            label = _normalized_label(frame.get("row_label"))
+            scores = [1.0 if label == alias else 0.8 if label.startswith(alias) else 0.6 if alias in label else 0.0 for alias in aliases]
+            score = max(scores, default=0.0)
+            if score:
+                legacy.append((score, frame))
+        best = max((score for score, _ in legacy), default=0.0)
+        selected = [frame for score, frame in legacy if score == best]
+        return selected, {
+            "field": field,
+            "concepts": query_concepts,
+            "candidates": [
+                {
+                    "evidence_id": str(frame.get("evidence_id") or ""),
+                    "row_label": str(frame.get("row_label") or ""),
+                    "period": str(frame.get("period") or ""),
+                    "match_method": "legacy_alias",
+                    "match_score": score,
+                }
+                for score, frame in legacy[:12]
+            ],
+            "selected_count": len(selected),
+            "alignment_enabled": False,
+        }
+    scored: List[tuple[float, str, dict]] = []
     for frame in frames:
         label = _normalized_label(frame.get("row_label"))
-        scores = [300 if label == alias else 200 if label.startswith(alias) else 100 if alias in label else 0 for alias in aliases]
-        score = max(scores, default=0)
-        if score:
-            candidates.append((score, frame))
-    if not candidates:
-        return []
-    best_score = max(score for score, _ in candidates)
-    return [frame for score, frame in candidates if score == best_score]
+        descriptor = _normalized_label(
+            frame.get("descriptor")
+            or " | ".join(
+                str(item or "")
+                for item in [
+                    frame.get("row_label"),
+                    " ".join(frame.get("row_path") or []),
+                    " ".join(frame.get("column_path") or []),
+                    frame.get("section"),
+                    frame.get("statement_type"),
+                    frame.get("scope"),
+                ]
+            )
+        )
+        method = ""
+        score = 0.0
+        if label and label in normalized_concepts:
+            method, score = "normalized_exact", 1.0
+        elif label and label in normalized_aliases:
+            method, score = "canonical_alias", 0.96
+        else:
+            for concept in normalized_concepts:
+                concept_tokens = _label_tokens(concept)
+                label_tokens = _label_tokens(label)
+                descriptor_tokens = _label_tokens(descriptor)
+                if not concept_tokens:
+                    continue
+                if concept in label or label in concept:
+                    candidate_score = 0.82 + 0.12 * len(concept_tokens & label_tokens) / len(concept_tokens)
+                    candidate_method = "phrase_overlap"
+                else:
+                    overlap = len(concept_tokens & descriptor_tokens) / len(concept_tokens)
+                    candidate_score = 0.5 + 0.3 * overlap if overlap >= 0.5 else 0.0
+                    candidate_method = "descriptor_context"
+                if candidate_score > score:
+                    method, score = candidate_method, candidate_score
+        if not score:
+            continue
+        if expected_statements and str(frame.get("statement_type") or "") in expected_statements:
+            score += 0.03
+        if expected_scope and _normalized_label(frame.get("scope")) == expected_scope:
+            score += 0.02
+        scored.append((min(score, 1.0), method, frame))
+
+    method_priority = {
+        "normalized_exact": 4,
+        "canonical_alias": 3,
+        "phrase_overlap": 2,
+        "descriptor_context": 1,
+    }
+    deduplicated: Dict[str, tuple[float, str, dict]] = {}
+    for score, method, frame in scored:
+        evidence_id = str(frame.get("evidence_id") or "")
+        key = evidence_id or f"object:{id(frame)}"
+        previous = deduplicated.get(key)
+        if previous is None or (method_priority.get(method, 0), score) > (method_priority.get(previous[1], 0), previous[0]):
+            deduplicated[key] = (score, method, frame)
+    scored = list(deduplicated.values())
+    scored.sort(
+        key=lambda item: (method_priority.get(item[1], 0), item[0], str(item[2].get("evidence_id") or "")),
+        reverse=True,
+    )
+    best_priority = method_priority.get(scored[0][1], 0) if scored else 0
+    same_layer = [item for item in scored if method_priority.get(item[1], 0) == best_priority]
+    best = max((score for score, _, _ in same_layer), default=0.0)
+    selected = [frame for score, _, frame in same_layer if score >= 0.55 and score >= best - 0.08]
+    trace = {
+        "field": field,
+        "concepts": query_concepts,
+        "candidates": [
+            {
+                "evidence_id": str(frame.get("evidence_id") or ""),
+                "row_label": str(frame.get("row_label") or ""),
+                "period": str(frame.get("period") or ""),
+                "match_method": method,
+                "match_score": round(score, 4),
+            }
+            for score, method, frame in scored[:12]
+        ],
+        "selected_count": len(selected),
+        "alignment_enabled": True,
+    }
+    return selected, trace
+
+
+def matching_evidence_frames(field: str, frames: List[dict]) -> List[dict]:
+    """Compatibility wrapper for the layered matcher."""
+    matches, _ = match_evidence_frames_detailed(field, frames)
+    return matches
 
 
 def resolve_frame_operands(
@@ -130,6 +266,154 @@ def resolve_frame_operands(
             return None
         selected[str(field)] = candidates
     return selected
+
+
+def _task_frame_matches(task_spec: Dict[str, object], evidence_frames: List[dict]) -> List[dict]:
+    target = str(task_spec.get("target_measure") or "").strip()
+    fields = [str(item) for item in task_spec.get("required_fields") or []]
+    matches: Dict[str, dict] = {}
+    for field in fields:
+        candidates, _ = match_evidence_frames_detailed(
+            field,
+            evidence_frames,
+            statement_types=[str(item) for item in task_spec.get("statement_types") or []],
+            scope=str(task_spec.get("scope") or ""),
+        )
+        matches.update({str(item.get("evidence_id") or ""): item for item in candidates})
+    if target:
+        candidates, _ = match_evidence_frames_detailed(
+            "target_measure",
+            evidence_frames,
+            concepts=[target],
+            statement_types=[str(item) for item in task_spec.get("statement_types") or []],
+            scope=str(task_spec.get("scope") or ""),
+        )
+        matches.update({str(item.get("evidence_id") or ""): item for item in candidates})
+    selected = [item for key, item in matches.items() if key]
+    expected_company = _normalized_label(task_spec.get("company"))
+    if expected_company:
+        selected = [item for item in selected if _normalized_label(item.get("company")) == expected_company]
+    expected_scope = _normalized_label(task_spec.get("scope"))
+    if expected_scope:
+        selected = [item for item in selected if _normalized_label(item.get("scope")) == expected_scope]
+    return selected
+
+
+def _compatible_matrix(frames: List[dict]) -> bool:
+    if len(frames) < 2:
+        return False
+    for field in ("company", "currency", "scale", "scope"):
+        values = [str(item.get(field) or "") for item in frames]
+        if any(not value for value in values) or len(set(value.casefold() for value in values)) != 1:
+            return False
+    return True
+
+
+def resolve_comparison_frames(task_spec: Dict[str, object], evidence_frames: List[dict]) -> List[dict]:
+    """Resolve exactly one compatible value for each explicitly requested period."""
+    periods = [str(item) for item in task_spec.get("required_periods") or []]
+    if len(periods) != 2:
+        return []
+    candidates = _task_frame_matches(task_spec, evidence_frames)
+    groups: Dict[tuple, List[dict]] = {}
+    for frame in candidates:
+        groups.setdefault(
+            (frame.get("table_id"), tuple(frame.get("row_path") or [frame.get("row_label")]), frame.get("scope")),
+            [],
+        ).append(frame)
+    valid: List[List[dict]] = []
+    for group in groups.values():
+        selected = []
+        for period in periods:
+            matches = [item for item in group if str(item.get("period") or "") == period]
+            if len(matches) != 1:
+                selected = []
+                break
+            selected.append(matches[0])
+        if selected and _compatible_matrix(selected):
+            valid.append(selected)
+    return valid[0] if len(valid) == 1 else []
+
+
+def resolve_selection_frames(task_spec: Dict[str, object], evidence_frames: List[dict]) -> List[dict]:
+    """Resolve a complete, same-table candidate matrix without inventing members."""
+    if not task_spec.get("candidate_dimension") or task_spec.get("selection_direction") not in {"max", "min"}:
+        return []
+    periods = [str(item) for item in task_spec.get("required_periods") or []]
+    candidates = _task_frame_matches(task_spec, evidence_frames)
+    if periods:
+        if len(periods) != 1:
+            return []
+        candidates = [item for item in candidates if str(item.get("period") or "") == periods[0]]
+    groups: Dict[tuple, List[dict]] = {}
+    for frame in candidates:
+        groups.setdefault(
+            (frame.get("table_id"), tuple(frame.get("column_path") or []), frame.get("period"), frame.get("scope")),
+            [],
+        ).append(frame)
+    valid = []
+    for group in groups.values():
+        labels = [str(item.get("row_label") or "").strip() for item in group]
+        if len(group) >= 2 and all(labels) and len(set(label.casefold() for label in labels)) == len(labels) and _compatible_matrix(group):
+            valid.append(group)
+    return valid[0] if len(valid) == 1 else []
+
+
+def _build_non_calculation_frame_result(
+    task_spec: Dict[str, object],
+    evidence_frames: List[dict],
+) -> Dict[str, object] | None:
+    if os.getenv("STRUCTURED_TASK_EXECUTOR_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    task_type = str(task_spec.get("task_type") or "")
+    if task_type == "comparison":
+        selected = resolve_comparison_frames(task_spec, evidence_frames)
+        operation = "compare"
+    elif task_type == "selection":
+        selected = resolve_selection_frames(task_spec, evidence_frames)
+        operation = "argmax" if task_spec.get("selection_direction") == "max" else "argmin"
+    else:
+        return None
+    if not selected:
+        return None
+    try:
+        result = execute_financial_operation(
+            operation,
+            evidence_frames,
+            operand_evidence_ids=[str(item["evidence_id"]) for item in selected],
+            rounding=task_spec.get("rounding_decimal_places"),
+            unit=str(task_spec.get("result_unit") or selected[0].get("scale") or ""),
+        )
+    except FinancialExecutionError:
+        return None
+    result["source"] = "evidence_frame_decimal"
+    result["task_type"] = task_type
+    result["authoritative"] = True
+    result["candidate_matrix"] = [
+        {
+            "evidence_id": item.get("evidence_id"),
+            "label": item.get("row_label"),
+            "period": item.get("period"),
+            "raw_value": item.get("raw_value"),
+            "normalized_value": item.get("normalized_value"),
+            "currency": item.get("currency"),
+            "scale": item.get("scale"),
+            "scope": item.get("scope"),
+            "citation": item.get("citation"),
+            "document": item.get("document"),
+            "page_number": item.get("page_number"),
+        }
+        for item in selected
+    ]
+    if task_type == "comparison":
+        result["comparison_direction"] = {
+            "greater": "increased",
+            "less": "decreased",
+            "equal": "unchanged",
+        }.get(str(result.get("direction") or ""), "")
+    else:
+        result["selected_entity"] = str((result.get("selected_frame") or {}).get("row_label") or "")
+    return result
 
 
 def _build_frame_calculation(
@@ -190,9 +474,15 @@ def _build_frame_calculation(
         first = frames[0]
         operands[field] = {
             "value": operand_value,
+            "raw_value": [frame.get("raw_value") for frame in frames] if len(frames) > 1 else first.get("raw_value"),
+            "normalized_value": operand_value,
             "filename": first.get("document") or "",
             "page_number": first.get("page_number"),
             "period": first.get("period") or "",
+            "currency": first.get("currency"),
+            "scale": first.get("scale"),
+            "scope": first.get("scope"),
+            "citation": first.get("citation"),
             "matched_alias": first.get("row_label") or "",
             "evidence_ids": [frame["evidence_id"] for frame in frames],
         }
@@ -214,6 +504,8 @@ def _build_frame_calculation(
         "status": "calculated",
         "executor": "evidence_frame",
         "source": "evidence_frame_decimal",
+        "task_type": "calculation",
+        "authoritative": True,
         "result_unit": task_spec.get("result_unit") or "",
     }, task_spec)
 
@@ -452,7 +744,7 @@ def build_calculation_result(
 ) -> Dict[str, object] | None:
     """Calculate only when every required field resolves to one unambiguous numeric value."""
     if task_spec.get("task_type") != "calculation":
-        return None
+        return _build_non_calculation_frame_result(task_spec, evidence_frames or [])
     structured_coverage_required = os.getenv("STRUCTURED_COVERAGE_ENABLED", "false").strip().lower() in {
         "1", "true", "yes", "on",
     }
@@ -549,3 +841,114 @@ def format_calculation_evidence(calculation: Dict[str, object] | None) -> str:
             f"direction = {comparison.get('direction')}"
         )
     return "\n".join(lines)
+
+
+def _answer_numbers(text: str) -> List[Decimal]:
+    values: List[Decimal] = []
+    for raw in re.findall(r"(?<![A-Za-z0-9])\(?-?\d[\d,]*(?:\.\d+)?\)?%?", text or ""):
+        normalized = _normalized_number(raw)
+        if normalized:
+            try:
+                values.append(Decimal(normalized))
+            except DecimalException:
+                continue
+    return values
+
+
+def _result_candidates(calculation: Dict[str, object]) -> List[Decimal]:
+    values: List[Decimal] = []
+    for key in ("display_result", "result", "full_precision_result"):
+        if calculation.get(key) in (None, ""):
+            continue
+        try:
+            values.append(Decimal(str(calculation[key])))
+        except DecimalException:
+            continue
+    if calculation.get("result_unit") == "percent" or calculation.get("unit") == "percent":
+        values.extend(value * Decimal("100") for value in list(values))
+    return list(dict.fromkeys(values))
+
+
+def _citations_text(calculation: Dict[str, object]) -> str:
+    citations = [str(item) for item in calculation.get("citations") or [] if str(item).strip()]
+    if not citations:
+        citations = list(dict.fromkeys(
+            str(item.get("citation") or "")
+            for item in calculation.get("candidate_matrix") or []
+            if item.get("citation")
+        ))
+    return " ".join(citations)
+
+
+def _authoritative_template(task_spec: Dict[str, object], calculation: Dict[str, object]) -> str:
+    task_type = str(calculation.get("task_type") or task_spec.get("task_type") or "")
+    citation = _citations_text(calculation)
+    if task_type == "comparison":
+        matrix = list(calculation.get("candidate_matrix") or [])
+        values = "；".join(
+            f"{item.get('period')}: {item.get('normalized_value')} {item.get('scale') or ''}".strip()
+            for item in matrix
+        )
+        direction = str(calculation.get("comparison_direction") or "")
+        return f"{values}。比较结果：{direction}。 {citation}".strip()
+    if task_type == "selection":
+        selected = str(calculation.get("selected_entity") or "")
+        value = str(calculation.get("result") or "")
+        unit = str(calculation.get("unit") or "")
+        return f"{selected}，数值为 {value} {unit}。 {citation}".strip()
+    result = str(calculation.get("display_result") or calculation.get("result") or "")
+    unit = str(calculation.get("result_unit") or calculation.get("unit") or "")
+    formula = str(calculation.get("formula") or calculation.get("expression") or "")
+    return f"根据已验证操作数，{formula} = {result}{'%' if unit == 'percent' else (' ' + unit if unit else '')}。 {citation}".strip()
+
+
+def validate_or_repair_structured_answer(
+    answer: str,
+    task_spec: Dict[str, object],
+    calculation: Dict[str, object] | None,
+) -> tuple[str, Dict[str, object]]:
+    """Repair only direct conflicts with a high-confidence local result."""
+    trace: Dict[str, object] = {
+        "enabled": os.getenv("ANSWER_CONSISTENCY_VALIDATOR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+        "authoritative_result": bool((calculation or {}).get("authoritative")),
+        "checked": False,
+        "conflict": False,
+        "repaired": False,
+        "reason": "",
+    }
+    if not trace["enabled"] or not trace["authoritative_result"]:
+        return answer, trace
+    calculation = calculation or {}
+    trace["checked"] = True
+    task_type = str(calculation.get("task_type") or task_spec.get("task_type") or "")
+    normalized_answer = _normalized_label(answer)
+    conflict = False
+    reason = ""
+    if task_type == "calculation":
+        actual = _answer_numbers(answer)
+        expected = _result_candidates(calculation)
+        tolerance = Decimal("0.000001")
+        if not any(abs(item - target) <= tolerance * max(Decimal("1"), abs(target)) for item in actual for target in expected):
+            conflict, reason = True, "calculation_result_mismatch"
+    elif task_type == "comparison":
+        expected = str(calculation.get("comparison_direction") or "")
+        synonyms = {
+            "increased": {"increase", "increased", "grew", "higher"},
+            "decreased": {"decrease", "decreased", "declined", "lower"},
+            "unchanged": {"unchanged", "no change", "equal", "flat"},
+        }
+        expected_terms = synonyms.get(expected, {expected})
+        opposing = set().union(*(values for key, values in synonyms.items() if key != expected))
+        has_expected = any(term in normalized_answer for term in expected_terms)
+        has_opposing = any(term in normalized_answer for term in opposing)
+        if not has_expected or has_opposing:
+            conflict, reason = True, "comparison_direction_mismatch"
+    elif task_type == "selection":
+        selected = _normalized_label(calculation.get("selected_entity"))
+        conclusion = _normalized_label((answer or "").split(".", 1)[0].split("。", 1)[0])
+        if not selected or selected not in conclusion:
+            conflict, reason = True, "selection_entity_mismatch"
+    if not conflict:
+        return answer, trace
+    trace.update({"conflict": True, "repaired": True, "reason": reason})
+    return _authoritative_template(task_spec, calculation), trace

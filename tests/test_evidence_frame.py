@@ -25,6 +25,9 @@ def test_balance_sheet_frames_preserve_headers_units_scope_and_negative_sign():
     assert negative["scale"] == "millions"
     assert negative["scope"] == "consolidated"
     assert negative["statement_type"] == "balance_sheet"
+    assert "cash and cash equivalents" in negative["descriptor"].lower()
+    assert "consolidated balance sheets" in negative["descriptor"].lower()
+    assert "balance sheet" in negative["descriptor"].lower()
     assert negative["citation"] == "[source: report.pdf, page 7]"
     assert trace["evidence_frame_count"] == 4
     assert trace["frames_with_period"] == 4

@@ -228,6 +228,26 @@ def test_parse_query_extracts_explicit_rounding_precision():
     assert parsed["rounding_decimal_places"] == 2
 
 
+def test_parse_query_exposes_generic_frame_alignment_fields():
+    parsed = parse_query("Which reporting segment had the highest net revenue in FY2022?")
+
+    assert parsed["target_measure"] == "net revenue"
+    assert "net revenue" in parsed["required_concepts"]
+    assert parsed["required_periods"] == ["2022"]
+    assert parsed["candidate_dimension"] == "reporting segment"
+    assert parsed["scope"] == "segment"
+    assert parsed["operation"] == "argmax"
+    assert parsed["selection_direction"] == "max"
+
+
+def test_parse_query_builds_generic_target_measure_without_company_rules():
+    parsed = parse_query("What was Example Holdings' days payable outstanding for FY2021?")
+
+    assert "days payable outstanding" in parsed["target_measure"]
+    assert parsed["required_concepts"] == [parsed["target_measure"]]
+    assert parsed["required_periods"] == ["2021"]
+
+
 def test_margin_uses_percent_unit_but_roa_formula_remains_decimal():
     margin_question = "What is FY2015 depreciation and amortization % margin?"
     margin = parse_query(margin_question)

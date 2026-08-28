@@ -115,10 +115,15 @@ conda run -n rag python -m pytest tests -q
 EVIDENCE_FRAME_ENABLED=false
 STRUCTURED_EXECUTOR_ENABLED=false
 STRUCTURED_COVERAGE_ENABLED=false
+FRAME_ALIGNMENT_ENABLED=false
+STRUCTURED_COVERAGE_ADVISORY_ENABLED=true
+STRUCTURED_TASK_EXECUTOR_ENABLED=false
+ANSWER_CONSISTENCY_VALIDATOR_ENABLED=false
+RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED=false
 SUPPLEMENTAL_FIND_ENABLED=false
 ```
 
-启用后流程仍保留现有 Dense/BM25、RRF、Jina、页面选择和压缩，只在回答前增加 EvidenceFrame、Decimal executor 和 coverage；仅当 coverage 不完整时允许一次目标文档内补搜。正式运行及 v14/Oracle 对比命令见 [`docs/financebench_fixed_regression_protocol.md`](docs/financebench_fixed_regression_protocol.md)。
+启用后流程仍保留现有 Dense/BM25、RRF、Jina 和页面选择。结构化 coverage 默认只作 advisory；高置信 executor 结果可由本地一致性校验器验证，protected slots 只重分配现有压缩预算；仅当 base coverage 确实不完整时允许一次目标文档内补搜。正式运行及 v14/Oracle 对比命令见 [`docs/financebench_fixed_regression_protocol.md`](docs/financebench_fixed_regression_protocol.md)。
 
 ## 数据与迁移说明
 

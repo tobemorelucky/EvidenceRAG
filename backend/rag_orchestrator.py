@@ -1,5 +1,6 @@
 """Static and bounded-agentic retrieval orchestration for EvidenceRAG."""
 
+import hashlib
 import os
 import re
 import time
@@ -283,6 +284,8 @@ def _supplement_partial_evidence(
         "searched_documents": [],
         "new_pages": [],
         "new_evidence_frames": 0,
+        "new_evidence_hashes": [],
+        "supplemental_effective": False,
         "coverage_before": coverage,
         "coverage_after": coverage,
         "supplemental_skip_reason": "",
@@ -325,7 +328,27 @@ def _supplement_partial_evidence(
                     page_requests.append({"filename": filename, "page_number": adjacent})
         opened = open_pages(page_requests, limit=len(page_requests)) if page_requests else []
         existing_pages = {(doc.get("filename"), doc.get("page_number")) for doc in documents}
-        new_pages = [doc for doc in opened if (doc.get("filename"), doc.get("page_number")) not in existing_pages]
+
+        def evidence_hash(document: dict) -> str:
+            text = re.sub(r"\s+", " ", str(document.get("text") or document.get("page_text") or "")).strip()
+            return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+
+        existing_hashes = {evidence_hash(doc) for doc in documents} - {""}
+        new_pages = []
+        new_hashes = []
+        for doc in opened:
+            key = (doc.get("filename"), doc.get("page_number"))
+            item_hash = evidence_hash(doc)
+            if key in existing_pages or not item_hash or item_hash in existing_hashes:
+                continue
+            new_pages.append(doc)
+            new_hashes.append(item_hash)
+            existing_hashes.add(item_hash)
+        trace["new_evidence_hashes"] = new_hashes
+        trace["supplemental_effective"] = bool(new_hashes)
+        if not new_pages:
+            trace["supplemental_skip_reason"] = "no_new_evidence_hash"
+            return documents, trace
         trace["new_pages"] = [
             {"filename": doc.get("filename"), "page_number": doc.get("page_number")}
             for doc in new_pages
@@ -453,6 +476,20 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             for frame in evidence_frames
         )
         supplemental_trace["coverage_after"] = evidence_coverage
+        status_rank = {"insufficient": 0, "incomplete": 0, "partial": 1, "complete": 2}
+        coverage_before = supplemental_trace.get("coverage_before") or {}
+        coverage_improved = (
+            status_rank.get(str(evidence_coverage.get("status") or ""), 0)
+            > status_rank.get(str(coverage_before.get("status") or ""), 0)
+            or len(evidence_coverage.get("missing_fields") or [])
+            < len(coverage_before.get("missing_fields") or [])
+            or int(evidence_coverage.get("relevant_frame_count") or 0)
+            > int(coverage_before.get("relevant_frame_count") or 0)
+        )
+        supplemental_trace["coverage_improved"] = coverage_improved
+        supplemental_trace["supplemental_effective"] = bool(
+            supplemental_trace.get("new_evidence_hashes") or coverage_improved
+        )
     calculation = build_calculation_result(
         query_parse,
         evidence_coverage,
@@ -471,6 +508,12 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             "route_reason": route_reason,
             "evidence_status": evidence_status,
             "evidence_coverage": evidence_coverage,
+            "queryspec_concepts": evidence_coverage.get("queryspec_concepts") or query_parse.get("required_concepts") or [],
+            "frame_match_candidates": evidence_coverage.get("frame_match_candidates") or [],
+            "frame_match_method": evidence_coverage.get("frame_match_method") or "",
+            "frame_match_score": evidence_coverage.get("frame_match_score") or 0.0,
+            "relevant_frame_count": evidence_coverage.get("relevant_frame_count") or 0,
+            "operand_resolution_failure_reason": evidence_coverage.get("operand_resolution_failure_reason") or "",
             "calculation": calculation,
             "trace_id": str(uuid.uuid4()),
             "prompt_version": PROMPT_VERSION,
@@ -526,6 +569,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         "citations": citations,
         "evidence_status": evidence_status,
         "calculation": calculation,
+        "query_spec": query_parse,
         "evidence_frames": evidence_frames,
         "trace_id": trace["trace_id"],
     }

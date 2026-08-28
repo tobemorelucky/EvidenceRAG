@@ -263,6 +263,64 @@ def test_compact_evidence_reserves_pages_covering_each_required_field(monkeypatc
     assert meta["answer_context_missing_required_fields"] == []
 
 
+def test_protected_slots_keep_each_comparison_period_without_expanding_budget(monkeypatch):
+    monkeypatch.setenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true")
+    monkeypatch.setenv("RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED", "true")
+    monkeypatch.setenv("RAG_ANSWER_MAX_EVIDENCE_UNITS", "2")
+    monkeypatch.setenv("RAG_ANSWER_MAX_CONTEXT_CHARS", "2200")
+    documents = [
+        {"filename": "report.pdf", "page_number": 1, "text": "Revenue overview and corporate background."},
+        {"filename": "report.pdf", "page_number": 2, "text": "FY2024 revenue was 120 million."},
+        {"filename": "report.pdf", "page_number": 3, "text": "FY2023 revenue was 100 million."},
+    ]
+
+    evidence, meta = build_compact_evidence(
+        "Did revenue increase between FY2024 and FY2023?",
+        documents,
+        {
+            "task_type": "comparison",
+            "required_fields": ["revenue"],
+            "required_periods": ["2024", "2023"],
+        },
+    )
+
+    assert "FY2024 revenue was 120" in evidence
+    assert "FY2023 revenue was 100" in evidence
+    assert meta["answer_context_unit_count"] == 2
+    assert meta["answer_context_chars"] <= 2200
+    protected = meta["answer_context_protected_evidence"]
+    assert {item["page_number"] for item in protected} == {2, 3}
+    assert any("required_period:2024" in item["reasons"] for item in protected)
+
+
+def test_protected_selection_slot_prefers_authoritative_candidate_matrix_page(monkeypatch):
+    monkeypatch.setenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true")
+    monkeypatch.setenv("RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED", "true")
+    monkeypatch.setenv("RAG_ANSWER_MAX_EVIDENCE_UNITS", "1")
+    documents = [
+        {"filename": "report.pdf", "page_number": 1, "text": "Revenue overview 2024."},
+        {"filename": "report.pdf", "page_number": 8, "text": "North revenue 80\nSouth revenue 120"},
+    ]
+    calculation = {
+        "authoritative": True,
+        "candidate_matrix": [
+            {"document": "report.pdf", "page_number": 8, "label": "North", "normalized_value": "80"},
+            {"document": "report.pdf", "page_number": 8, "label": "South", "normalized_value": "120"},
+        ],
+    }
+
+    evidence, meta = build_compact_evidence(
+        "Which region had the highest revenue?",
+        documents,
+        {"task_type": "selection", "required_fields": [], "required_periods": [], "candidate_dimension": "region"},
+        calculation,
+    )
+
+    assert "North revenue 80" in evidence and "South revenue 120" in evidence
+    assert meta["answer_context_unit_count"] == 1
+    assert meta["answer_context_protected_evidence"][0]["page_number"] == 8
+
+
 def test_compact_evidence_matches_acquisition_word_forms_after_period_header(monkeypatch):
     monkeypatch.setenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true")
     monkeypatch.setenv("RAG_ANSWER_MAX_UNIT_CHARS", "800")

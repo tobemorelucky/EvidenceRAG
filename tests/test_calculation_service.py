@@ -1,4 +1,4 @@
-from calculation_service import build_calculation_result
+from calculation_service import build_calculation_result, match_evidence_frames_detailed
 
 
 def _evidence_frame(evidence_id, row_label, value, *, period="2024"):
@@ -11,13 +11,119 @@ def _evidence_frame(evidence_id, row_label, value, *, period="2024"):
         "statement_type": "income_statement",
         "table_id": "table-1",
         "row_label": row_label,
+        "row_path": ["Financial results", row_label],
+        "column_path": [period] if period else [],
+        "section": "Consolidated Statements of Income",
         "period": period,
         "normalized_value": str(value),
         "currency": "USD",
         "scale": "millions",
         "scope": "consolidated",
+        "descriptor": f"{row_label} | Financial results | Consolidated Statements of Income | income statement | consolidated",
         "citation": "[source: report.pdf, page 8]",
     }
+
+
+def test_frame_matching_uses_descriptor_context_after_alias_matching(monkeypatch):
+    monkeypatch.setenv("FRAME_ALIGNMENT_ENABLED", "true")
+    frames = [
+        _evidence_frame("ef_receivables", "Trade receivables, net", "25"),
+        _evidence_frame("ef_noise", "Allowance", "2"),
+    ]
+
+    matches, trace = match_evidence_frames_detailed(
+        "accounts_receivable",
+        frames,
+        concepts=["accounts receivable"],
+        statement_types=["balance_sheet"],
+        scope="consolidated",
+    )
+
+    assert [item["evidence_id"] for item in matches] == ["ef_receivables"]
+    assert trace["candidates"][0]["match_method"] in {"canonical_alias", "phrase_overlap"}
+    assert trace["candidates"][0]["match_score"] > 0.7
+
+
+def test_frame_matching_exact_layer_suppresses_partial_rows_and_deduplicates(monkeypatch):
+    monkeypatch.setenv("FRAME_ALIGNMENT_ENABLED", "true")
+    exact = _evidence_frame("ef_exact", "Total current assets", "100")
+    partial = _evidence_frame("ef_partial", "Other current assets", "20")
+
+    matches, _ = match_evidence_frames_detailed(
+        "current_assets",
+        [exact, dict(exact), partial],
+        concepts=["total current assets", "current assets"],
+    )
+
+    assert [item["evidence_id"] for item in matches] == ["ef_exact"]
+
+
+def test_comparison_executor_builds_auditable_period_pair(monkeypatch):
+    monkeypatch.setenv("FRAME_ALIGNMENT_ENABLED", "true")
+    monkeypatch.setenv("STRUCTURED_TASK_EXECUTOR_ENABLED", "true")
+    current = _evidence_frame("ef_current", "Revenue", "120", period="2024")
+    prior = _evidence_frame("ef_prior", "Revenue", "100", period="2023")
+    task = {
+        "task_type": "comparison",
+        "company": "Example Co",
+        "target_measure": "revenue",
+        "required_fields": ["revenue"],
+        "required_periods": ["2024", "2023"],
+        "operation": "compare",
+    }
+
+    result = build_calculation_result(task, {"status": "complete"}, [], evidence_frames=[current, prior])
+
+    assert result["executor"] == "evidence_frame"
+    assert result["operation"] == "compare"
+    assert result["comparison_direction"] == "increased"
+    assert result["operand_evidence_ids"] == ["ef_current", "ef_prior"]
+    assert result["candidate_matrix"][0]["period"] == "2024"
+
+
+def test_selection_executor_requires_complete_same_table_candidate_matrix(monkeypatch):
+    monkeypatch.setenv("FRAME_ALIGNMENT_ENABLED", "true")
+    monkeypatch.setenv("STRUCTURED_TASK_EXECUTOR_ENABLED", "true")
+    north = _evidence_frame("ef_north", "North region revenue", "80", period="2024")
+    south = _evidence_frame("ef_south", "South region revenue", "120", period="2024")
+    task = {
+        "task_type": "selection",
+        "company": "Example Co",
+        "target_measure": "revenue",
+        "candidate_dimension": "region",
+        "required_periods": ["2024"],
+        "selection_direction": "max",
+        "operation": "argmax",
+    }
+
+    result = build_calculation_result(task, {"status": "complete"}, [], evidence_frames=[north, south])
+
+    assert result["operation"] == "argmax"
+    assert result["selected_entity"] == "South region revenue"
+    assert result["selected_evidence_id"] == "ef_south"
+
+
+def test_selection_executor_rejects_ambiguous_candidate_groups(monkeypatch):
+    monkeypatch.setenv("FRAME_ALIGNMENT_ENABLED", "true")
+    monkeypatch.setenv("STRUCTURED_TASK_EXECUTOR_ENABLED", "true")
+    first = _evidence_frame("ef_a", "North revenue", "80")
+    second = _evidence_frame("ef_b", "South revenue", "120")
+    duplicate_group_a = {**first, "evidence_id": "ef_c", "table_id": "table-2"}
+    duplicate_group_b = {**second, "evidence_id": "ef_d", "table_id": "table-2"}
+    task = {
+        "task_type": "selection",
+        "target_measure": "revenue",
+        "candidate_dimension": "region",
+        "required_periods": ["2024"],
+        "selection_direction": "max",
+    }
+
+    assert build_calculation_result(
+        task,
+        {"status": "complete"},
+        [],
+        evidence_frames=[first, second, duplicate_group_a, duplicate_group_b],
+    ) is None
 
 
 def test_structured_executor_precedes_text_row_parser(monkeypatch):

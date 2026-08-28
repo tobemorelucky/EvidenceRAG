@@ -309,6 +309,93 @@ def extract_metrics(question: str) -> List[str]:
     return metrics
 
 
+def _target_measure(question: str, required_fields: List[str]) -> str:
+    """Return a question-derived measure phrase without benchmark-specific rules."""
+    text = (question or "").lower()
+    matched_aliases = [
+        alias
+        for aliases in METRIC_ALIASES.values()
+        for alias in aliases
+        if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text)
+    ]
+    if matched_aliases:
+        matched = max(matched_aliases, key=len)
+        phrase_match = re.search(rf"\b([a-z]+\s+)?{re.escape(matched)}\b", text)
+        if phrase_match and phrase_match.group(1):
+            modifier = phrase_match.group(1).strip()
+            if modifier not in {"the", "a", "an", "highest", "lowest", "largest", "smallest"}:
+                return f"{modifier} {matched}"
+        return matched
+    if required_fields:
+        first = str(required_fields[0])
+        return (FIELD_ALIASES.get(first) or [first.replace("_", " ")])[0]
+
+    # Generic fallback: preserve the measure named by the question while
+    # removing interrogative, ownership, period and output-format scaffolding.
+    phrase = re.sub(r"^.*?\b(?:what|which)\s+(?:is|are|was|were)\s+", "", text)
+    phrase = re.sub(r"\b(?:for|in|as of|between|from)\s+(?:fy\s*)?(?:19|20)\d{2}.*$", "", phrase)
+    phrase = re.sub(r"\b(?:fy\s*)?(?:19|20)\d{2}\b", "", phrase)
+    phrase = re.sub(r"\b(?:of|for)\s+[a-z0-9&.,' -]+?'s\s+", "", phrase)
+    phrase = re.sub(r"^[a-z0-9&.,' -]+?'s\s+", "", phrase)
+    phrase = re.sub(r"\b(?:round|answer|calculate|compute)\b.*$", "", phrase)
+    phrase = re.sub(r"[^a-z0-9&%() -]+", " ", phrase)
+    return re.sub(r"\s+", " ", phrase).strip(" -?.")
+
+
+def _candidate_dimension(question: str) -> str:
+    text = (question or "").lower()
+    match = re.search(
+        r"\bwhich\s+((?:[a-z]+\s+){0,3}(?:segment|region|geography|category|business|activity|period|year|quarter|item|product|customer))\b",
+        text,
+    )
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip()
+    match = re.search(r"\bamong\s+([^?.,;]{2,100})", text)
+    return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+
+
+def _query_scope(question: str) -> str:
+    text = (question or "").lower()
+    if "consolidated" in text:
+        return "consolidated"
+    if re.search(r"\b(?:segment|business unit)\b", text):
+        return "segment"
+    if re.search(r"\b(?:region|geograph|country)\b", text):
+        return "geography"
+    return ""
+
+
+def _selection_direction(question: str) -> str:
+    text = (question or "").lower()
+    if re.search(r"\b(?:highest|largest|biggest|most|best)\b", text):
+        return "max"
+    if re.search(r"\b(?:lowest|smallest|least|worst)\b", text):
+        return "min"
+    return ""
+
+
+def _query_operation(task_spec: Dict[str, object], selection_direction: str) -> str:
+    task_type = str(task_spec.get("task_type") or "lookup")
+    formula = str(task_spec.get("formula") or "")
+    if task_type == "selection":
+        return "argmax" if selection_direction == "max" else "argmin" if selection_direction == "min" else "select"
+    if task_type == "comparison":
+        return "compare"
+    if task_type != "calculation":
+        return "select"
+    if "average(" in formula:
+        return "average"
+    if "/" in formula:
+        return "divide"
+    if "*" in formula:
+        return "multiply"
+    if "-" in formula:
+        return "subtract"
+    if "+" in formula:
+        return "sum"
+    return "select"
+
+
 def infer_generic_task_type(question: str) -> str:
     """Infer the requested operation from generic language, without metric-specific rules."""
     text = (question or "").lower()
@@ -636,6 +723,13 @@ def parse_query(question: str) -> Dict[str, object]:
         "required_periods": [str(year) for year in extract_years(question)] + extract_quarters(question),
     }
     task_spec = infer_task_spec(question)
+    required_fields = [str(item) for item in task_spec.get("required_fields") or []]
+    target_measure = _target_measure(question, required_fields)
+    required_concepts = list(dict.fromkeys([
+        *((FIELD_ALIASES.get(field) or [field.replace("_", " ")])[0] for field in required_fields),
+        *([target_measure] if target_measure else []),
+    ]))
+    selection_direction = _selection_direction(question)
     formula = str(task_spec.get("formula") or "")
     result_unit = ""
     if task_spec.get("task_type") == "calculation" and "/" in formula:
@@ -646,6 +740,12 @@ def parse_query(question: str) -> Dict[str, object]:
     return {
         **parsed,
         **task_spec,
+        "target_measure": target_measure,
+        "required_concepts": required_concepts,
+        "candidate_dimension": _candidate_dimension(question),
+        "scope": _query_scope(question),
+        "operation": _query_operation(task_spec, selection_direction),
+        "selection_direction": selection_direction,
         "rounding_decimal_places": extract_rounding_decimal_places(question),
         "result_unit": result_unit,
         "statement_types": infer_statement_types(question, list(task_spec.get("required_fields") or [])),
