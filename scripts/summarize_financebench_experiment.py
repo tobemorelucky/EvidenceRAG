@@ -112,6 +112,10 @@ def _summarize_split(
         for task in sorted(task_totals)
     }
     latencies = [float((item.get("evaluation_latency") or {}).get("total_ms") or 0) for item in answers]
+    gate_names = (
+        "frame_matched", "measure_validated", "period_validated",
+        "metadata_validated", "operand_unique", "operation_validated",
+    )
     return (
         {
             "answers": len(answers),
@@ -145,6 +149,10 @@ def _summarize_split(
             "structured_answerable_questions": sum(bool((trace.get("evidence_coverage") or {}).get("structured_answerable")) for trace in traces),
             "structured_execution_ready_questions": sum(bool((trace.get("evidence_coverage") or {}).get("structured_execution_ready")) for trace in traces),
             "structured_executions": sum(int(trace.get("frames_used_for_execution") or 0) > 0 for trace in traces),
+            "execution_gate_funnel": {
+                gate: sum(bool(((trace.get("evidence_coverage") or {}).get("structured_gate_trace") or {}).get(gate)) for trace in traces)
+                for gate in gate_names
+            },
             "answer_consistency_checked": sum(bool((trace.get("answer_consistency") or {}).get("checked")) for trace in traces),
             "answer_consistency_repaired": sum(bool((trace.get("answer_consistency") or {}).get("repaired")) for trace in traces),
             "protected_evidence_questions": sum(bool(trace.get("answer_context_protected_evidence")) for trace in traces),

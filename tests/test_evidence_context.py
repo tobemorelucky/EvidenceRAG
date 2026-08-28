@@ -321,6 +321,122 @@ def test_protected_selection_slot_prefers_authoritative_candidate_matrix_page(mo
     assert meta["answer_context_protected_evidence"][0]["page_number"] == 8
 
 
+def test_period_protection_prefers_same_line_concept_and_period(monkeypatch):
+    monkeypatch.setenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true")
+    monkeypatch.setenv("RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED", "true")
+    monkeypatch.setenv("RAG_ANSWER_MAX_EVIDENCE_UNITS", "2")
+    documents = [
+        {
+            "filename": "report.pdf",
+            "page_number": 1,
+            "text": "FY2024 FY2023 revenue outlook background comparison management discussion.",
+        },
+        {"filename": "report.pdf", "page_number": 2, "text": "FY2024 Revenue 120 million."},
+        {"filename": "report.pdf", "page_number": 3, "text": "FY2023 Revenue 100 million."},
+    ]
+
+    evidence, meta = build_compact_evidence(
+        "Did revenue increase from FY2023 to FY2024?",
+        documents,
+        {
+            "task_type": "comparison",
+            "required_fields": ["revenue"],
+            "required_periods": ["2023", "2024"],
+            "target_measure": "revenue",
+        },
+    )
+
+    assert "FY2024 Revenue 120" in evidence
+    assert "FY2023 Revenue 100" in evidence
+    assert {item["page_number"] for item in meta["answer_context_protected_evidence"]} == {2, 3}
+
+
+def test_quarter_comparison_does_not_protect_annual_page_with_incidental_year(monkeypatch):
+    monkeypatch.setenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true")
+    monkeypatch.setenv("RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED", "true")
+    monkeypatch.setenv("RAG_ANSWER_MAX_EVIDENCE_UNITS", "2")
+    documents = [
+        {
+            "filename": "annual.pdf",
+            "page_number": 25,
+            "text": (
+                "Total stores at end of fiscal year 2023 were 978. "
+                + "\n".join(f"Unrelated annual disclosure {index}." for index in range(20))
+                + " During the second quarter of fiscal 2024, restructuring continued."
+            ),
+        },
+        {
+            "filename": "quarterly.pdf",
+            "page_number": 16,
+            "text": (
+                "Stores at the end of the second quarter (Q2) of fiscal 2024 and fiscal 2023 "
+                "were 969 and 982, respectively."
+            ),
+        },
+    ]
+
+    evidence, meta = build_compact_evidence(
+        "Did store count change between Q2 FY2024 and FY2023?",
+        documents,
+        {
+            "task_type": "comparison",
+            "required_fields": ["store_count"],
+            "required_periods": ["2024", "2023", "Q2"],
+            "target_measure": "store count",
+        },
+    )
+
+    protected = meta["answer_context_protected_evidence"]
+    quarterly = next(item for item in protected if item["page_number"] == 16)
+    assert "required_period:2024" in quarterly["reasons"]
+    assert "required_period:2023" in quarterly["reasons"]
+    assert all(
+        not reason.startswith("required_period:")
+        for item in protected
+        if item["page_number"] == 25
+        for reason in item["reasons"]
+    )
+    assert "969 and 982" in evidence
+
+
+def test_lookup_gets_one_protected_slot_only_when_target_measure_is_explicit(monkeypatch):
+    monkeypatch.setenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true")
+    monkeypatch.setenv("RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED", "true")
+    monkeypatch.setenv("RAG_ANSWER_MAX_EVIDENCE_UNITS", "1")
+    documents = [
+        {"filename": "report.pdf", "page_number": 1, "text": "Corporate overview and FY2024 highlights."},
+        {"filename": "report.pdf", "page_number": 7, "text": "FY2024 Net revenue 500 million."},
+    ]
+
+    _, explicit_meta = build_compact_evidence(
+        "What was FY2024 net revenue?",
+        documents,
+        {
+            "task_type": "lookup",
+            "required_fields": ["revenue"],
+            "required_periods": ["2024"],
+            "target_measure": "net revenue",
+            "target_measure_explicit": True,
+        },
+    )
+    _, ambiguous_meta = build_compact_evidence(
+        "What was disclosed?",
+        documents,
+        {
+            "task_type": "lookup",
+            "required_fields": [],
+            "required_periods": [],
+            "target_measure": "disclosed item",
+            "target_measure_explicit": False,
+        },
+    )
+
+    assert explicit_meta["answer_context_protected_evidence"] == [
+        {"filename": "report.pdf", "page_number": 7, "reasons": ["lookup_target_measure"]}
+    ]
+    assert ambiguous_meta["answer_context_protected_evidence"] == []
+
+
 def test_compact_evidence_matches_acquisition_word_forms_after_period_header(monkeypatch):
     monkeypatch.setenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true")
     monkeypatch.setenv("RAG_ANSWER_MAX_UNIT_CHARS", "800")

@@ -374,26 +374,136 @@ def _selection_direction(question: str) -> str:
     return ""
 
 
-def _query_operation(task_spec: Dict[str, object], selection_direction: str) -> str:
+def _has_explicit_selection_measure(question: str, target_measure: str, required_fields: List[str]) -> bool:
+    text = (question or "").lower()
+    if required_fields or extract_metrics(question):
+        return True
+    if re.search(
+        r"\b(?:by|based on|measured by|in terms of)\s+(?:the\s+)?"
+        r"(?:revenue|sales|growth|margin|income|profit|cash flow|rate|ratio|return|volume)\b",
+        text,
+    ):
+        return True
+    return False
+
+
+def _query_operation(
+    question: str,
+    task_spec: Dict[str, object],
+    selection_direction: str,
+    target_measure: str,
+    candidate_dimension: str,
+) -> tuple[str, float, str]:
+    """Determine the requested numeric operation independently from task type."""
+    text = (question or "").lower()
     task_type = str(task_spec.get("task_type") or "lookup")
     formula = str(task_spec.get("formula") or "")
+
+    percentage_change = (
+        r"\b(?:percentage|percent)\s+(?:change|increase|decrease|growth|decline)\b",
+        r"\b(?:increase|decrease|grow|growth|decline|change)(?:d)?\s+by\s+what\s+(?:percentage|percent)\b",
+        r"\bgrowth\s+rate\b",
+        r"\byear[- ]over[- ]year\b.{0,50}\b(?:percentage|percent|rate)\b",
+    )
+    explicit_percent_unit = bool(re.search(r"(?:%|\bpercents?\b|\bpercentage\b)", text))
+    year_over_year_change = bool(re.search(r"\byear[- ]over[- ]year\s+change\b", text))
+    if any(re.search(pattern, text) for pattern in percentage_change) or (
+        explicit_percent_unit and year_over_year_change
+    ):
+        return "percentage_change", 1.0, "explicit_percentage_change"
+
+    absolute_change = (
+        r"\b(?:absolute\s+)?(?:change|difference)\s+(?:in|between)\b.{0,80}\b(?:dollars?|usd|amount)\b",
+        r"\b(?:by how much|how many dollars|what amount)\b.{0,80}\b(?:change|increase|decrease|difference)\b",
+        r"\b(?:change|increase|decrease)(?:d)?\s+by\s+\$",
+    )
+    if any(re.search(pattern, text) for pattern in absolute_change):
+        return "subtract", 0.98, "explicit_absolute_change"
+
     if task_type == "selection":
-        return "argmax" if selection_direction == "max" else "argmin" if selection_direction == "min" else "select"
+        measure_explicit = _has_explicit_selection_measure(
+            question,
+            target_measure,
+            [str(item) for item in task_spec.get("required_fields") or []],
+        )
+        if candidate_dimension and measure_explicit and selection_direction in {"max", "min"}:
+            return ("argmax" if selection_direction == "max" else "argmin"), 0.95, "explicit_selection_contract"
+        return "select", 0.4, "ambiguous_selection_measure_or_dimension"
+
     if task_type == "comparison":
-        return "compare"
+        directional = (
+            r"\b(?:did|has|have|was|were)\b.{0,80}\b(?:increase|decrease|grow|decline|higher|lower|greater|less)\b",
+            r"\b(?:higher|lower|greater|less)\s+than\b",
+            r"\bwhich\s+(?:period|year|quarter)\b.{0,80}\b(?:higher|lower|larger|smaller)\b",
+            r"\b(?:increase|decrease|grow|decline)(?:d)?\b.{0,80}\b(?:between|from|versus|vs\.?|year[- ]over[- ]year)\b",
+        )
+        if any(re.search(pattern, text) for pattern in directional):
+            return "compare", 0.95, "explicit_direction_comparison"
+        return "compare", 0.7, "generic_comparison_without_requested_magnitude"
+
     if task_type != "calculation":
-        return "select"
+        return "select", 1.0, "direct_lookup"
     if "average(" in formula:
-        return "average"
+        # Average can be an internal operand of a larger requested formula.
+        if re.fullmatch(r"\s*average\([^)]*\)\s*", formula):
+            return "average", 0.95, "explicit_average_formula"
     if "/" in formula:
-        return "divide"
+        return "divide", 0.95, "validated_ratio_formula"
     if "*" in formula:
-        return "multiply"
+        return "multiply", 0.95, "validated_multiplication_formula"
     if "-" in formula:
-        return "subtract"
+        return "subtract", 0.95, "validated_subtraction_formula"
     if "+" in formula:
-        return "sum"
-    return "select"
+        return "sum", 0.95, "validated_sum_formula"
+    if re.search(r"\b(?:ratio|divided by|per|how many times|proportion)\b", text):
+        return "divide", 0.8, "explicit_ratio_without_formula"
+    return "select", 0.4, "calculation_operation_ambiguous"
+
+
+def _period_semantics(question: str, required_periods: List[str]) -> Dict[str, object]:
+    """Preserve question-stated baseline/target order; never use table column order."""
+    periods = list(dict.fromkeys(str(item) for item in required_periods if str(item)))
+    if len(periods) < 2:
+        return {
+            "baseline_period": "",
+            "target_period": periods[0] if len(periods) == 1 else "",
+            "period_order": periods,
+            "period_semantics_confidence": 1.0 if periods else 0.0,
+            "period_semantics_method": "single_period" if periods else "not_specified",
+        }
+    text = (question or "").lower().replace("→", " to ")
+    token = r"(?:fy\s*)?((?:19|20)\d{2})"
+    patterns = (
+        (rf"\bfrom\s+{token}\s+(?:to|through)\s+{token}\b", "from_to", 1.0),
+        (rf"\b{token}\s*(?:->|to)\s*{token}\b", "arrow_or_to", 1.0),
+        (rf"\bbetween\s+{token}\s+and\s+{token}\b", "between_listed_order", 0.6),
+    )
+    for pattern, method, confidence in patterns:
+        match = re.search(pattern, text)
+        if match:
+            baseline, target = match.group(1), match.group(2)
+            if method == "between_listed_order":
+                return {
+                    "baseline_period": "",
+                    "target_period": "",
+                    "period_order": [baseline, target],
+                    "period_semantics_confidence": confidence,
+                    "period_semantics_method": method,
+                }
+            return {
+                "baseline_period": baseline,
+                "target_period": target,
+                "period_order": [baseline, target],
+                "period_semantics_confidence": confidence,
+                "period_semantics_method": method,
+            }
+    return {
+        "baseline_period": "",
+        "target_period": "",
+        "period_order": periods,
+        "period_semantics_confidence": 0.4,
+        "period_semantics_method": "listed_but_direction_ambiguous",
+    }
 
 
 def infer_generic_task_type(question: str) -> str:
@@ -725,14 +835,31 @@ def parse_query(question: str) -> Dict[str, object]:
     task_spec = infer_task_spec(question)
     required_fields = [str(item) for item in task_spec.get("required_fields") or []]
     target_measure = _target_measure(question, required_fields)
+    target_measure_explicit = bool(required_fields or extract_metrics(question)) or bool(re.search(
+        r"\b(?:by|based on|measured by|in terms of)\s+(?:the\s+)?"
+        r"(?:revenue|sales|growth|margin|income|profit|cash flow|rate|ratio|return|volume)\b",
+        question or "",
+        re.IGNORECASE,
+    ))
     required_concepts = list(dict.fromkeys([
         *((FIELD_ALIASES.get(field) or [field.replace("_", " ")])[0] for field in required_fields),
         *([target_measure] if target_measure else []),
     ]))
     selection_direction = _selection_direction(question)
+    candidate_dimension = _candidate_dimension(question)
+    operation, operation_confidence, operation_reason = _query_operation(
+        question,
+        task_spec,
+        selection_direction,
+        target_measure,
+        candidate_dimension,
+    )
+    period_semantics = _period_semantics(question, list(parsed["required_periods"]))
     formula = str(task_spec.get("formula") or "")
     result_unit = ""
-    if task_spec.get("task_type") == "calculation" and "/" in formula:
+    if operation == "percentage_change":
+        result_unit = "percent"
+    elif task_spec.get("task_type") == "calculation" and "/" in formula:
         if re.search(r"(?:%|\bpercent(?:age)?\b|\bmargin\b)", question or "", re.IGNORECASE):
             result_unit = "percent"
         else:
@@ -741,11 +868,15 @@ def parse_query(question: str) -> Dict[str, object]:
         **parsed,
         **task_spec,
         "target_measure": target_measure,
+        "target_measure_explicit": target_measure_explicit,
         "required_concepts": required_concepts,
-        "candidate_dimension": _candidate_dimension(question),
+        "candidate_dimension": candidate_dimension,
         "scope": _query_scope(question),
-        "operation": _query_operation(task_spec, selection_direction),
+        "operation": operation,
+        "operation_confidence": operation_confidence,
+        "operation_reason": operation_reason,
         "selection_direction": selection_direction,
+        **period_semantics,
         "rounding_decimal_places": extract_rounding_decimal_places(question),
         "result_unit": result_unit,
         "statement_types": infer_statement_types(question, list(task_spec.get("required_fields") or [])),

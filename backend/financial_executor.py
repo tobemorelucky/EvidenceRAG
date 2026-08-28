@@ -195,8 +195,8 @@ def execute_financial_operation(
             raise FinancialExecutionError("percentage_change requires current and prior operands")
         if values[1] == 0:
             raise FinancialExecutionError("percentage change has a zero prior value")
-        result = (values[0] - values[1]) / values[1] * Decimal("100")
-        expression = f"(({values[0]} - {values[1]}) / {values[1]}) * 100"
+        result = (values[0] - values[1]) / abs(values[1]) * Decimal("100")
+        expression = f"(({values[0]} - {values[1]}) / abs({values[1]})) * 100"
         base["unit"] = unit or "percent"
     elif operation == "compare":
         if len(values) != 2:

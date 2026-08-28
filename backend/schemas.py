@@ -157,6 +157,9 @@ class RagTrace(BaseModel):
     frame_match_score: Optional[float] = None
     relevant_frame_count: Optional[int] = None
     operand_resolution_failure_reason: Optional[str] = None
+    structured_gate_trace: Optional[dict] = None
+    execution_contract: Optional[dict] = None
+    structured_authoritative: Optional[bool] = None
     evidence_coverage: Optional[dict] = None
     calculation: Optional[dict] = None
     answer_consistency: Optional[dict] = None
@@ -168,6 +171,7 @@ class RagTrace(BaseModel):
     new_evidence_frames: Optional[int] = None
     new_evidence_hashes: Optional[List[str]] = None
     supplemental_effective: Optional[bool] = None
+    supplemental_requirement_improvements: Optional[List[str]] = None
     coverage_improved: Optional[bool] = None
     supplemental_skip_reason: Optional[str] = None
     coverage_before: Optional[dict] = None

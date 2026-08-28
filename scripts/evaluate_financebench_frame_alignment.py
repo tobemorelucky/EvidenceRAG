@@ -15,6 +15,14 @@ DATASET = ROOT / "data" / "financebench_top40_100_langsmith_with_evidence.csv"
 
 
 def _summarize(records: list[dict]) -> dict:
+    gate_names = (
+        "frame_matched",
+        "measure_validated",
+        "period_validated",
+        "metadata_validated",
+        "operand_unique",
+        "operation_validated",
+    )
     return {
         "questions": len(records),
         "evidence_frame_questions": sum(int(item.get("evidence_frame_count") or 0) > 0 for item in records),
@@ -22,6 +30,10 @@ def _summarize(records: list[dict]) -> dict:
         "structured_answerable_questions": sum(bool((item.get("evidence_coverage") or {}).get("structured_answerable")) for item in records),
         "structured_execution_ready_questions": sum(bool((item.get("evidence_coverage") or {}).get("structured_execution_ready")) for item in records),
         "structured_executions": sum(int(item.get("frames_used_for_execution") or 0) > 0 for item in records),
+        "execution_gate_funnel": {
+            gate: sum(bool((item.get("structured_gate_trace") or {}).get(gate)) for item in records)
+            for gate in gate_names
+        },
         "operand_resolution_failures": {
             reason: sum(str(item.get("operand_resolution_failure_reason") or "") == reason for item in records)
             for reason in sorted({str(item.get("operand_resolution_failure_reason") or "") for item in records} - {""})
@@ -77,6 +89,11 @@ def main() -> None:
             "frame_match_score": trace.get("frame_match_score"),
             "operand_resolution_failure_reason": trace.get("operand_resolution_failure_reason"),
             "evidence_coverage": trace.get("evidence_coverage") or {},
+            "structured_gate_trace": (trace.get("evidence_coverage") or {}).get("structured_gate_trace") or {},
+            "query_spec": prepared.get("query_spec") or {},
+            "execution_contract": trace.get("execution_contract") or {},
+            "structured_authoritative": bool(trace.get("structured_authoritative")),
+            "calculation": prepared.get("calculation"),
             "frames_used_for_execution": trace.get("frames_used_for_execution", 0),
             "supplemental_triggered": trace.get("supplemental_triggered", False),
             "supplemental_effective": trace.get("supplemental_effective", False),

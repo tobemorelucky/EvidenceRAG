@@ -106,6 +106,7 @@ def test_generic_value_columns_recover_only_explicit_matched_page_headers():
     assert all(frame["currency"] == "USD" for frame in frames)
     assert all(frame["scale"] == "millions" for frame in frames)
     assert all(frame["scope"] == "consolidated" for frame in frames)
+    assert all(frame["period_provenance"]["source"] == "matched_page_explicit_header" for frame in frames)
 
 
 def test_narrative_years_do_not_define_generic_value_columns():
@@ -177,6 +178,70 @@ def test_existing_normalized_column_paths_are_preserved():
     frame = next(item for item in frames if item["column_label"] == "Year Ended, 2024")
     assert frame["column_path"] == ["Year Ended", "2024"]
     assert frame["period"] == "2024"
+    assert frame["period_provenance"]["source"] == "column_schema"
+
+
+def test_multilevel_quarter_and_year_header_keeps_explicit_period_provenance():
+    table = {
+        "table_id": "quarterly-income",
+        "filename": "income.pdf",
+        "page_number": 5,
+        "normalized": True,
+        "normalized_title": "Consolidated Statements of Operations",
+        "normalized_unit": "USD millions",
+        "normalized_columns": ["Metric", "Q2 FY2024", "Q2 FY2023"],
+        "column_schema": [
+            {"label": "Q2 FY2024", "path": ["Three Months Ended", "Q2", "FY2024"], "unit": "USD millions"},
+            {"label": "Q2 FY2023", "path": ["Three Months Ended", "Q2", "FY2023"], "unit": "USD millions"},
+        ],
+        "normalized_rows": [
+            {"Metric": "Net revenues", "Q2 FY2024": "120", "Q2 FY2023": "100"},
+            {"Metric": "Operating income", "Q2 FY2024": "30", "Q2 FY2023": "20"},
+        ],
+    }
+
+    frames, _ = build_evidence_frames([table])
+
+    assert {frame["period"] for frame in frames} == {"Q2 2024", "Q2 2023"}
+    assert all(frame["period_provenance"]["source"] == "column_schema" for frame in frames)
+
+
+def test_adjacent_same_table_continuation_can_inherit_explicit_header_with_provenance():
+    header_page = {
+        "table_id": "cash-flow-continuation",
+        "filename": "report.pdf",
+        "page_number": 10,
+        "title": "Consolidated Statements of Cash Flows",
+        "columns": ["Metric", "value_1", "value_2"],
+        "rows": [
+            {"Metric": "Net income", "value_1": "120", "value_2": "100"},
+            {"Metric": "Depreciation and amortization", "value_1": "30", "value_2": "25"},
+        ],
+        "evidence_page_context": (
+            "Consolidated Statements of Cash Flows\n"
+            "Year Ended December 31, 2024 2023\n"
+            "Net income 120 100\n"
+            "Depreciation and amortization 30 25"
+        ),
+    }
+    continuation = {
+        "table_id": "cash-flow-continuation",
+        "filename": "report.pdf",
+        "page_number": 11,
+        "title": "Consolidated Statements of Cash Flows (continued)",
+        "columns": ["Metric", "value_1", "value_2"],
+        "rows": [
+            {"Metric": "Capital expenditures", "value_1": "(40)", "value_2": "(35)"},
+            {"Metric": "Net cash provided by operating activities", "value_1": "150", "value_2": "130"},
+        ],
+    }
+
+    frames, _ = build_evidence_frames([header_page, continuation])
+    continued = [frame for frame in frames if frame["page_number"] == 11]
+
+    assert {frame["period"] for frame in continued} == {"2024", "2023"}
+    assert all(frame["period_provenance"]["source"] == "same_table_continuation" for frame in continued)
+    assert all(frame["period_provenance"]["inherited_from_page"] == 10 for frame in continued)
 
 
 def test_quality_rejected_table_can_be_recovered_only_with_stable_primary_statement_rows():

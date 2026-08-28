@@ -42,6 +42,7 @@ class EvidenceFrame:
     column_label: str
     column_path: list[str]
     period: str | None
+    period_provenance: dict[str, Any] | None
     raw_value: str
     normalized_value: str
     currency: str | None
@@ -266,6 +267,8 @@ def _column_schema(
     table: dict[str, Any],
     normalized: dict[str, Any],
     value_columns: list[str],
+    inherited_periods: list[str] | None = None,
+    inherited_from_page: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     schema_by_label = {
         _clean(item.get("label")): item
@@ -277,11 +280,48 @@ def _column_schema(
         for column in value_columns
     }
     recovered_periods = _explicit_header_periods(table, normalized, value_columns)
-    if recovered_periods:
-        for column, period in zip(value_columns, recovered_periods):
+    period_source = "matched_page_explicit_header"
+    periods = recovered_periods
+    if not periods and inherited_periods and len(inherited_periods) == len(value_columns):
+        periods = inherited_periods
+        period_source = "same_table_continuation"
+    if periods:
+        for column, period in zip(value_columns, periods):
             if not _YEAR.search(" | ".join([*schema[column].get("path", []), str(schema[column].get("label") or "")])):
-                schema[column] = {**schema[column], "label": period, "path": [period]}
+                provenance = {
+                    "source": period_source,
+                    "table_id": _clean(table.get("table_id")),
+                    "page_number": int(table.get("evidence_page_number") or table.get("page_number") or 0),
+                }
+                if inherited_from_page is not None:
+                    provenance["inherited_from_page"] = inherited_from_page
+                schema[column] = {
+                    **schema[column],
+                    "label": period,
+                    "path": [period],
+                    "period_provenance": provenance,
+                }
     return schema
+
+
+def _period_provenance(
+    schema_item: dict[str, Any],
+    column_label: str,
+    column_path: list[str],
+    table: dict[str, Any],
+) -> dict[str, Any] | None:
+    explicit = schema_item.get("period_provenance")
+    if isinstance(explicit, dict):
+        return dict(explicit)
+    header = " | ".join([*column_path, column_label])
+    if not _YEAR.search(header):
+        return None
+    return {
+        "source": "column_schema",
+        "table_id": _clean(table.get("table_id")),
+        "page_number": int(table.get("evidence_page_number") or table.get("page_number") or 0),
+        "header": header,
+    }
 
 
 def is_evidence_frame_eligible_table(table: dict[str, Any]) -> bool:
@@ -304,6 +344,7 @@ def build_evidence_frames(
     frames: list[dict[str, Any]] = []
     skipped = {"unsupported_statement": 0, "unstructured_table": 0, "non_numeric_value": 0}
     accepted_tables = 0
+    explicit_periods_by_table: dict[str, tuple[str, int, list[str]]] = {}
     for table in tables or []:
         if not is_evidence_frame_eligible_table(table):
             continue
@@ -320,11 +361,29 @@ def build_evidence_frames(
         accepted_tables += 1
         metric_column = columns[0]
         value_columns = list(columns[1:])
-        schema = _column_schema(table, normalized, value_columns)
-        context = _table_text(table, normalized)
         table_id = _clean(table.get("table_id"))
         filename = _clean(table.get("filename"))
         page_number = int(table.get("evidence_page_number") or table.get("page_number") or 0)
+        inherited_periods: list[str] | None = None
+        inherited_from_page: int | None = None
+        inherited = explicit_periods_by_table.get(table_id) if table_id else None
+        if inherited and inherited[0] == filename and page_number == inherited[1] + 1:
+            inherited_periods = inherited[2]
+            inherited_from_page = inherited[1]
+        schema = _column_schema(
+            table,
+            normalized,
+            value_columns,
+            inherited_periods=inherited_periods,
+            inherited_from_page=inherited_from_page,
+        )
+        schema_periods = [
+            _period(column, [_clean(value) for value in (schema[column].get("path") or [column]) if _clean(value)])
+            for column in value_columns
+        ]
+        if table_id and all(schema_periods):
+            explicit_periods_by_table[table_id] = (filename, page_number, [str(item) for item in schema_periods])
+        context = _table_text(table, normalized)
         section = _clean(normalized.get("normalized_title") or table.get("title") or table.get("caption")) or None
         table_title = _clean(table.get("title") or table.get("caption") or normalized.get("normalized_title")) or None
         scope = _scope(context)
@@ -375,6 +434,12 @@ def build_evidence_frames(
                     column_label=column_label,
                     column_path=column_path or [column_label],
                     period=period,
+                    period_provenance=_period_provenance(
+                        schema_item,
+                        column_label,
+                        column_path or [column_label],
+                        table,
+                    ),
                     raw_value=raw_value,
                     normalized_value=normalized_value,
                     currency=_currency(raw_value, context),

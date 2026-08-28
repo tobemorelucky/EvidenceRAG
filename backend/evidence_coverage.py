@@ -136,6 +136,35 @@ def assess_structured_coverage(
         from calculation_service import resolve_selection_frames
         operands_validated = bool(resolve_selection_frames(task_spec, frames))
 
+    operation = str(task_spec.get("operation") or "")
+    operation_confident = float(task_spec.get("operation_confidence", 1.0) or 0.0) >= 0.8
+    if task_type == "calculation":
+        operation_validated = operation_confident and operation not in {"", "select"}
+    elif task_type == "comparison":
+        operation_validated = operation_confident and operation in {"compare", "percentage_change", "subtract"}
+    else:
+        operation_validated = (
+            operation_confident
+            and operation in {"argmax", "argmin"}
+            and bool(task_spec.get("candidate_dimension"))
+            and bool(task_spec.get("target_measure"))
+        )
+    metadata_validated = bool(unit_scale_supported and scope_supported)
+    period_semantics_validated = (
+        "period_semantics_confidence" not in task_spec
+        or len(required_periods) < 2
+        or float(task_spec.get("period_semantics_confidence") or 0.0) >= 0.8
+    )
+    structured_gate_trace = {
+        "frame_matched": bool(relevant_frames),
+        "measure_validated": bool(row_supported),
+        "period_validated": bool(period_supported and period_semantics_validated),
+        "metadata_validated": metadata_validated,
+        "operand_unique": bool(operands_validated),
+        "operation_validated": operation_validated,
+    }
+    execution_ready = page_supported and all(structured_gate_trace.values())
+
     missing = []
     dimensions = {
         "page_supported": page_supported,
@@ -164,12 +193,16 @@ def assess_structured_coverage(
         failure_reason = "missing_required_concept"
     elif not period_supported:
         failure_reason = "period_not_resolved"
+    elif not period_semantics_validated:
+        failure_reason = "period_order_ambiguous"
     elif not unit_scale_supported:
         failure_reason = "unit_or_scale_not_validated"
     elif not scope_supported:
         failure_reason = "scope_not_validated"
     elif not operands_validated:
         failure_reason = "operands_not_unique_or_complete"
+    elif not operation_validated:
+        failure_reason = "operation_not_validated"
     frame_candidates = [candidate for trace in match_traces for candidate in trace.get("candidates") or []]
     best_candidate = max(frame_candidates, key=lambda item: float(item.get("match_score") or 0), default={})
     return {
@@ -179,7 +212,8 @@ def assess_structured_coverage(
         "status": status,
         "structured_status": structured_status,
         "structured_answerable": structured_answerable,
-        "structured_execution_ready": structured_answerable,
+        "structured_execution_ready": execution_ready,
+        "structured_gate_trace": structured_gate_trace,
         "structured_advisory_mode": advisory,
         "structured_missing": missing,
         "coverage_basis": "evidence_frame",

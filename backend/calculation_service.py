@@ -309,6 +309,139 @@ def _compatible_matrix(frames: List[dict]) -> bool:
     return True
 
 
+def _requested_operation(task_spec: Dict[str, object]) -> str:
+    operation = str(task_spec.get("operation") or "").strip().lower()
+    if operation:
+        return operation
+    task_type = str(task_spec.get("task_type") or "")
+    if task_type == "comparison":
+        return "compare"
+    if task_type == "selection":
+        return "argmax" if task_spec.get("selection_direction") == "max" else "argmin"
+    formula = str(task_spec.get("formula") or "")
+    return "divide" if "/" in formula else "multiply" if "*" in formula else "subtract" if "-" in formula else "sum" if "+" in formula else "select"
+
+
+def _semantic_period_order(task_spec: Dict[str, object]) -> List[str]:
+    explicit = [str(item) for item in task_spec.get("period_order") or [] if str(item)]
+    if explicit:
+        return explicit
+    return [str(item) for item in task_spec.get("required_periods") or [] if str(item)]
+
+
+def validate_execution_contract(
+    task_spec: Dict[str, object],
+    result: Dict[str, object],
+    operand_frames: List[dict],
+) -> Dict[str, object]:
+    """Gate structured authority using the question contract and operand provenance."""
+    requested_operation = _requested_operation(task_spec)
+    actual_operation = str(result.get("operation") or "").strip().lower()
+    operation_match = bool(requested_operation and actual_operation == requested_operation)
+    operation_confident = float(task_spec.get("operation_confidence", 1.0) or 0.0) >= 0.8
+
+    required_periods = [str(item) for item in task_spec.get("required_periods") or [] if str(item)]
+    frame_periods = [str(frame.get("period") or "") for frame in operand_frames]
+    period_match = all(period and period in frame_periods for period in required_periods)
+    requested_order = _semantic_period_order(task_spec)
+    resolved_order = [str(item) for item in result.get("resolved_period_order") or [] if str(item)]
+    period_semantics_match = (
+        "period_semantics_confidence" not in task_spec
+        or float(task_spec.get("period_semantics_confidence") or 0.0) >= 0.8
+    )
+    period_order_match = (not requested_order or resolved_order == requested_order) and period_semantics_match
+
+    matched_ids = {
+        str(frame.get("evidence_id") or "")
+        for frame in _task_frame_matches(task_spec, operand_frames)
+    }
+    operand_ids = {str(frame.get("evidence_id") or "") for frame in operand_frames}
+    measure_match = bool(operand_ids) and operand_ids <= matched_ids
+
+    expected_company = _normalized_label(task_spec.get("company"))
+    companies = {_normalized_label(frame.get("company")) for frame in operand_frames if frame.get("company")}
+    company_match = bool(companies) and len(companies) == 1 and (
+        not expected_company or companies == {expected_company}
+    )
+    expected_scope = _normalized_label(task_spec.get("scope"))
+    scopes = {_normalized_label(frame.get("scope")) for frame in operand_frames if frame.get("scope")}
+    scope_match = bool(scopes) and len(scopes) == 1 and (
+        not expected_scope or scopes == {expected_scope}
+    )
+    currencies = {str(frame.get("currency") or "").casefold() for frame in operand_frames}
+    scales = {str(frame.get("scale") or "").casefold() for frame in operand_frames}
+    metadata_compatible = (
+        company_match
+        and scope_match
+        and "" not in currencies
+        and "" not in scales
+        and len(currencies) == 1
+        and len(scales) == 1
+    )
+
+    requested_unit = str(task_spec.get("result_unit") or "").casefold()
+    actual_unit = str(result.get("unit") or result.get("result_unit") or "").casefold()
+    if requested_operation == "percentage_change":
+        unit_match = requested_unit == "percent" and actual_unit == "percent"
+    elif requested_unit:
+        unit_match = actual_unit == requested_unit
+    else:
+        unit_match = True
+    requested_rounding = task_spec.get("rounding_decimal_places")
+    actual_rounding = result.get("rounding")
+    if actual_rounding is None:
+        actual_rounding = result.get("rounding_decimal_places")
+    rounding_match = requested_rounding is None or (
+        actual_rounding == requested_rounding
+        and result.get("display_result") not in (None, "")
+    )
+    if requested_operation == "compare":
+        output_contract_match = str(result.get("direction") or "") in {"greater", "less", "equal"}
+    elif requested_operation in {"argmax", "argmin"}:
+        output_contract_match = bool(result.get("selected_evidence_id"))
+    else:
+        output_contract_match = result.get("result") not in (None, "")
+
+    checks = {
+        "operation_match": operation_match,
+        "operation_confident": operation_confident,
+        "period_match": period_match,
+        "period_semantics_match": period_semantics_match,
+        "period_order_match": period_order_match,
+        "measure_match": measure_match,
+        "company_match": company_match,
+        "scope_match": scope_match,
+        "metadata_compatible": metadata_compatible,
+        "unit_match": unit_match,
+        "rounding_match": rounding_match,
+        "output_contract_match": output_contract_match,
+    }
+    reason_by_check = {
+        "operation_match": "operation_mismatch",
+        "operation_confident": "operation_ambiguous",
+        "period_match": "required_period_missing",
+        "period_semantics_match": "period_order_ambiguous",
+        "period_order_match": "period_order_mismatch",
+        "measure_match": "target_measure_ambiguous",
+        "company_match": "company_mismatch",
+        "scope_match": "scope_mismatch",
+        "metadata_compatible": "metadata_incompatible",
+        "unit_match": "unit_mismatch",
+        "rounding_match": "rounding_mismatch",
+        "output_contract_match": "output_contract_mismatch",
+    }
+    failures = [reason_by_check[name] for name, passed in checks.items() if not passed]
+    return {
+        "passed": not failures,
+        "requested_operation": requested_operation,
+        "actual_operation": actual_operation,
+        "requested_period_order": requested_order,
+        "resolved_period_order": resolved_order,
+        **checks,
+        "failure_reasons": failures,
+    }
+
+
 def resolve_comparison_frames(task_spec: Dict[str, object], evidence_frames: List[dict]) -> List[dict]:
     """Resolve exactly one compatible value for each explicitly requested period."""
     periods = [str(item) for item in task_spec.get("required_periods") or []]
@@ -337,7 +470,11 @@ def resolve_comparison_frames(task_spec: Dict[str, object], evidence_frames: Lis
 
 def resolve_selection_frames(task_spec: Dict[str, object], evidence_frames: List[dict]) -> List[dict]:
     """Resolve a complete, same-table candidate matrix without inventing members."""
-    if not task_spec.get("candidate_dimension") or task_spec.get("selection_direction") not in {"max", "min"}:
+    if (
+        not task_spec.get("candidate_dimension")
+        or task_spec.get("selection_direction") not in {"max", "min"}
+        or ("target_measure_explicit" in task_spec and not task_spec.get("target_measure_explicit"))
+    ):
         return []
     periods = [str(item) for item in task_spec.get("required_periods") or []]
     candidates = _task_frame_matches(task_spec, evidence_frames)
@@ -368,27 +505,48 @@ def _build_non_calculation_frame_result(
     task_type = str(task_spec.get("task_type") or "")
     if task_type == "comparison":
         selected = resolve_comparison_frames(task_spec, evidence_frames)
-        operation = "compare"
+        operation = _requested_operation(task_spec)
+        if operation not in {"compare", "percentage_change", "subtract"}:
+            return None
     elif task_type == "selection":
         selected = resolve_selection_frames(task_spec, evidence_frames)
-        operation = "argmax" if task_spec.get("selection_direction") == "max" else "argmin"
+        operation = _requested_operation(task_spec)
+        if operation not in {"argmax", "argmin"}:
+            return None
     else:
         return None
     if not selected:
         return None
+    requested_order = _semantic_period_order(task_spec)
+    baseline_period = str(task_spec.get("baseline_period") or "")
+    target_period = str(task_spec.get("target_period") or "")
+    semantic_selected = list(selected)
+    execution_selected = list(selected)
+    if task_type == "comparison" and baseline_period and target_period:
+        by_period = {str(item.get("period") or ""): item for item in selected}
+        if baseline_period in by_period and target_period in by_period:
+            semantic_selected = [by_period[baseline_period], by_period[target_period]]
+            execution_selected = [by_period[target_period], by_period[baseline_period]]
     try:
         result = execute_financial_operation(
             operation,
             evidence_frames,
-            operand_evidence_ids=[str(item["evidence_id"]) for item in selected],
+            operand_evidence_ids=[str(item["evidence_id"]) for item in execution_selected],
             rounding=task_spec.get("rounding_decimal_places"),
-            unit=str(task_spec.get("result_unit") or selected[0].get("scale") or ""),
+            unit=str(task_spec.get("result_unit") or execution_selected[0].get("scale") or ""),
         )
     except FinancialExecutionError:
         return None
     result["source"] = "evidence_frame_decimal"
     result["task_type"] = task_type
-    result["authoritative"] = True
+    result["authoritative"] = False
+    result["requested_period_order"] = requested_order
+    result["resolved_period_order"] = list(dict.fromkeys(
+        str(item.get("period") or "") for item in semantic_selected if item.get("period")
+    ))
+    if task_type == "comparison" and len(semantic_selected) == 2:
+        result["baseline_value"] = str(semantic_selected[0].get("normalized_value") or "")
+        result["target_value"] = str(semantic_selected[1].get("normalized_value") or "")
     result["candidate_matrix"] = [
         {
             "evidence_id": item.get("evidence_id"),
@@ -403,16 +561,23 @@ def _build_non_calculation_frame_result(
             "document": item.get("document"),
             "page_number": item.get("page_number"),
         }
-        for item in selected
+        for item in semantic_selected
     ]
     if task_type == "comparison":
-        result["comparison_direction"] = {
-            "greater": "increased",
-            "less": "decreased",
-            "equal": "unchanged",
-        }.get(str(result.get("direction") or ""), "")
+        if operation == "compare":
+            result["comparison_direction"] = {
+                "greater": "increased",
+                "less": "decreased",
+                "equal": "unchanged",
+            }.get(str(result.get("direction") or ""), "")
+        else:
+            numeric_result = Decimal(str(result.get("result") or "0"))
+            result["comparison_direction"] = "increased" if numeric_result > 0 else "decreased" if numeric_result < 0 else "unchanged"
     else:
         result["selected_entity"] = str((result.get("selected_frame") or {}).get("row_label") or "")
+    contract = validate_execution_contract(task_spec, result, semantic_selected)
+    result["execution_contract"] = contract
+    result["authoritative"] = bool(contract["passed"])
     return result
 
 
@@ -491,7 +656,7 @@ def _build_frame_calculation(
     except ValueError:
         return None
     root_operation = "divide" if "/" in formula else "multiply" if "*" in formula else "subtract" if "-" in formula else "sum"
-    return _with_display_result({
+    result = _with_display_result({
         "formula": formula,
         "operation": root_operation,
         "expression": calculated["expression"],
@@ -505,9 +670,17 @@ def _build_frame_calculation(
         "executor": "evidence_frame",
         "source": "evidence_frame_decimal",
         "task_type": "calculation",
-        "authoritative": True,
+        "authoritative": False,
         "result_unit": task_spec.get("result_unit") or "",
     }, task_spec)
+    result["resolved_period_order"] = list(dict.fromkeys(
+        str(frame.get("period") or "") for frame in operand_frames if frame.get("period")
+    ))
+    result["requested_period_order"] = _semantic_period_order(task_spec)
+    contract = validate_execution_contract(task_spec, result, operand_frames)
+    result["execution_contract"] = contract
+    result["authoritative"] = bool(contract["passed"])
+    return result
 
 
 def _header_periods(lines: List[str], row_index: int, value_count: int) -> List[str]:
@@ -808,6 +981,8 @@ def build_calculation_result(
 def format_calculation_evidence(calculation: Dict[str, object] | None) -> str:
     if not calculation:
         return ""
+    if calculation.get("source") == "evidence_frame_decimal" and not calculation.get("authoritative"):
+        return ""
     lines = ["Validated calculation contract (authoritative Decimal result):"]
     for field, operand in (calculation.get("operands") or {}).items():
         period = f", period {operand.get('period')}" if operand.get("period") else ""
@@ -890,6 +1065,11 @@ def _authoritative_template(task_spec: Dict[str, object], calculation: Dict[str,
             for item in matrix
         )
         direction = str(calculation.get("comparison_direction") or "")
+        operation = str(calculation.get("operation") or "")
+        if operation in {"percentage_change", "subtract"}:
+            result = str(calculation.get("display_result") or calculation.get("result") or "")
+            unit = "%" if operation == "percentage_change" else f" {calculation.get('unit') or ''}".rstrip()
+            return f"{values}。{operation} = {result}{unit}，方向：{direction}。 {citation}".strip()
         return f"{values}。比较结果：{direction}。 {citation}".strip()
     if task_type == "selection":
         selected = str(calculation.get("selected_entity") or "")
@@ -916,7 +1096,14 @@ def validate_or_repair_structured_answer(
         "repaired": False,
         "reason": "",
     }
-    if not trace["enabled"] or not trace["authoritative_result"]:
+    if not trace["enabled"]:
+        return answer, trace
+    contract = (calculation or {}).get("execution_contract")
+    if trace["authoritative_result"] and (not isinstance(contract, dict) or not contract.get("passed")):
+        trace["authoritative_result"] = False
+        trace["reason"] = "execution_contract_failed" if isinstance(contract, dict) else "execution_contract_missing"
+        return answer, trace
+    if not trace["authoritative_result"]:
         return answer, trace
     calculation = calculation or {}
     trace["checked"] = True
@@ -930,6 +1117,26 @@ def validate_or_repair_structured_answer(
         tolerance = Decimal("0.000001")
         if not any(abs(item - target) <= tolerance * max(Decimal("1"), abs(target)) for item in actual for target in expected):
             conflict, reason = True, "calculation_result_mismatch"
+    elif task_type == "comparison" and str(calculation.get("operation") or "") in {"percentage_change", "subtract"}:
+        actual = _answer_numbers(answer)
+        expected_values = _result_candidates(calculation)
+        tolerance = Decimal("0.000001")
+        numeric_match = any(
+            abs(item - target) <= tolerance * max(Decimal("1"), abs(target))
+            for item in actual
+            for target in expected_values
+        )
+        expected_direction = str(calculation.get("comparison_direction") or "")
+        direction_terms = {
+            "increased": {"increase", "increased", "grew", "higher"},
+            "decreased": {"decrease", "decreased", "declined", "lower"},
+            "unchanged": {"unchanged", "no change", "equal", "flat"},
+        }
+        has_direction = any(term in normalized_answer for term in direction_terms.get(expected_direction, {expected_direction}))
+        if not numeric_match:
+            conflict, reason = True, "comparison_result_mismatch"
+        elif not has_direction:
+            conflict, reason = True, "comparison_direction_mismatch"
     elif task_type == "comparison":
         expected = str(calculation.get("comparison_direction") or "")
         synonyms = {

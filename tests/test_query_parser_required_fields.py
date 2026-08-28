@@ -341,3 +341,62 @@ def test_company_name_containing_best_does_not_trigger_selection():
     parsed = parse_query("Was there any change in the number of Best Holdings stores between FY2024 and FY2023?")
 
     assert parsed["task_type"] == "comparison"
+
+
+def test_percentage_change_operation_is_independent_from_comparison_task_type():
+    parsed = parse_query(
+        "What is the year-over-year percentage change in operating income from FY2015 to FY2016?"
+    )
+
+    assert parsed["task_type"] == "comparison"
+    assert parsed["operation"] == "percentage_change"
+    assert parsed["baseline_period"] == "2015"
+    assert parsed["target_period"] == "2016"
+    assert parsed["period_order"] == ["2015", "2016"]
+    assert parsed["result_unit"] == "percent"
+
+
+def test_yoy_change_with_percent_output_unit_requests_percentage_change():
+    parsed = parse_query(
+        "What is the year-over-year change in unadjusted operating income from FY2015 to FY2016 "
+        "(in units of percents and round to one decimal place)?"
+    )
+
+    assert parsed["operation"] == "percentage_change"
+    assert parsed["result_unit"] == "percent"
+    assert parsed["rounding_decimal_places"] == 1
+
+
+def test_directional_and_absolute_change_choose_different_existing_operations():
+    direction = parse_query("Did revenue increase from FY2022 to FY2023?")
+    difference = parse_query("By how many dollars did revenue change from FY2022 to FY2023?")
+
+    assert direction["operation"] == "compare"
+    assert difference["operation"] == "subtract"
+    assert direction["baseline_period"] == difference["baseline_period"] == "2022"
+    assert direction["target_period"] == difference["target_period"] == "2023"
+
+
+def test_between_periods_preserves_list_order_but_does_not_invent_direction():
+    parsed = parse_query("Was revenue higher between FY2023 and FY2024?")
+
+    assert parsed["period_order"] == ["2023", "2024"]
+    assert parsed["baseline_period"] == ""
+    assert parsed["target_period"] == ""
+    assert parsed["period_semantics_confidence"] < 0.8
+
+
+def test_ambiguous_best_does_not_request_authoritative_argmax():
+    parsed = parse_query("Which segment performed best in FY2022?")
+
+    assert parsed["task_type"] == "selection"
+    assert parsed["operation"] == "select"
+    assert parsed["operation_confidence"] < 0.8
+
+
+def test_explicit_selection_measure_can_request_argmax():
+    parsed = parse_query("Which segment had the highest revenue in FY2022?")
+
+    assert parsed["operation"] == "argmax"
+    assert parsed["candidate_dimension"] == "segment"
+    assert parsed["operation_confidence"] >= 0.8

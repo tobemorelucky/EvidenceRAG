@@ -476,20 +476,24 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             for frame in evidence_frames
         )
         supplemental_trace["coverage_after"] = evidence_coverage
-        status_rank = {"insufficient": 0, "incomplete": 0, "partial": 1, "complete": 2}
         coverage_before = supplemental_trace.get("coverage_before") or {}
-        coverage_improved = (
-            status_rank.get(str(evidence_coverage.get("status") or ""), 0)
-            > status_rank.get(str(coverage_before.get("status") or ""), 0)
-            or len(evidence_coverage.get("missing_fields") or [])
-            < len(coverage_before.get("missing_fields") or [])
-            or int(evidence_coverage.get("relevant_frame_count") or 0)
-            > int(coverage_before.get("relevant_frame_count") or 0)
+        requirement_improvements = []
+        for name in ("missing_fields", "missing_periods", "structured_missing"):
+            before_missing = {str(item) for item in coverage_before.get(name) or []}
+            after_missing = {str(item) for item in evidence_coverage.get(name) or []}
+            requirement_improvements.extend(f"resolved:{name}:{item}" for item in sorted(before_missing - after_missing))
+        before_gates = coverage_before.get("structured_gate_trace") or {}
+        after_gates = evidence_coverage.get("structured_gate_trace") or {}
+        requirement_improvements.extend(
+            f"gate:{gate}"
+            for gate, supported in after_gates.items()
+            if supported is True and before_gates.get(gate) is not True
         )
+        requirement_improvements = list(dict.fromkeys(requirement_improvements))
+        coverage_improved = bool(requirement_improvements)
         supplemental_trace["coverage_improved"] = coverage_improved
-        supplemental_trace["supplemental_effective"] = bool(
-            supplemental_trace.get("new_evidence_hashes") or coverage_improved
-        )
+        supplemental_trace["supplemental_requirement_improvements"] = requirement_improvements
+        supplemental_trace["supplemental_effective"] = coverage_improved
     calculation = build_calculation_result(
         query_parse,
         evidence_coverage,
@@ -514,6 +518,9 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             "frame_match_score": evidence_coverage.get("frame_match_score") or 0.0,
             "relevant_frame_count": evidence_coverage.get("relevant_frame_count") or 0,
             "operand_resolution_failure_reason": evidence_coverage.get("operand_resolution_failure_reason") or "",
+            "structured_gate_trace": evidence_coverage.get("structured_gate_trace") or {},
+            "execution_contract": (calculation or {}).get("execution_contract") or {},
+            "structured_authoritative": bool((calculation or {}).get("authoritative")),
             "calculation": calculation,
             "trace_id": str(uuid.uuid4()),
             "prompt_version": PROMPT_VERSION,

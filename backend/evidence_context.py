@@ -18,6 +18,12 @@ _TABLE_HEADER = re.compile(
     r"january|february|march|april|may|june|july|august|september|october|november|december)\b",
     re.IGNORECASE,
 )
+_QUARTER_VARIANTS = {
+    "q1": ("q1", "first quarter"),
+    "q2": ("q2", "second quarter"),
+    "q3": ("q3", "third quarter"),
+    "q4": ("q4", "fourth quarter"),
+}
 _STOP_TERMS = {
     "about", "after", "based", "between", "company", "does", "from", "have", "into",
     "million", "please", "question", "report", "the", "their", "this", "using", "what",
@@ -137,6 +143,117 @@ def _line_score(
     if re.search(r"\b(?:in millions|in thousands|year ended|at december|quarter ended)\b", lowered):
         score += 4
     return float(score)
+
+
+def _protected_candidate_score(
+    item: tuple[float, int, dict, str, set[str]],
+    task_spec: Dict[str, object],
+    *,
+    field: str = "",
+    period: str = "",
+) -> tuple[float, int]:
+    """Rank protected slots by QuerySpec evidence quality, not retrieval score alone."""
+    base_score, rank, document, snippet, field_hits = item
+    text = str(document.get("text") or document.get("page_text") or "")
+    lowered = text.casefold()
+    aliases = [alias.casefold() for alias in FIELD_ALIASES.get(field, [])]
+    if not aliases:
+        aliases = _required_aliases(task_spec)
+    if not aliases:
+        target = str(task_spec.get("target_measure") or "").casefold().strip()
+        aliases = [target] if target else []
+    concept_match = field in field_hits or any(alias and alias in lowered for alias in aliases)
+    required_periods = [str(value) for value in task_spec.get("required_periods") or []]
+    period_match = not period or _contains_period(lowered, period)
+    period_hits = sum(_contains_period(lowered, value) for value in required_periods)
+    required_quarters = [value for value in required_periods if value.casefold() in _QUARTER_VARIANTS]
+    quarter_context_match = not required_quarters or all(
+        _contains_period(lowered, value) for value in required_quarters
+    )
+    same_line_match = any(
+        any(alias and alias in line.casefold() for alias in aliases)
+        and (not period or _contains_period(line.casefold(), period))
+        and bool(_FINANCIAL_NUMBER.search(line))
+        for line in _split_lines(text)
+    )
+    scope = str(task_spec.get("scope") or "").replace("_", " ").casefold().strip()
+    scope_match = not scope or scope in lowered
+    statement_markers = {
+        "balance_sheet": ("balance sheet", "financial position"),
+        "income_statement": ("statement of income", "statement of operations", "statement of earnings"),
+        "cash_flow": ("statement of cash flows",),
+    }
+    expected_statements = [str(item) for item in task_spec.get("statement_types") or []]
+    statement_match = not expected_statements or any(
+        any(marker in lowered for marker in statement_markers.get(statement, (statement.replace("_", " "),)))
+        for statement in expected_statements
+    )
+    quality = (
+        base_score
+        + 50 * int(concept_match)
+        + 25 * int(period_match)
+        + 12 * period_hits
+        + 35 * int(quarter_context_match)
+        - 80 * int(not quarter_context_match)
+        + 70 * int(same_line_match)
+        + 100 * int(bool(period) and same_line_match)
+        - 50 * int(bool(period) and not same_line_match)
+        + 15 * int(scope_match)
+        + 20 * int(statement_match)
+    )
+    return quality, -rank
+
+
+def _contains_period(text: str, period: str) -> bool:
+    """Match explicit period semantics without treating any year mention as a quarter hit."""
+    normalized_text = str(text or "").casefold()
+    normalized_period = str(period or "").casefold().strip()
+    variants = _QUARTER_VARIANTS.get(normalized_period)
+    if variants:
+        return any(re.search(rf"\b{re.escape(value)}\b", normalized_text) for value in variants)
+    if re.fullmatch(r"(?:19|20)\d{2}", normalized_period):
+        return bool(re.search(
+            rf"\b(?:fy\s*|fiscal(?:\s+year)?\s+)?{re.escape(normalized_period)}\b",
+            normalized_text,
+        ))
+    return bool(normalized_period and re.search(rf"\b{re.escape(normalized_period)}\b", normalized_text))
+
+
+def _has_required_period_qualifiers(text: str, task_spec: Dict[str, object]) -> bool:
+    """Require requested quarter/half-year qualifiers on protected period pages."""
+    required_periods = [str(value) for value in task_spec.get("required_periods") or []]
+    qualifiers = [value for value in required_periods if value.casefold() in _QUARTER_VARIANTS]
+    return all(_contains_period(text, value) for value in qualifiers)
+
+
+def _period_concept_window_match(
+    text: str,
+    task_spec: Dict[str, object],
+    *,
+    period: str = "",
+    radius: int = 8,
+) -> bool:
+    """Require measure, numeric value, and period semantics in one local table/text region."""
+    aliases = _required_aliases(task_spec)
+    target = str(task_spec.get("target_measure") or "").casefold().strip()
+    if target:
+        aliases.append(target)
+    aliases = list(dict.fromkeys(alias for alias in aliases if alias))
+    if not aliases:
+        return False
+    lines = _split_lines(text)
+    required_periods = [str(value) for value in task_spec.get("required_periods") or []]
+    qualifiers = [value for value in required_periods if value.casefold() in _QUARTER_VARIANTS]
+    for index, line in enumerate(lines):
+        lowered_line = line.casefold()
+        if not any(alias in lowered_line for alias in aliases) or not _FINANCIAL_NUMBER.search(line):
+            continue
+        window = "\n".join(lines[max(0, index - radius) : min(len(lines), index + radius + 1)])
+        if period and not _contains_period(window, period):
+            continue
+        if all(_contains_period(window, qualifier) for qualifier in qualifiers):
+            return True
+    return False
 
 
 def _compact_document(
@@ -369,11 +486,29 @@ def build_compact_evidence(
         selected.append(item)
         selected_pages.add(page_key)
 
-    for field in task_spec.get("required_fields") or []:
+    task_type = str(task_spec.get("task_type") or "")
+    protected_fields = list(task_spec.get("required_fields") or [])
+    if protected_slots_enabled and task_type not in {"calculation", "comparison", "selection"}:
+        protected_fields = []
+    for field in protected_fields:
         field_candidates = [item for item in candidates if str(field) in item[4]]
+        if protected_slots_enabled and task_type in {"calculation", "comparison"}:
+            qualified_candidates = [
+                item for item in field_candidates
+                if _has_required_period_qualifiers(str(item[2].get("text") or ""), task_spec)
+                and (
+                    not any(str(value).casefold() in _QUARTER_VARIANTS for value in periods)
+                    or _period_concept_window_match(str(item[2].get("text") or ""), task_spec)
+                )
+            ]
+            if qualified_candidates:
+                field_candidates = qualified_candidates
         if not field_candidates:
             continue
-        best = max(field_candidates, key=lambda item: (item[0], -item[1]))
+        best = max(
+            field_candidates,
+            key=lambda item: _protected_candidate_score(item, task_spec, field=str(field)),
+        )
         page_key = (str(best[2].get("filename") or ""), best[2].get("page_number"))
         if protected_slots_enabled:
             protect(best, f"required_operand:{field}")
@@ -384,10 +519,27 @@ def build_compact_evidence(
         for period in periods:
             period_candidates = [
                 item for item in candidates
-                if period.casefold() in str(item[2].get("text") or "").casefold()
+                if _contains_period(str(item[2].get("text") or ""), period)
+                and _has_required_period_qualifiers(str(item[2].get("text") or ""), task_spec)
+                and (
+                    not any(str(value).casefold() in _QUARTER_VARIANTS for value in periods)
+                    or _period_concept_window_match(
+                        str(item[2].get("text") or ""), task_spec, period=period,
+                    )
+                )
+                and (
+                    not task_spec.get("required_fields")
+                    or bool(item[4] & {str(field) for field in task_spec.get("required_fields") or []})
+                )
             ]
             if period_candidates:
-                protect(max(period_candidates, key=lambda item: (item[0], -item[1])), f"required_period:{period}")
+                protect(
+                    max(
+                        period_candidates,
+                        key=lambda item: _protected_candidate_score(item, task_spec, period=period),
+                    ),
+                    f"required_period:{period}",
+                )
     if protected_slots_enabled and task_spec.get("task_type") == "selection":
         matrix_pages = {
             (str(item.get("document") or ""), item.get("page_number"))
@@ -398,13 +550,35 @@ def build_compact_evidence(
             item for item in candidates
             if (str(item[2].get("filename") or ""), item[2].get("page_number")) in matrix_pages
         ]
-        if not selection_candidates:
+        if not selection_candidates and task_spec.get("target_measure_explicit"):
             selection_candidates = [
                 item for item in candidates
                 if len(_FINANCIAL_NUMBER.findall(str(item[2].get("text") or ""))) >= 2
+                and str(task_spec.get("target_measure") or "").casefold()
+                in str(item[2].get("text") or "").casefold()
             ]
         if selection_candidates:
-            protect(max(selection_candidates, key=lambda item: (item[0], -item[1])), "selection_candidate_matrix")
+            protect(
+                max(selection_candidates, key=lambda item: _protected_candidate_score(item, task_spec)),
+                "selection_candidate_matrix",
+            )
+    if (
+        protected_slots_enabled
+        and task_type == "lookup"
+        and task_spec.get("target_measure_explicit")
+        and task_spec.get("target_measure")
+    ):
+        target = str(task_spec.get("target_measure") or "").casefold()
+        lookup_candidates = [
+            item for item in candidates
+            if target in str(item[2].get("text") or "").casefold()
+            and bool(_FINANCIAL_NUMBER.search(str(item[2].get("text") or "")))
+        ]
+        if lookup_candidates:
+            protect(
+                max(lookup_candidates, key=lambda item: _protected_candidate_score(item, task_spec)),
+                "lookup_target_measure",
+            )
     # Enumeration and numeric-table questions are especially vulnerable to
     # glossary, contents, and nearby-but-irrelevant pages occupying the answer
     # budget. Preserve a small retrieval-order safety net, then let task-aware

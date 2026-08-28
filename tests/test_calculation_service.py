@@ -1,4 +1,8 @@
-from calculation_service import build_calculation_result, match_evidence_frames_detailed
+from calculation_service import (
+    build_calculation_result,
+    match_evidence_frames_detailed,
+    validate_execution_contract,
+)
 
 
 def _evidence_frame(evidence_id, row_label, value, *, period="2024"):
@@ -81,6 +85,96 @@ def test_comparison_executor_builds_auditable_period_pair(monkeypatch):
     assert result["candidate_matrix"][0]["period"] == "2024"
 
 
+def test_percentage_change_uses_target_then_baseline_but_preserves_requested_period_order(monkeypatch):
+    monkeypatch.setenv("FRAME_ALIGNMENT_ENABLED", "true")
+    monkeypatch.setenv("STRUCTURED_TASK_EXECUTOR_ENABLED", "true")
+    baseline = _evidence_frame("ef_2015", "Operating income", "903095", period="2015")
+    target = _evidence_frame("ef_2016", "Operating income", "1493602", period="2016")
+    task = {
+        "task_type": "comparison",
+        "company": "Example Co",
+        "target_measure": "operating income",
+        "required_fields": ["operating_income"],
+        "required_periods": ["2015", "2016"],
+        "baseline_period": "2015",
+        "target_period": "2016",
+        "period_order": ["2015", "2016"],
+        "operation": "percentage_change",
+        "operation_confidence": 1.0,
+        "result_unit": "percent",
+        "rounding_decimal_places": 1,
+    }
+
+    result = build_calculation_result(task, {"status": "complete"}, [], evidence_frames=[target, baseline])
+
+    assert result["operation"] == "percentage_change"
+    assert result["display_result"] == "65.4"
+    assert result["requested_period_order"] == ["2015", "2016"]
+    assert result["resolved_period_order"] == ["2015", "2016"]
+    assert result["baseline_value"] == "903095"
+    assert result["target_value"] == "1493602"
+    assert result["authoritative"] is True
+    assert result["execution_contract"]["passed"] is True
+
+
+def test_wrong_operation_result_never_becomes_authoritative():
+    task = {
+        "task_type": "comparison",
+        "operation": "percentage_change",
+        "operation_confidence": 1.0,
+        "required_periods": ["2015", "2016"],
+        "baseline_period": "2015",
+        "target_period": "2016",
+        "period_order": ["2015", "2016"],
+        "target_measure": "operating income",
+        "required_concepts": ["operating income"],
+        "result_unit": "percent",
+    }
+    frames = [
+        _evidence_frame("ef_2015", "Operating income", "90", period="2015"),
+        _evidence_frame("ef_2016", "Operating income", "150", period="2016"),
+    ]
+    result = {
+        "operation": "compare",
+        "unit": "percent",
+        "rounding": None,
+        "candidate_matrix": frames,
+        "requested_period_order": ["2015", "2016"],
+        "resolved_period_order": ["2015", "2016"],
+    }
+
+    contract = validate_execution_contract(task, result, frames)
+
+    assert contract["passed"] is False
+    assert contract["operation_match"] is False
+    assert "operation_mismatch" in contract["failure_reasons"]
+
+
+def test_unknown_period_result_never_becomes_authoritative():
+    task = {
+        "task_type": "comparison",
+        "operation": "compare",
+        "operation_confidence": 1.0,
+        "required_periods": ["2023", "2024"],
+        "baseline_period": "2023",
+        "target_period": "2024",
+        "period_order": ["2023", "2024"],
+        "target_measure": "revenue",
+        "required_concepts": ["revenue"],
+    }
+    frames = [
+        _evidence_frame("ef_a", "Revenue", "100", period=None),
+        _evidence_frame("ef_b", "Revenue", "120", period=None),
+    ]
+    result = {"operation": "compare", "candidate_matrix": frames}
+
+    contract = validate_execution_contract(task, result, frames)
+
+    assert contract["passed"] is False
+    assert contract["period_match"] is False
+    assert "required_period_missing" in contract["failure_reasons"]
+
+
 def test_selection_executor_requires_complete_same_table_candidate_matrix(monkeypatch):
     monkeypatch.setenv("FRAME_ALIGNMENT_ENABLED", "true")
     monkeypatch.setenv("STRUCTURED_TASK_EXECUTOR_ENABLED", "true")
@@ -145,6 +239,33 @@ def test_structured_executor_precedes_text_row_parser(monkeypatch):
     assert result["executor"] == "evidence_frame"
     assert result["result"] == "0.25"
     assert result["operand_evidence_ids"] == ["ef_income", "ef_revenue"]
+
+
+def test_formula_executor_rounding_field_satisfies_authoritative_contract(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_EXECUTOR_ENABLED", "true")
+    task_spec = {
+        "task_type": "calculation",
+        "company": "Example Co",
+        "required_periods": ["2024"],
+        "period_order": ["2024"],
+        "required_fields": ["operating_income", "revenue"],
+        "target_measure": "operating margin",
+        "formula": "operating_income / revenue",
+        "operation": "divide",
+        "operation_confidence": 1.0,
+        "result_unit": "decimal",
+        "rounding_decimal_places": 2,
+    }
+    frames = [
+        _evidence_frame("ef_income", "Operating income", "25"),
+        _evidence_frame("ef_revenue", "Revenue", "100"),
+    ]
+
+    result = build_calculation_result(task_spec, {"status": "partial"}, [], evidence_frames=frames)
+
+    assert result["display_result"] == "0.25"
+    assert result["execution_contract"]["rounding_match"] is True
+    assert result["authoritative"] is True
 
 
 def test_structured_executor_does_not_guess_missing_period(monkeypatch):
