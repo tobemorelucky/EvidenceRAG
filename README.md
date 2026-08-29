@@ -68,6 +68,18 @@ conda run --no-capture-output -n rag python -u scripts/run_financebench_local_ex
 
 FinanceBench 评测默认使用本地 CSV、JSONL 和独立 Judge，不访问 LangSmith。`.env` 中的 `FINANCEBENCH_EVALUATION_BACKEND=local`、`LANGSMITH_TRACING=false` 会同时关闭实验上传和应用 tracing。本地入口为 `scripts/run_financebench_local_experiment.py`，完成后会自动调用 `scripts/judge_financebench_local_answers.py`。旧 LangSmith 入口仅作为以后恢复服务时的兼容代码保留。
 
+### 显式公式求解 Skill
+
+`clean_baseline_formula_skill` 是建立在冻结 `clean_baseline` 上的独立实验 profile。它只在问题明确出现 `defined as`、`define ... as`、`calculated as` 或 `formula is` 且表达式可安全解析时触发；不内置 quick ratio、ROA 等标准指标公式。技能最多进行 4 次确定性操作数检索，严格校验公司、期间、报表类型、币种、scale、scope 和唯一性，再使用受限 Decimal AST 计算。成功时直接返回带引用的确定性答案；失败时原 Evidence、clean prompt 和普通回答路径不变。
+
+自动识别并运行显式公式固定回归集：
+
+```powershell
+conda run --no-capture-output -n rag python -u scripts/run_financebench_explicit_formula_skill.py
+```
+
+显式指定 `--split all` 可运行完整 100 题。该 profile 不启用 Formula Advisory、Query Planner、Agent、EvidenceFrame 或标准金融公式库。实现与实验结论见 [`docs/explicit_formula_skill_v1.md`](docs/explicit_formula_skill_v1.md)。
+
 ## 重建 40 份金融文档索引
 
 测试集为 [`data/financebench_top40_100_langsmith_with_evidence.csv`](data/financebench_top40_100_langsmith_with_evidence.csv)，其中恰好引用 40 份 PDF。先执行只读校验：

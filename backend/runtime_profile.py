@@ -7,6 +7,7 @@ from typing import Mapping
 
 
 CLEAN_BASELINE_PROFILE = "clean_baseline"
+EXPLICIT_FORMULA_SKILL_PROFILE = "clean_baseline_formula_skill"
 
 # These values are authoritative for the clean baseline. They intentionally
 # override stale values from .env so an experiment cannot be polluted by a
@@ -42,6 +43,7 @@ CLEAN_BASELINE_OVERRIDES: Mapping[str, str] = {
     "NUMERIC_DISPLAY_VALIDATOR_ENABLED": "false",
     "ANSWER_REQUIRED_FACETS_ENABLED": "false",
     "EXPLICIT_FORMULA_ADVISORY_ENABLED": "false",
+    "EXPLICIT_FORMULA_SKILL_ENABLED": "false",
     "SUPPLEMENTAL_FIND_ENABLED": "false",
     "ENABLE_FINANCE_FORMULA_EXPANSION": "false",
     "RERANK_REMOTE_MAX_ATTEMPTS": "2",
@@ -60,6 +62,7 @@ FEATURE_LABELS: tuple[tuple[str, str], ...] = (
     ("Protected Pages", "PROTECTED_PAGE_SLOTS_ENABLED"),
     ("Stage Coverage", "STAGE_AWARE_COVERAGE_ENABLED"),
     ("Formula Advisory", "EXPLICIT_FORMULA_ADVISORY_ENABLED"),
+    ("Explicit Formula Skill", "EXPLICIT_FORMULA_SKILL_ENABLED"),
     ("Answer Facets", "ANSWER_REQUIRED_FACETS_ENABLED"),
     ("Supplemental Retrieval", "SUPPLEMENTAL_FIND_ENABLED"),
     ("Agent/Planner", "RAG_QUERY_PLANNER_ENABLED"),
@@ -74,11 +77,21 @@ def is_clean_baseline(profile: str | None = None) -> bool:
     return normalize_profile(profile) == CLEAN_BASELINE_PROFILE
 
 
+def uses_clean_baseline_path(profile: str | None = None) -> bool:
+    return normalize_profile(profile) in {CLEAN_BASELINE_PROFILE, EXPLICIT_FORMULA_SKILL_PROFILE}
+
+
 def apply_runtime_profile(profile: str | None = None) -> str:
     """Apply authoritative settings for profiles that require hard isolation."""
     resolved = normalize_profile(profile)
     if resolved == CLEAN_BASELINE_PROFILE:
         os.environ.update(CLEAN_BASELINE_OVERRIDES)
+    elif resolved == EXPLICIT_FORMULA_SKILL_PROFILE:
+        os.environ.update(CLEAN_BASELINE_OVERRIDES)
+        os.environ.update({
+            "RAG_PROFILE": EXPLICIT_FORMULA_SKILL_PROFILE,
+            "EXPLICIT_FORMULA_SKILL_ENABLED": "true",
+        })
     return resolved
 
 

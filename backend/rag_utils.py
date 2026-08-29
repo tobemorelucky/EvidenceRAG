@@ -17,7 +17,7 @@ from cache import cache
 from document_page_store import DocumentPageStore
 from embedding import embedding_service as _embedding_service
 from local_reranker import LocalReranker
-from runtime_profile import is_clean_baseline
+from runtime_profile import uses_clean_baseline_path
 from finance_rag_features import (
     COMPANY_ALIASES,
     FINANCE_METRIC_HINTS,
@@ -1953,7 +1953,7 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
 
 
 def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
-    auto_merge_enabled = AUTO_MERGE_ENABLED and not is_clean_baseline()
+    auto_merge_enabled = AUTO_MERGE_ENABLED and not uses_clean_baseline_path()
     if not auto_merge_enabled or not docs:
         return docs[:top_k], {
             "auto_merge_enabled": auto_merge_enabled,
@@ -4165,7 +4165,7 @@ def retrieve_documents(
     )
     context_docs = list(finalized.get("context_docs", []) or [])
     combined_meta = {**(candidates.get("meta", {}) or {}), **(finalized.get("meta", {}) or {})}
-    clean_baseline = is_clean_baseline()
+    clean_baseline = uses_clean_baseline_path()
     if clean_baseline:
         task_spec = {}
         initial_coverage = {"status": "not_evaluated", "answerable": None}

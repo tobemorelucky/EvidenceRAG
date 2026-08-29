@@ -18,14 +18,14 @@ from conversation_service import storage
 from rag_orchestrator import RetrievalServiceError, prepare_rag_response
 from query_parser import assess_answer_facets
 from tools import set_rag_step_queue
-from runtime_profile import is_clean_baseline
+from runtime_profile import uses_clean_baseline_path
 
 
 INSUFFICIENT_EVIDENCE_MESSAGE = "未检索到足够证据，无法基于当前知识库可靠回答。"
 
 
 def _finalize_generated_answer(answer: str, prepared: dict) -> str:
-    if is_clean_baseline(prepared.get("profile")):
+    if uses_clean_baseline_path(prepared.get("profile")):
         prepared["rag_trace"].update({
             "answer_consistency": {"enabled": False, "checked": False},
             "numeric_display_validation": {"enabled": False, "checked": False},
@@ -81,7 +81,9 @@ def chat_with_agent(
     messages.append(HumanMessage(content=user_text))
 
     prepared = prepare_rag_response(user_text, profile=profile, mode=execution_mode)
-    if prepared["evidence_status"] == "insufficient":
+    if prepared.get("skill_applied"):
+        response_content, usage = str(prepared.get("skill_answer") or ""), {}
+    elif prepared["evidence_status"] == "insufficient":
         response_content, usage = INSUFFICIENT_EVIDENCE_MESSAGE, {}
     else:
         response_content, usage = generate_answer(
@@ -170,7 +172,10 @@ async def chat_with_agent_stream(
 
     full_response = ""
     usage = {}
-    if prepared["evidence_status"] == "insufficient":
+    if prepared.get("skill_applied"):
+        full_response = str(prepared.get("skill_answer") or "")
+        yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
+    elif prepared["evidence_status"] == "insufficient":
         full_response = INSUFFICIENT_EVIDENCE_MESSAGE
         yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
     elif (prepared.get("calculation") or {}).get("authoritative") or (

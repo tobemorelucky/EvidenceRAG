@@ -17,7 +17,7 @@ from prompts import (
     SUMMARY_SYSTEM_PROMPT,
     SUMMARY_USER_TEMPLATE,
 )
-from runtime_profile import is_clean_baseline
+from runtime_profile import uses_clean_baseline_path
 
 
 def _create_model():
@@ -64,7 +64,7 @@ def build_answer_messages(
     task_policy: str = "",
     profile: str | None = None,
 ) -> list:
-    clean_baseline = is_clean_baseline(profile)
+    clean_baseline = uses_clean_baseline_path(profile)
     prompt_version = CLEAN_BASELINE_PROMPT_VERSION if clean_baseline else PROMPT_VERSION
     system_prompt = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT if clean_baseline else ANSWER_SYSTEM_PROMPT
     messages = [SystemMessage(content=f"Prompt-Version: {prompt_version}\n\n{system_prompt}")]

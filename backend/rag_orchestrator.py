@@ -7,7 +7,12 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from runtime_profile import apply_runtime_profile, feature_state, is_clean_baseline
+from runtime_profile import (
+    EXPLICIT_FORMULA_SKILL_PROFILE,
+    apply_runtime_profile,
+    feature_state,
+    uses_clean_baseline_path,
+)
 
 apply_runtime_profile()
 
@@ -32,7 +37,7 @@ from rag_utils import finalize_retrieved_documents, get_finance_rag_config, retr
 from table_store import TableStore
 
 
-VALID_PROFILES = {"general", "finance", "clean_baseline"}
+VALID_PROFILES = {"general", "finance", "clean_baseline", EXPLICIT_FORMULA_SKILL_PROFILE}
 VALID_MODES = {"static", "agentic", "auto"}
 _table_store = TableStore()
 
@@ -480,6 +485,30 @@ def _prepare_clean_baseline_response(question: str, config: ExecutionConfig, sta
         **page_trace,
         **context_meta,
     })
+    skill_answer = ""
+    skill_applied = False
+    calculation = None
+    if config.profile == EXPLICIT_FORMULA_SKILL_PROFILE:
+        from skills.registry import execute_matching_skill
+
+        skill_result = execute_matching_skill(question, answer_docs, candidate_pool)
+        trace["explicit_formula_skill"] = skill_result.trace
+        skill_answer = skill_result.answer
+        skill_applied = skill_result.applied
+        if skill_applied:
+            citations = skill_result.citations
+            calculation = {
+                "source": "explicit_formula_skill_decimal",
+                "authoritative": True,
+                "formula": skill_result.trace.get("formula_text", ""),
+                "operands": skill_result.trace.get("resolved_operands", []),
+                "result": skill_result.trace.get("full_precision_result", ""),
+                "display_result": skill_result.trace.get("display_result", ""),
+            }
+            trace["experiment_modules_in_answer_path"] = ["explicit_formula_skill"]
+        latency["explicit_formula_skill_latency_ms"] = skill_result.trace.get("skill_latency_ms", 0)
+        latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        trace["latency_breakdown"] = latency
     trace["answer_prompt_evidence_chars"] = len(evidence)
     trace["answer_prompt_policy_chars"] = 0
     trace["answer_prompt_total_chars"] = len(evidence)
@@ -493,17 +522,19 @@ def _prepare_clean_baseline_response(question: str, config: ExecutionConfig, sta
         "route_reason": "clean_baseline_static",
         "citations": citations,
         "evidence_status": "sufficient" if citations else "insufficient",
-        "calculation": None,
+        "calculation": calculation,
         "query_spec": {},
         "evidence_frames": [],
         "trace_id": trace_id,
+        "skill_applied": skill_applied,
+        "skill_answer": skill_answer,
     }
 
 
 def prepare_rag_response(question: str, profile: str | None = None, mode: str | None = None) -> dict:
     started = time.perf_counter()
     config = resolve_execution_config(profile, mode)
-    if is_clean_baseline(config.profile):
+    if uses_clean_baseline_path(config.profile):
         return _prepare_clean_baseline_response(question, config, started)
     initial = _run_search(question)
     initial_docs = list(initial.get("docs") or [])

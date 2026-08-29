@@ -323,6 +323,7 @@ def extract_explicit_formula_contract(question: str) -> Dict[str, object]:
     source = str(question or "")
     cue = re.search(
         r"\b(?:(?:is|are)\s+)?(?:defined|calculated|computed)\s+as\s*:?[ \t]*"
+        r"|\bdefine\s+[^?.:]{1,100}?\s+as\s*:?[ \t]*"
         r"|\b(?:the\s+)?formula\s+(?:is|equals)\s*:?[ \t]*",
         source,
         re.IGNORECASE,
