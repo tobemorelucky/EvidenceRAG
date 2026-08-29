@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET = ROOT / "data" / "financebench_top40_100_langsmith_with_evidence.csv"
+BACKEND = ROOT / "backend"
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -50,6 +52,38 @@ def _gold_pages(dataset: Path) -> dict[str, set[tuple[str, int]]]:
     return result
 
 
+def _dataset_metadata(dataset: Path) -> tuple[dict[str, str], set[str]]:
+    with dataset.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    sys.path.insert(0, str(BACKEND))
+    from query_parser import parse_query
+
+    question_types = {
+        str(row.get("financebench_id") or ""): str(
+            parse_query(str(row.get("question") or "")).get("task_type")
+            or row.get("question_type")
+            or "unknown"
+        )
+        for row in rows
+    }
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(str(row.get("question_type") or "unknown"), []).append(row)
+    fixed20: list[dict] = []
+    while len(fixed20) < 20:
+        added = False
+        for _, group in sorted(groups.items()):
+            group.sort(key=lambda item: str(item.get("financebench_id") or ""))
+            if group:
+                fixed20.append(group.pop(0))
+                added = True
+                if len(fixed20) == 20:
+                    break
+        if not added:
+            break
+    return question_types, {str(row.get("financebench_id") or "") for row in fixed20}
+
+
 def _page_keys(items: list[dict]) -> set[tuple[str, int]]:
     result = set()
     for item in items or []:
@@ -65,7 +99,9 @@ def _summarize_split(
     answers_path: Path,
     judge_path: Path,
     gold_by_id: dict[str, set[tuple[str, int]]],
+    question_types: dict[str, str] | None = None,
 ) -> tuple[dict, set[str]]:
+    question_types = question_types or {}
     answers = _read_jsonl(answers_path)
     judges = _read_jsonl(judge_path)
     judges_by_run = {str(item.get("run_id") or ""): item for item in judges}
@@ -93,12 +129,24 @@ def _summarize_split(
     task_correct: Counter = Counter()
     candidate_page_hits = context_page_hits = candidate_context_losses = 0
     citation_page_hits = 0
+    failure_stages: Counter = Counter()
     for answer, judge, trace in zip(answers, matched, traces):
-        task_type = str(trace.get("task_type") or (trace.get("evidence_coverage") or {}).get("task_type") or "unknown")
+        financebench_id = str(answer.get("financebench_id") or "")
+        task_type = str(
+            trace.get("task_type")
+            or (trace.get("evidence_coverage") or {}).get("task_type")
+            or question_types.get(financebench_id)
+            or "unknown"
+        )
         task_totals[task_type] += 1
         task_correct[task_type] += int((judge or {}).get("score") or 0)
-        gold = gold_by_id.get(str(answer.get("financebench_id") or ""), set())
-        candidates = _page_keys(trace.get("page_first_selected_pages") or trace.get("page_stage_candidates") or [])
+        gold = gold_by_id.get(financebench_id, set())
+        candidates = _page_keys(
+            trace.get("page_first_selected_pages")
+            or trace.get("page_stage_candidates")
+            or trace.get("initial_retrieved_chunks")
+            or []
+        )
         context = _page_keys(trace.get("answer_context_pages") or answer.get("citations") or [])
         citations = _page_keys(answer.get("citations") or [])
         candidate_hit = bool(gold & candidates)
@@ -107,6 +155,13 @@ def _summarize_split(
         context_page_hits += context_hit
         citation_page_hits += bool(gold & citations)
         candidate_context_losses += candidate_hit and not context_hit
+        if not int((judge or {}).get("score") or 0):
+            if not candidate_hit:
+                failure_stages["retrieval_candidate_miss"] += 1
+            elif not context_hit:
+                failure_stages["candidate_to_context_loss"] += 1
+            else:
+                failure_stages["gold_context_answer_wrong"] += 1
 
     task_metrics = {
         task: {
@@ -129,6 +184,7 @@ def _summarize_split(
             "correct": correct,
             "accuracy": round(correct / len(answers), 4) if answers else 0.0,
             "task_types": task_metrics,
+            "incorrect_failure_stages": dict(sorted(failure_stages.items())),
             "invalid_judge_outputs": sum(item.get("verdict") == "invalid_judge_output" for item in matched if item),
             "empty_retrievals": sum(trace.get("rrf_fused_candidate_count") == 0 for trace in traces),
             "rerank_providers": dict(sorted(Counter(trace.get("rerank_provider") or "unknown" for trace in traces).items())),
@@ -223,10 +279,21 @@ def main() -> None:
     splits: dict[str, dict] = {}
     all_ids: set[str] = set()
     gold_by_id = _gold_pages(args.dataset)
+    question_types, fixed20_ids = _dataset_metadata(args.dataset)
+    answers_and_judges: list[tuple[dict, dict]] = []
     for label, answers_name, judge_name in args.split:
         if label in splits:
             raise SystemExit(f"Duplicate split label: {label}")
-        summary, ids = _summarize_split(label, ROOT / answers_name, ROOT / judge_name, gold_by_id)
+        answer_rows = _read_jsonl(ROOT / answers_name)
+        judge_rows = _read_jsonl(ROOT / judge_name)
+        judges_by_id = {str(item.get("financebench_id") or ""): item for item in judge_rows}
+        answers_and_judges.extend(
+            (answer, judges_by_id.get(str(answer.get("financebench_id") or ""), {}))
+            for answer in answer_rows
+        )
+        summary, ids = _summarize_split(
+            label, ROOT / answers_name, ROOT / judge_name, gold_by_id, question_types
+        )
         overlap = all_ids & ids
         if overlap:
             raise SystemExit(f"Duplicate FinanceBench IDs across splits: {sorted(overlap)[:3]}")
@@ -287,6 +354,18 @@ def main() -> None:
         },
     }
     combined = payload["combined"]
+    fixed20_rows = [item for item in answers_and_judges if str(item[0].get("financebench_id") or "") in fixed20_ids]
+    regression80_rows = [item for item in answers_and_judges if str(item[0].get("financebench_id") or "") not in fixed20_ids]
+    combined["historical_fixed20"] = {
+        "questions": len(fixed20_rows),
+        "correct": sum(int(judge.get("score") or 0) for _, judge in fixed20_rows),
+    }
+    combined["historical_regression80"] = {
+        "questions": len(regression80_rows),
+        "correct": sum(int(judge.get("score") or 0) for _, judge in regression80_rows),
+    }
+    for item in (combined["historical_fixed20"], combined["historical_regression80"]):
+        item["accuracy"] = round(item["correct"] / item["questions"], 4) if item["questions"] else 0.0
     combined["candidate_gold_page_hit_rate"] = round(combined["candidate_gold_page_hits"] / total, 4) if total else 0.0
     combined["context_gold_page_hit_rate"] = round(combined["context_gold_page_hits"] / total, 4) if total else 0.0
     combined["average_answer_tokens"] = round(combined["answer_total_tokens"] / total, 2) if total else 0.0
@@ -322,12 +401,14 @@ def main() -> None:
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     markdown_output = args.markdown_output or args.output.with_suffix(".md")
     lines = [
-        "# EvidenceRAG FinanceBench 固定回归报告",
+        "# EvidenceRAG FinanceBench 实验报告",
         "",
         "> 本数据集 100 题均已被查看；本报告只表示 fixed seen regression，不代表未见数据泛化能力。",
         "",
         f"- Questions: {total}",
         f"- Accuracy: {combined['accuracy']:.2%}",
+        f"- Historical fixed20: {combined['historical_fixed20']['correct']}/{combined['historical_fixed20']['questions']} ({combined['historical_fixed20']['accuracy']:.2%})",
+        f"- Historical regression80: {combined['historical_regression80']['correct']}/{combined['historical_regression80']['questions']} ({combined['historical_regression80']['accuracy']:.2%})",
         f"- Candidate gold-page hit: {combined['candidate_gold_page_hit_rate']:.2%}",
         f"- Context gold-page hit: {combined['context_gold_page_hit_rate']:.2%}",
         f"- Candidate → context losses: {combined['candidate_to_context_losses']}",

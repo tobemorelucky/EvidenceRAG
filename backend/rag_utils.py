@@ -17,6 +17,7 @@ from cache import cache
 from document_page_store import DocumentPageStore
 from embedding import embedding_service as _embedding_service
 from local_reranker import LocalReranker
+from runtime_profile import is_clean_baseline
 from finance_rag_features import (
     COMPANY_ALIASES,
     FINANCE_METRIC_HINTS,
@@ -1952,9 +1953,10 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
 
 
 def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
-    if not AUTO_MERGE_ENABLED or not docs:
+    auto_merge_enabled = AUTO_MERGE_ENABLED and not is_clean_baseline()
+    if not auto_merge_enabled or not docs:
         return docs[:top_k], {
-            "auto_merge_enabled": AUTO_MERGE_ENABLED,
+            "auto_merge_enabled": auto_merge_enabled,
             "auto_merge_applied": False,
             "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
             "auto_merge_replaced_chunks": 0,
@@ -4163,10 +4165,15 @@ def retrieve_documents(
     )
     context_docs = list(finalized.get("context_docs", []) or [])
     combined_meta = {**(candidates.get("meta", {}) or {}), **(finalized.get("meta", {}) or {})}
-    task_spec = parse_finance_query(query)
-    task_spec.update(infer_task_spec(query))
-    task_spec["statement_types"] = infer_statement_types(query, task_spec.get("required_fields") or [])
-    initial_coverage = assess_required_field_coverage(task_spec, context_docs)
+    clean_baseline = is_clean_baseline()
+    if clean_baseline:
+        task_spec = {}
+        initial_coverage = {"status": "not_evaluated", "answerable": None}
+    else:
+        task_spec = parse_finance_query(query)
+        task_spec.update(infer_task_spec(query))
+        task_spec["statement_types"] = infer_statement_types(query, task_spec.get("required_fields") or [])
+        initial_coverage = assess_required_field_coverage(task_spec, context_docs)
     supplemental_meta = {
         "supplemental_search_enabled": (
             _parse_bool(os.getenv("RAG_SUPPLEMENTAL_SEARCH_ENABLED"), True)
@@ -4180,7 +4187,7 @@ def retrieve_documents(
         "evidence_coverage_before_supplemental": initial_coverage,
     }
     combined_candidates = list(candidates.get("docs", []) or [])
-    supplemental_query = build_supplemental_field_query(query, initial_coverage)
+    supplemental_query = "" if clean_baseline else build_supplemental_field_query(query, initial_coverage)
     if (
         field_aware
         and supplemental_meta["supplemental_search_enabled"]
@@ -4228,17 +4235,30 @@ def retrieve_documents(
                     combined_meta = {**combined_meta, **(finalized.get("meta", {}) or {})}
             except (RuntimeError, ValueError, TypeError, OSError) as exc:
                 supplemental_meta["supplemental_search_error"] = f"{type(exc).__name__}: {exc}"
-    evidence_group_docs, table_context_meta = _build_evidence_groups(
-        query,
-        context_docs,
-        finalized.get("final_retrieved_docs", []) or [],
-        combined_meta,
-    )
-    if table_aware_config["mode"] != "off" and evidence_group_docs:
-        context_docs = evidence_group_docs
+    if clean_baseline:
+        table_context_meta = {
+            "table_aware_retrieval_mode": "off",
+            "evidence_group_count": 0,
+            "selected_evidence_group_count": 0,
+            "final_evidence_pack_source": combined_meta.get(
+                "final_evidence_pack_source", "chunk_rerank_fallback"
+            ),
+        }
+    else:
+        evidence_group_docs, table_context_meta = _build_evidence_groups(
+            query,
+            context_docs,
+            finalized.get("final_retrieved_docs", []) or [],
+            combined_meta,
+        )
+        if table_aware_config["mode"] != "off" and evidence_group_docs:
+            context_docs = evidence_group_docs
     meta = {**combined_meta, **table_context_meta, **supplemental_meta}
     meta["field_aware_enabled"] = _is_field_aware_enabled()
-    meta["evidence_coverage"] = assess_required_field_coverage(task_spec, context_docs)
+    meta["evidence_coverage"] = (
+        {"status": "not_evaluated", "answerable": None}
+        if clean_baseline else assess_required_field_coverage(task_spec, context_docs)
+    )
     meta["evidence_coverage"]["supplemental_search_attempted"] = supplemental_meta["supplemental_search_attempted"]
     meta["latency_breakdown"] = {
         **(candidates.get("meta", {}).get("latency_breakdown", {}) or {}),

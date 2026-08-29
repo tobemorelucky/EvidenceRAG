@@ -70,6 +70,87 @@ def _split_lines(text: str) -> List[str]:
     return lines
 
 
+def _baseline_snippet(text: str, query_terms: set[str], max_chars: int) -> str:
+    """Compress one unit using only lexical relevance and original line order."""
+    lines = _split_lines(text)
+    if not lines:
+        return ""
+    ranked = []
+    for index, line in enumerate(lines):
+        line_terms = _query_terms(line)
+        overlap = len(query_terms & line_terms)
+        ranked.append((overlap, -index, index, line))
+    relevant = [item for item in ranked if item[0] > 0]
+    chosen = relevant or ranked[:1]
+    chosen_indices = sorted(item[2] for item in sorted(chosen, reverse=True)[:8])
+    selected: List[str] = []
+    used = 0
+    for index in chosen_indices:
+        line = lines[index]
+        separator = 1 if selected else 0
+        if used + separator + len(line) > max_chars:
+            remaining = max_chars - used - separator
+            if remaining >= 80:
+                selected.append(line[:remaining].rstrip() + "…")
+            break
+        selected.append(line)
+        used += separator + len(line)
+    return "\n".join(selected)
+
+
+def build_baseline_evidence(question: str, documents: List[dict]) -> tuple[str, dict]:
+    """Build clean-baseline evidence without task, metric, formula, or company rules."""
+    max_units = _parse_int("RAG_ANSWER_MAX_EVIDENCE_UNITS", 10, 1)
+    max_context_chars = _parse_int("RAG_ANSWER_MAX_CONTEXT_CHARS", 24000, 2000)
+    max_unit_chars = _parse_int("RAG_ANSWER_MAX_UNIT_CHARS", 2000, 400)
+    query_terms = _query_terms(question)
+    original_chars = sum(len(str(doc.get("text") or doc.get("page_text") or "")) for doc in documents)
+    selected: List[dict] = []
+    seen_pages: set[tuple[str, str]] = set()
+    for document in documents:
+        filename = str(document.get("filename") or "Unknown")
+        page = str(document.get("page_number", "N/A"))
+        key = (filename, page)
+        if key in seen_pages:
+            continue
+        seen_pages.add(key)
+        selected.append(document)
+        if len(selected) >= max_units:
+            break
+
+    blocks: List[str] = []
+    pages: List[dict] = []
+    used_chars = 0
+    for document in selected:
+        filename = str(document.get("filename") or "Unknown")
+        page = document.get("page_number", "N/A")
+        text = str(document.get("text") or document.get("page_text") or "")
+        header = f"Source: {filename} | Page: {page}\n"
+        remaining = max_context_chars - used_chars - len(header)
+        if remaining < 100:
+            break
+        snippet = _baseline_snippet(text, query_terms, min(max_unit_chars, remaining))
+        if not snippet:
+            continue
+        block = f"{header}{snippet}"
+        blocks.append(block)
+        used_chars += len(block) + (7 if len(blocks) > 1 else 0)
+        pages.append({"filename": filename, "page_number": page})
+
+    evidence = "\n\n---\n\n".join(blocks)
+    return evidence, {
+        "answer_context_strategy": "clean_baseline_generic_v1",
+        "answer_context_compressed": True,
+        "answer_context_original_chars": original_chars,
+        "answer_context_chars": len(evidence),
+        "answer_context_unit_count": len(blocks),
+        "answer_context_pages": pages,
+        "answer_context_protected_evidence": [],
+        "answer_context_dropped_protected_evidence": [],
+        "answer_context_task_rules_used": False,
+    }
+
+
 def _required_aliases(task_spec: Dict[str, object]) -> List[str]:
     aliases: List[str] = []
     for field in task_spec.get("required_fields") or []:

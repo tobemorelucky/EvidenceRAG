@@ -65,6 +65,8 @@ def _split_records(
         if not reference_answer:
             raise SystemExit(f"{label}: missing reference answer for {financebench_id}.")
         trace = answer.get("rag_trace") or {}
+        usage = answer.get("usage") or {}
+        latency = answer.get("evaluation_latency") or {}
         rows.append(
             {
                 "financebench_id": financebench_id,
@@ -77,6 +79,18 @@ def _split_records(
                 "judge_reason": str(judge.get("reason") or ""),
                 "evidence_status": str(answer.get("evidence_status") or ""),
                 "rerank_provider": str(trace.get("rerank_provider") or "unknown"),
+                "task_type": str(trace.get("task_type") or (trace.get("evidence_coverage") or {}).get("task_type") or "unknown"),
+                "execution_mode": str(answer.get("execution_mode") or trace.get("execution_mode") or "unknown"),
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "total_tokens": int(usage.get("total_tokens") or 0),
+                "latency_ms": float(latency.get("total_ms") or 0),
+                "candidate_coverage": str((trace.get("candidate_coverage") or {}).get("status") or "unknown"),
+                "selected_page_coverage": str((trace.get("selected_page_coverage") or {}).get("status") or "unknown"),
+                "compact_context_coverage": str((trace.get("compact_context_coverage") or {}).get("status") or "unknown"),
+                "evidence_flow_stage": str(trace.get("evidence_flow_stage") or "unknown"),
+                "protected_page_count": int(trace.get("protected_page_count") or 0),
+                "structured_authoritative": bool(trace.get("structured_authoritative")),
             }
         )
     return rows, sum(row["score"] for row in rows)
@@ -114,6 +128,12 @@ def main() -> None:
         total_correct += correct
 
     total = sum(len(rows) for _, rows, _ in grouped)
+    all_rows = [row for _, rows, _ in grouped for row in rows]
+    input_tokens = sum(row["input_tokens"] for row in all_rows)
+    output_tokens = sum(row["output_tokens"] for row in all_rows)
+    total_tokens = sum(row["total_tokens"] for row in all_rows)
+    average_tokens = total_tokens / total if total else 0
+    average_latency_ms = sum(row["latency_ms"] for row in all_rows) / total if total else 0
     lines = ["# EvidenceRAG FinanceBench 100-Question Results", ""]
     lines.extend(
         [
@@ -121,8 +141,10 @@ def main() -> None:
             f"- Correct: {total_correct}",
             f"- Accuracy: {total_correct / total:.1%}" if total else "- Accuracy: n/a",
             "- Judge: DeepSeek-V4-Pro",
+            f"- Answer tokens: input={input_tokens:,}; output={output_tokens:,}; total={total_tokens:,}; average={average_tokens:,.2f}/question",
+            f"- Average latency: {average_latency_ms / 1000:.2f}s/question",
             "",
-            "Each entry contains the question, FinanceBench reference answer, model answer, citations, Judge result, and exceptional retrieval state.",
+            "Each entry contains the question, FinanceBench reference answer, model answer, citations, Judge result, and compact execution metrics.",
         ]
     )
     for label, rows, correct in grouped:
@@ -142,16 +164,19 @@ def main() -> None:
                     "",
                     f"**引用：** {row['citations']}",
                     "",
-                    f"**Judge：** {row['judge_reason']}",
+                    f"**Judge：** {verdict} — {row['judge_reason']}",
+                    "",
+                    "**指标：** "
+                    f"task={row['task_type']}; mode={row['execution_mode']}; "
+                    f"tokens={row['input_tokens']}+{row['output_tokens']}={row['total_tokens']}; "
+                    f"latency={row['latency_ms'] / 1000:.2f}s; evidence={row['evidence_status'] or 'unknown'}; "
+                    f"coverage(candidate/selected/compact)="
+                    f"{row['candidate_coverage']}/{row['selected_page_coverage']}/{row['compact_context_coverage']}; "
+                    f"flow={row['evidence_flow_stage']}; protected_pages={row['protected_page_count']}; "
+                    f"structured_authoritative={str(row['structured_authoritative']).lower()}; "
+                    f"rerank={row['rerank_provider']}",
                 ]
             )
-            if row["evidence_status"] != "sufficient" or row["rerank_provider"] != "remote":
-                lines.extend(
-                    [
-                        "",
-                        f"**Run note:** evidence={row['evidence_status'] or 'unknown'}; rerank={row['rerank_provider']}",
-                    ]
-                )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Markdown: {args.output}")

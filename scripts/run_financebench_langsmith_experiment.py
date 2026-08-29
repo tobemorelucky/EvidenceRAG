@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 DATA_PATH = ROOT / "data" / "financebench_top40_100_langsmith_with_evidence.csv"
 load_dotenv(ROOT / ".env", override=True)
+sys.path.insert(0, str(BACKEND))
+
+from runtime_profile import apply_runtime_profile, feature_state, print_feature_summary
 
 
 def _development_ids(rows: list[dict[str, str]], size: int = 20) -> set[str]:
@@ -38,6 +41,7 @@ def _development_ids(rows: list[dict[str, str]], size: int = 20) -> set[str]:
 
 
 def _configure_static_baseline(
+    rag_profile: str,
     max_completion_tokens: int,
     thinking_mode: str,
     diagnose: bool,
@@ -64,7 +68,7 @@ def _configure_static_baseline(
             "RAG_QUERY_PLANNER_ENABLED": "false",
             "FINANCE_RAG_ENABLE_STEP_BACK": "false",
             "RAG_EXECUTION_MODE": "static",
-            "RAG_PROFILE": "finance",
+            "RAG_PROFILE": rag_profile,
             "FINANCE_RAG_CANDIDATE_K": "40",
             "FINANCE_RAG_FINAL_TOP_K": "5",
             "RAG_PAGE_FIRST_ENABLED": "true",
@@ -119,6 +123,7 @@ def _configure_static_baseline(
     else:
         settings["LOCAL_RERANK_ENABLED"] = "false"
     os.environ.update(settings)
+    apply_runtime_profile(rag_profile)
 
 
 def _normalized_document_name(value: object) -> str:
@@ -171,6 +176,12 @@ def main() -> None:
         help="Evaluate only this FinanceBench ID; repeat the option for a targeted set.",
     )
     parser.add_argument("--experiment-prefix", default="evidencerag-finance-static")
+    parser.add_argument(
+        "--rag-profile",
+        choices=("finance", "clean_baseline"),
+        default="finance",
+        help="Runtime profile. clean_baseline authoritatively disables all experimental answer paths.",
+    )
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--max-completion-tokens", type=int, default=512)
     parser.add_argument("--thinking", choices=("disabled", "auto", "enabled"), default="disabled")
@@ -261,6 +272,7 @@ def main() -> None:
         parser.error("--supplemental-find requires --structured-coverage.")
 
     _configure_static_baseline(
+        args.rag_profile,
         args.max_completion_tokens,
         args.thinking,
         args.diagnose,
@@ -362,7 +374,6 @@ def main() -> None:
         output_handle = None
 
     # Do not load the local embedding model until the remote experiment service is reachable.
-    sys.path.insert(0, str(BACKEND))
     from answer_generator import generate_answer
     from calculation_service import validate_numeric_display, validate_or_repair_structured_answer
     from query_parser import assess_answer_facets
@@ -382,7 +393,7 @@ def main() -> None:
 
     @traceable(name="EvidenceRAG.retrieve", run_type="retriever")
     def retrieve(question: str) -> dict:
-        return prepare_rag_response(question, profile="finance", mode="static")
+        return prepare_rag_response(question, profile=args.rag_profile, mode="static")
 
     def failed_empty_retrieval(prepared: dict) -> bool:
         trace = prepared.get("rag_trace") or {}
@@ -395,7 +406,7 @@ def main() -> None:
 
     @traceable(name="EvidenceRAG.generate", run_type="llm")
     def generate(question: str, evidence: str, task_policy: str) -> tuple[str, dict]:
-        return generate_answer(question, evidence, [], task_policy)
+        return generate_answer(question, evidence, [], task_policy, args.rag_profile)
 
     @traceable(name="EvidenceRAG.financebench_static", run_type="chain")
     def target(inputs: dict) -> dict:
@@ -439,30 +450,37 @@ def main() -> None:
                     prepared["evidence"],
                     prepared.get("task_policy", ""),
                 )
-                answer, consistency_trace = validate_or_repair_structured_answer(
-                    answer,
-                    prepared.get("query_spec") or {},
-                    prepared.get("calculation"),
-                )
-                prepared["rag_trace"]["answer_consistency"] = consistency_trace
-                answer, numeric_trace = validate_numeric_display(
-                    answer,
-                    prepared.get("query_spec") or {},
-                    prepared.get("calculation"),
-                )
-                prepared["rag_trace"]["numeric_display_validation"] = numeric_trace
-                facet_trace = assess_answer_facets(answer, prepared.get("query_spec") or {})
-                prepared["rag_trace"]["answer_facet_validation"] = facet_trace
-                if (
-                    facet_trace.get("missing_facets")
-                    and prepared["rag_trace"].get("evidence_flow_stage") == "evidence_ready_for_utilization"
-                ):
-                    prepared["rag_trace"]["evidence_flow_stage"] = "evidence_utilization_failure"
-                elif (
-                    facet_trace.get("complete")
-                    and prepared["rag_trace"].get("evidence_flow_stage") == "evidence_ready_for_utilization"
-                ):
-                    prepared["rag_trace"]["evidence_flow_stage"] = "evidence_utilization_complete"
+                if args.rag_profile == "clean_baseline":
+                    prepared["rag_trace"].update({
+                        "answer_consistency": {"enabled": False, "checked": False},
+                        "numeric_display_validation": {"enabled": False, "checked": False},
+                        "answer_facet_validation": {"enabled": False, "checked": False},
+                    })
+                else:
+                    answer, consistency_trace = validate_or_repair_structured_answer(
+                        answer,
+                        prepared.get("query_spec") or {},
+                        prepared.get("calculation"),
+                    )
+                    prepared["rag_trace"]["answer_consistency"] = consistency_trace
+                    answer, numeric_trace = validate_numeric_display(
+                        answer,
+                        prepared.get("query_spec") or {},
+                        prepared.get("calculation"),
+                    )
+                    prepared["rag_trace"]["numeric_display_validation"] = numeric_trace
+                    facet_trace = assess_answer_facets(answer, prepared.get("query_spec") or {})
+                    prepared["rag_trace"]["answer_facet_validation"] = facet_trace
+                    if (
+                        facet_trace.get("missing_facets")
+                        and prepared["rag_trace"].get("evidence_flow_stage") == "evidence_ready_for_utilization"
+                    ):
+                        prepared["rag_trace"]["evidence_flow_stage"] = "evidence_utilization_failure"
+                    elif (
+                        facet_trace.get("complete")
+                        and prepared["rag_trace"].get("evidence_flow_stage") == "evidence_ready_for_utilization"
+                    ):
+                        prepared["rag_trace"]["evidence_flow_stage"] = "evidence_utilization_complete"
             finally:
                 if args.slow_question_seconds > 0:
                     faulthandler.cancel_dump_traceback_later()
@@ -470,6 +488,15 @@ def main() -> None:
             if args.diagnose:
                 print(f"[question] {financebench_id} generate finished in {generation_seconds:.2f}s", flush=True)
         run_tree = get_current_run_tree()
+        total_seconds = time.perf_counter() - question_started
+        prepared["rag_trace"].update({
+            "answer_input_tokens": int(usage.get("input_tokens") or 0),
+            "answer_output_tokens": int(usage.get("output_tokens") or 0),
+            "answer_total_tokens": int(usage.get("total_tokens") or 0),
+            "answer_latency_ms": round(generation_seconds * 1000, 2),
+            "retrieval_latency_ms": round(retrieval_seconds * 1000, 2),
+            "total_latency_ms": round(total_seconds * 1000, 2),
+        })
         result = {
             "financebench_id": financebench_id,
             "question": question,
@@ -484,7 +511,7 @@ def main() -> None:
             "evaluation_latency": {
                 "retrieval_ms": round(retrieval_seconds * 1000, 2),
                 "generation_ms": round(generation_seconds * 1000, 2),
-                "total_ms": round((time.perf_counter() - question_started) * 1000, 2),
+                "total_ms": round(total_seconds * 1000, 2),
             },
             "application_trace_id": prepared["trace_id"],
             "evaluation_run_id": prepared["trace_id"],
@@ -496,19 +523,21 @@ def main() -> None:
         completed_run_ids.add(financebench_id)
         return result
 
+    active_features = feature_state(args.rag_profile)
+    active_modules = active_features["modules"]
     metadata = {
-        "profile": "finance",
+        "profile": args.rag_profile,
         "execution_mode": "static",
         "query_planner": False,
         "step_back": False,
-        "field_aware": args.field_aware,
-        "statement_aware": args.field_aware,
-        "required_field_page_scoring": args.field_aware,
-        "required_period_page_scoring": args.field_aware,
-        "legacy_supplemental_search": args.field_aware and not args.supplemental_find,
-        "supplemental_find": args.supplemental_find,
-        "page_neighbor_window": 2 if args.field_aware else 0,
-        "context_page_window": 2 if args.field_aware else 0,
+        "field_aware": feature_state(args.rag_profile)["field_aware"],
+        "statement_aware": False if args.rag_profile == "clean_baseline" else args.field_aware,
+        "required_field_page_scoring": False if args.rag_profile == "clean_baseline" else args.field_aware,
+        "required_period_page_scoring": False if args.rag_profile == "clean_baseline" else args.field_aware,
+        "legacy_supplemental_search": False if args.rag_profile == "clean_baseline" else args.field_aware and not args.supplemental_find,
+        "supplemental_find": active_modules["Supplemental Retrieval"],
+        "page_neighbor_window": 0 if args.rag_profile == "clean_baseline" else (2 if args.field_aware else 0),
+        "context_page_window": 0 if args.rag_profile == "clean_baseline" else (2 if args.field_aware else 0),
         "rerank": args.enable_rerank,
         "rerank_remote_max_attempts": int(os.getenv("RERANK_REMOTE_MAX_ATTEMPTS", "2")),
         "rerank_remote_backoff_seconds": float(os.getenv("RERANK_REMOTE_BACKOFF_SECONDS", "0.8")),
@@ -517,10 +546,10 @@ def main() -> None:
         "thinking": args.thinking,
         "max_completion_tokens": args.max_completion_tokens,
         "temperature": 0,
-        "finance_policy": args.finance_policy,
-        "evidence_frame": args.evidence_frame,
-        "structured_executor": args.structured_executor,
-        "structured_coverage": args.structured_coverage,
+        "finance_policy": active_modules["Finance Policy"],
+        "evidence_frame": os.getenv("EVIDENCE_FRAME_ENABLED", "false").lower() == "true",
+        "structured_executor": active_modules["Structured Executor"],
+        "structured_coverage": active_modules["Structured Coverage"],
         "frame_alignment": args.frame_alignment,
         "structured_task_executor": args.structured_task_executor,
         "answer_consistency_validator": args.answer_consistency_validator,
@@ -537,8 +566,9 @@ def main() -> None:
         "started_at": datetime.now(timezone.utc).isoformat(),
         "evaluation_backend": args.evaluation_backend,
     }
+    print_feature_summary(args.rag_profile)
     print(
-        f"[setup] backend={args.evaluation_backend} dataset={args.dataset_name} split={args.split} examples={len(examples)} "
+        f"[setup] backend={args.evaluation_backend} profile={args.rag_profile} dataset={args.dataset_name} split={args.split} examples={len(examples)} "
         f"planner=false policy={str(args.finance_policy).lower()} frames={str(args.evidence_frame).lower()} "
         f"executor={str(args.structured_executor).lower()} coverage={str(args.structured_coverage).lower()} "
         f"alignment={str(args.frame_alignment).lower()} task_executor={str(args.structured_task_executor).lower()} "

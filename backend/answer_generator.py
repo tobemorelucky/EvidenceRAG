@@ -10,10 +10,14 @@ from prompts import (
     ANSWER_SYSTEM_PROMPT,
     ANSWER_USER_TEMPLATE,
     ANSWER_USER_WITH_POLICY_TEMPLATE,
+    CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT,
+    CLEAN_BASELINE_ANSWER_USER_TEMPLATE,
+    CLEAN_BASELINE_PROMPT_VERSION,
     PROMPT_VERSION,
     SUMMARY_SYSTEM_PROMPT,
     SUMMARY_USER_TEMPLATE,
 )
+from runtime_profile import is_clean_baseline
 
 
 def _create_model():
@@ -58,12 +62,18 @@ def build_answer_messages(
     evidence: str,
     history: list | None = None,
     task_policy: str = "",
+    profile: str | None = None,
 ) -> list:
-    messages = [SystemMessage(content=f"Prompt-Version: {PROMPT_VERSION}\n\n{ANSWER_SYSTEM_PROMPT}")]
+    clean_baseline = is_clean_baseline(profile)
+    prompt_version = CLEAN_BASELINE_PROMPT_VERSION if clean_baseline else PROMPT_VERSION
+    system_prompt = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT if clean_baseline else ANSWER_SYSTEM_PROMPT
+    messages = [SystemMessage(content=f"Prompt-Version: {prompt_version}\n\n{system_prompt}")]
     for message in (history or [])[-12:]:
         if getattr(message, "type", "") in {"human", "ai"}:
             messages.append(message)
-    if task_policy:
+    if clean_baseline:
+        content = CLEAN_BASELINE_ANSWER_USER_TEMPLATE.format(question=question, evidence=evidence)
+    elif task_policy:
         content = ANSWER_USER_WITH_POLICY_TEMPLATE.format(
             question=question,
             task_policy=task_policy,
@@ -80,8 +90,9 @@ def generate_answer(
     evidence: str,
     history: list | None = None,
     task_policy: str = "",
+    profile: str | None = None,
 ) -> tuple[str, dict]:
-    response = model.invoke(build_answer_messages(question, evidence, history, task_policy))
+    response = model.invoke(build_answer_messages(question, evidence, history, task_policy, profile))
     usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {}).get("token_usage") or {}
     return _content_text(getattr(response, "content", response)), dict(usage or {})
 
@@ -91,9 +102,10 @@ async def stream_answer(
     evidence: str,
     history: list | None = None,
     task_policy: str = "",
+    profile: str | None = None,
 ) -> AsyncIterator[tuple[str, dict]]:
     usage = {}
-    async for chunk in model.astream(build_answer_messages(question, evidence, history, task_policy)):
+    async for chunk in model.astream(build_answer_messages(question, evidence, history, task_policy, profile)):
         text = _content_text(getattr(chunk, "content", chunk))
         chunk_usage = getattr(chunk, "usage_metadata", None)
         if chunk_usage:

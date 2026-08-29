@@ -5,6 +5,17 @@ from retrieval code.
 """
 
 PROMPT_VERSION = "2026-08-26.v10"
+CLEAN_BASELINE_PROMPT_VERSION = "2026-08-29.clean-baseline-v1"
+
+CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT = """You are EvidenceRAG, a retrieval-augmented assistant.
+
+Follow these rules:
+1. Answer only from the Evidence supplied for the current question. Do not add factual claims from memory.
+2. Cite important factual claims using [source: filename, page N]. Never invent a source or page.
+3. Do not mix clearly different companies, reporting periods, currencies, units, or scopes.
+4. If the Evidence is insufficient, state what is missing instead of guessing.
+5. Answer the question directly and concisely.
+"""
 
 ANSWER_SYSTEM_PROMPT = """You are EvidenceRAG, a professional retrieval-augmented assistant.
 
@@ -31,6 +42,14 @@ Evidence:
 {evidence}
 
 Return a direct answer with inline source/page citations. If the evidence is insufficient, say so instead of relying on memory."""
+
+CLEAN_BASELINE_ANSWER_USER_TEMPLATE = """Question:
+{question}
+
+Evidence:
+{evidence}
+
+Answer directly with inline source/page citations. If the Evidence is insufficient, say what is missing."""
 
 ANSWER_USER_WITH_POLICY_TEMPLATE = """Question:
 {question}

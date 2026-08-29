@@ -18,12 +18,20 @@ from conversation_service import storage
 from rag_orchestrator import RetrievalServiceError, prepare_rag_response
 from query_parser import assess_answer_facets
 from tools import set_rag_step_queue
+from runtime_profile import is_clean_baseline
 
 
 INSUFFICIENT_EVIDENCE_MESSAGE = "未检索到足够证据，无法基于当前知识库可靠回答。"
 
 
 def _finalize_generated_answer(answer: str, prepared: dict) -> str:
+    if is_clean_baseline(prepared.get("profile")):
+        prepared["rag_trace"].update({
+            "answer_consistency": {"enabled": False, "checked": False},
+            "numeric_display_validation": {"enabled": False, "checked": False},
+            "answer_facet_validation": {"enabled": False, "checked": False},
+        })
+        return answer
     task_spec = prepared.get("query_spec") or {}
     calculation = prepared.get("calculation")
     answer, consistency_trace = validate_or_repair_structured_answer(answer, task_spec, calculation)
@@ -81,6 +89,7 @@ def chat_with_agent(
             prepared["evidence"],
             history,
             prepared.get("task_policy", ""),
+            prepared.get("profile"),
         )
         response_content = _finalize_generated_answer(response_content, prepared)
 
@@ -174,6 +183,7 @@ async def chat_with_agent_stream(
             prepared["evidence"],
             history,
             prepared.get("task_policy", ""),
+            prepared.get("profile"),
         ):
             generated += content
             usage = chunk_usage or usage
@@ -185,6 +195,7 @@ async def chat_with_agent_stream(
             prepared["evidence"],
             history,
             prepared.get("task_policy", ""),
+            prepared.get("profile"),
         ):
             full_response += content
             usage = chunk_usage or usage

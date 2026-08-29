@@ -7,6 +7,10 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from runtime_profile import apply_runtime_profile, feature_state, is_clean_baseline
+
+apply_runtime_profile()
+
 from agent_tools import find_evidence, open_pages, select_pages
 from calculation_service import build_calculation_result, format_calculation_evidence
 from evidence_frame import build_evidence_frames
@@ -20,15 +24,15 @@ from evidence_coverage import (
     structured_coverage_enabled,
 )
 from finance_policy import load_finance_policy
-from evidence_context import build_compact_evidence
-from prompts import PROMPT_VERSION
+from evidence_context import build_baseline_evidence, build_compact_evidence
+from prompts import CLEAN_BASELINE_PROMPT_VERSION, PROMPT_VERSION
 from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
 from rag_pipeline import run_rag_graph
 from rag_utils import finalize_retrieved_documents, get_finance_rag_config, retrieve_document_scoped_candidates
 from table_store import TableStore
 
 
-VALID_PROFILES = {"general", "finance"}
+VALID_PROFILES = {"general", "finance", "clean_baseline"}
 VALID_MODES = {"static", "agentic", "auto"}
 _table_store = TableStore()
 
@@ -46,7 +50,7 @@ class ExecutionConfig:
 
 
 def resolve_execution_config(profile: str | None = None, mode: str | None = None) -> ExecutionConfig:
-    resolved_profile = (profile or os.getenv("RAG_PROFILE", "finance")).strip().lower()
+    resolved_profile = apply_runtime_profile(profile)
     if resolved_profile not in VALID_PROFILES:
         resolved_profile = "finance"
     default_mode = "auto" if resolved_profile == "finance" else "static"
@@ -419,9 +423,88 @@ def _supplement_partial_evidence(
         return documents, trace
 
 
+def _prepare_clean_baseline_response(question: str, config: ExecutionConfig, started: float) -> dict:
+    """Run the isolated retrieval, rerank, generic context, and answer path."""
+    initial = _run_search(question)
+    final_docs = list(initial.get("docs") or [])
+    candidate_pool = list(initial.get("initial_candidate_docs") or final_docs)
+    answer_docs, page_trace = _open_retrieved_pages(final_docs)
+    citations = build_citations(answer_docs)
+    evidence, context_meta = build_baseline_evidence(question, answer_docs)
+    if not evidence:
+        evidence = _format_evidence(answer_docs)
+        context_meta = {
+            **context_meta,
+            "answer_context_chars": len(evidence),
+            "answer_context_unit_count": len(answer_docs),
+        }
+
+    trace = dict(initial.get("rag_trace") or {})
+    latency = dict(trace.get("latency_breakdown") or {})
+    latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    trace_id = str(uuid.uuid4())
+    trace.update({
+        "profile": config.profile,
+        "execution_mode": "static",
+        "route_reason": "clean_baseline_static",
+        "original_question": question,
+        "retrieval_queries": [question],
+        "dense_candidate_count": trace.get("dense_candidate_count"),
+        "bm25_candidate_count": trace.get("bm25_candidate_count"),
+        "dense_candidate_requested": int(os.getenv("FINANCE_RAG_CANDIDATE_K", "40")) * 2,
+        "bm25_candidate_requested": int(os.getenv("FINANCE_RAG_CANDIDATE_K", "40")) * 2,
+        "candidate_count_observability": "milvus_hybrid_api_exposes_fused_results_only",
+        "candidate_count": len(candidate_pool),
+        "rrf_fused_candidate_count": trace.get("rrf_fused_candidate_count", len(candidate_pool)),
+        "final_selected_pages": [
+            {"filename": doc.get("filename"), "page_number": doc.get("page_number")}
+            for doc in answer_docs
+        ],
+        "final_evidence_unit_count": context_meta.get("answer_context_unit_count", 0),
+        "evidence_status": "sufficient" if citations else "insufficient",
+        "trace_id": trace_id,
+        "prompt_version": CLEAN_BASELINE_PROMPT_VERSION,
+        "feature_state": feature_state(config.profile),
+        "experiment_modules_in_answer_path": [],
+        "shadow_query_spec": {},
+        "shadow_evidence_frame_count": 0,
+        "shadow_formula_detected": False,
+        "queryspec_used_for_retrieval": False,
+        "queryspec_used_for_context": False,
+        "queryspec_used_for_answer": False,
+        "finance_policy_enabled": False,
+        "structured_authoritative": False,
+        "agent_tool_calls": [{"tool": "search", "query": question, "new_evidence": len(final_docs)}],
+        "agent_tool_call_count": 1,
+        "latency_breakdown": latency,
+        **page_trace,
+        **context_meta,
+    })
+    trace["answer_prompt_evidence_chars"] = len(evidence)
+    trace["answer_prompt_policy_chars"] = 0
+    trace["answer_prompt_total_chars"] = len(evidence)
+    return {
+        "evidence": evidence,
+        "task_policy": "",
+        "docs": final_docs,
+        "rag_trace": trace,
+        "profile": config.profile,
+        "execution_mode": "static",
+        "route_reason": "clean_baseline_static",
+        "citations": citations,
+        "evidence_status": "sufficient" if citations else "insufficient",
+        "calculation": None,
+        "query_spec": {},
+        "evidence_frames": [],
+        "trace_id": trace_id,
+    }
+
+
 def prepare_rag_response(question: str, profile: str | None = None, mode: str | None = None) -> dict:
     started = time.perf_counter()
     config = resolve_execution_config(profile, mode)
+    if is_clean_baseline(config.profile):
+        return _prepare_clean_baseline_response(question, config, started)
     initial = _run_search(question)
     initial_docs = list(initial.get("docs") or [])
     initial_candidates = list(initial.get("initial_candidate_docs") or initial_docs)

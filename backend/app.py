@@ -10,6 +10,10 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import os
 
+from runtime_profile import apply_runtime_profile, print_feature_summary
+
+apply_runtime_profile()
+
 import api as api_module
 from database import init_db
 
@@ -26,6 +30,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _startup_init_db():
+        print_feature_summary()
         init_db()
 
     app.add_middleware(
