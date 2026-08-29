@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -307,6 +308,191 @@ def extract_metrics(question: str) -> List[str]:
         if any(alias in text_lower for alias in aliases):
             metrics.append(canonical)
     return metrics
+
+
+def _formula_segment(text: str, start: int, end: int) -> str:
+    boundaries = "+*/();"
+    left = max((text.rfind(char, 0, start) for char in boundaries), default=-1)
+    right_candidates = [position for char in boundaries if (position := text.find(char, end)) >= 0]
+    right = min(right_candidates) if right_candidates else len(text)
+    return text[left + 1 : right]
+
+
+def extract_explicit_formula_contract(question: str) -> Dict[str, object]:
+    """Extract only a formula explicitly supplied by the question; never infer a financial formula."""
+    source = str(question or "")
+    cue = re.search(
+        r"\b(?:(?:is|are)\s+)?(?:defined|calculated|computed)\s+as\s*:?[ \t]*"
+        r"|\b(?:the\s+)?formula\s+(?:is|equals)\s*:?[ \t]*",
+        source,
+        re.IGNORECASE,
+    )
+    empty = {
+        "explicit_formula_present": False,
+        "explicit_formula_text": "",
+        "explicit_formula_operands": [],
+        "explicit_formula_periods": [],
+        "explicit_formula_operators": [],
+        "explicit_formula_confidence": 0.0,
+        "explicit_formula_source": "none",
+        "explicit_formula_expression": {
+            "version": 1,
+            "kind": "none",
+            "operand_keys": [],
+            "operators": [],
+            "transforms": [],
+            "constants": [],
+            "execution_allowed": False,
+        },
+    }
+    if not cue:
+        return empty
+    tail = source[cue.end() :]
+    formula_text = re.split(
+        r"(?:\.(?=\s+(?:round|address|answer|give|use|based|please|what|which|who|how|"
+        r"did|does|do|has|have|is|are|was|were|compare|calculate)\b)|\?(?=\s|$))",
+        tail,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" .")
+    if not formula_text:
+        return empty
+
+    matches: list[dict[str, object]] = []
+    occupied: list[tuple[int, int]] = []
+    alias_specs = sorted(
+        list({
+            (alias, field)
+            for field, aliases in FIELD_ALIASES.items()
+            for alias in aliases
+        } | {
+            (alias, fields[0])
+            for metric, aliases in METRIC_ALIASES.items()
+            for alias in aliases
+            for fields in [METRIC_REQUIRED_FIELDS.get(metric) or []]
+            if len(fields) == 1
+        }),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    lowered = formula_text.casefold()
+    for alias, field in alias_specs:
+        for match in re.finditer(rf"(?<![a-z0-9]){re.escape(alias.casefold())}(?![a-z0-9])", lowered):
+            span = match.span()
+            if any(span[0] < used_end and used_start < span[1] for used_start, used_end in occupied):
+                continue
+            segment = _formula_segment(formula_text, *span)
+            periods = list(dict.fromkeys(re.findall(r"\b(?:FY\s*)?((?:19|20)\d{2})\b", segment, re.IGNORECASE)))
+            segment_lower = segment.casefold()
+            transform = "average" if re.search(r"\baverage\b", segment_lower) else (
+                "change" if re.search(r"\b(?:change|difference)\b", segment_lower) else "direct"
+            )
+            matches.append({
+                "key": field,
+                "field": field,
+                "label": alias,
+                "aliases": list(FIELD_ALIASES.get(field) or [alias]),
+                "periods": periods,
+                "transform": transform,
+                "span": [span[0], span[1]],
+            })
+            occupied.append(span)
+
+    ignored_acronyms = {"FY", "GAAP", "NON", "USD", "US"}
+    for match in re.finditer(r"(?<![A-Za-z0-9])([A-Z][A-Z&]{1,9})(?![A-Za-z0-9])", formula_text):
+        label = match.group(1)
+        span = match.span(1)
+        if label in ignored_acronyms or any(span[0] < used_end and used_start < span[1] for used_start, used_end in occupied):
+            continue
+        segment = _formula_segment(formula_text, *span)
+        periods = list(dict.fromkeys(re.findall(r"\b(?:FY\s*)?((?:19|20)\d{2})\b", segment, re.IGNORECASE)))
+        segment_lower = segment.casefold()
+        matches.append({
+            "key": re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_"),
+            "field": "",
+            "label": label,
+            "aliases": [label],
+            "periods": periods,
+            "transform": "average" if "average" in segment_lower else (
+                "change" if re.search(r"\b(?:change|difference)\b", segment_lower) else "direct"
+            ),
+            "span": [span[0], span[1]],
+        })
+
+    matches.sort(key=lambda item: int((item.get("span") or [0])[0]))
+    operands: list[dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for item in matches:
+        key = str(item.get("key") or "")
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        operands.append({name: value for name, value in item.items() if name != "span"})
+    ordered_operators = re.findall(r"[+*/-]", formula_text)
+    operators = list(dict.fromkeys(
+        ordered_operators
+        + [str(item["transform"]) for item in operands if item.get("transform") != "direct"]
+    ))
+    periods = list(dict.fromkeys(
+        period for item in operands for period in (item.get("periods") or [])
+    ))
+    confidence = 1.0 if len(operands) >= 2 and operators else (0.8 if operands and operators else 0.4)
+    constant_source = re.sub(r"\b(?:FY\s*)?(?:19|20)\d{2}\b", " ", formula_text, flags=re.IGNORECASE)
+    constants = list(dict.fromkeys(re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?(?![A-Za-z])", constant_source)))
+    return {
+        "explicit_formula_present": True,
+        "explicit_formula_text": formula_text,
+        "explicit_formula_operands": operands,
+        "explicit_formula_periods": periods,
+        "explicit_formula_operators": operators,
+        "explicit_formula_confidence": confidence,
+        "explicit_formula_source": "question_explicit_definition",
+        "explicit_formula_expression": {
+            "version": 1,
+            "kind": "question_defined_expression",
+            "operand_keys": [str(item.get("key") or "") for item in operands],
+            "operators": ordered_operators,
+            "transforms": [
+                {"operand": str(item.get("key") or ""), "transform": str(item.get("transform") or "direct")}
+                for item in operands if item.get("transform") != "direct"
+            ],
+            "constants": constants,
+            # Descriptive only: this cannot bypass existing executor gates.
+            "execution_allowed": False,
+        },
+    }
+
+
+def resolve_explicit_formula_task_type(
+    question: str,
+    original_task_type: str,
+    formula_contract: Dict[str, object],
+) -> tuple[str, str]:
+    """Resolve outer intent without treating formula-internal words as user intent."""
+    if os.getenv("EXPLICIT_FORMULA_ADVISORY_ENABLED", "false").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return original_task_type, "explicit_formula_advisory_disabled"
+    if (
+        formula_contract.get("explicit_formula_source") != "question_explicit_definition"
+        or float(formula_contract.get("explicit_formula_confidence") or 0.0) < 0.8
+    ):
+        return original_task_type, "original_inference"
+    intent_text = str(question or "")
+    formula_text = str(formula_contract.get("explicit_formula_text") or "")
+    if formula_text:
+        intent_text = intent_text.replace(formula_text, " ")
+    intent_text = re.sub(
+        r"\b(?:(?:is|are)\s+)?(?:defined|calculated|computed)\s+as\s*:?[ \t]*"
+        r"|\b(?:the\s+)?formula\s+(?:is|equals)\s*:?[ \t]*",
+        " ",
+        intent_text,
+        flags=re.IGNORECASE,
+    )
+    outer_task_type = infer_generic_task_type(intent_text)
+    if outer_task_type in {"selection", "comparison", "judgment"}:
+        return outer_task_type, f"explicit_formula_outer_{outer_task_type}"
+    return "calculation", "explicit_formula_direct_value"
 
 
 def _target_measure(question: str, required_fields: List[str]) -> str:
@@ -832,7 +1018,15 @@ def parse_query(question: str) -> Dict[str, object]:
         "metrics": extract_metrics(question),
         "required_periods": [str(year) for year in extract_years(question)] + extract_quarters(question),
     }
+    explicit_formula_contract = extract_explicit_formula_contract(question)
     task_spec = infer_task_spec(question)
+    original_task_type = str(task_spec.get("task_type") or "lookup")
+    resolved_task_type, task_type_resolution_method = resolve_explicit_formula_task_type(
+        question,
+        original_task_type,
+        explicit_formula_contract,
+    )
+    task_spec = {**task_spec, "task_type": resolved_task_type}
     required_fields = [str(item) for item in task_spec.get("required_fields") or []]
     target_measure = _target_measure(question, required_fields)
     target_measure_explicit = bool(required_fields or extract_metrics(question)) or bool(re.search(
@@ -864,9 +1058,12 @@ def parse_query(question: str) -> Dict[str, object]:
             result_unit = "percent"
         else:
             result_unit = "decimal"
+    answer_contract = infer_answer_contract(question, task_spec, operation, result_unit)
     return {
         **parsed,
         **task_spec,
+        "task_type_original": original_task_type,
+        "task_type_resolution_method": task_type_resolution_method,
         "target_measure": target_measure,
         "target_measure_explicit": target_measure_explicit,
         "required_concepts": required_concepts,
@@ -880,6 +1077,86 @@ def parse_query(question: str) -> Dict[str, object]:
         "rounding_decimal_places": extract_rounding_decimal_places(question),
         "result_unit": result_unit,
         "statement_types": infer_statement_types(question, list(task_spec.get("required_fields") or [])),
+        **explicit_formula_contract,
+        **answer_contract,
+    }
+
+
+def infer_answer_contract(
+    question: str,
+    task_spec: Dict[str, object],
+    operation: str,
+    result_unit: str,
+) -> Dict[str, object]:
+    """Infer required answer facets from question language only; never from reference data."""
+    text = (question or "").casefold()
+    facets: List[str] = []
+    task_type = str(task_spec.get("task_type") or "lookup")
+    asks_entity = bool(re.search(r"\b(?:who|which)\b", text)) or task_type == "selection"
+    asks_percentage = result_unit == "percent" or bool(re.search(r"(?:%|\bpercent(?:age)?\b)", text))
+    asks_numeric = asks_percentage or task_type == "calculation" or bool(re.search(
+        r"\b(?:how much|how many|what amount|what value|what ratio|what rate)\b",
+        text,
+    ))
+    asks_direction = task_type == "comparison" and operation == "compare"
+    asks_reason = bool(re.search(r"\b(?:why|what drove|drivers?|factors?|explain|reason)\b", text))
+    asks_list = bool(re.search(
+        r"\b(?:what are|who are|list|identify|name|primary customers?|major acquisitions?|main factors?)\b",
+        text,
+    ))
+    if asks_entity:
+        facets.append("entity")
+    if asks_numeric:
+        facets.append("numeric_value")
+    if asks_percentage:
+        facets.append("percentage")
+    if asks_direction:
+        facets.append("direction")
+    if asks_reason:
+        facets.append("reason")
+    if asks_list:
+        facets.append("list")
+    facets = list(dict.fromkeys(facets))
+    if len(facets) > 1:
+        answer_type = "multi_part"
+    elif facets:
+        answer_type = facets[0]
+    else:
+        answer_type = "direct"
+    return {"answer_type": answer_type, "required_facets": facets}
+
+
+def assess_answer_facets(answer: str, task_spec: Dict[str, object]) -> Dict[str, object]:
+    """Diagnose required-facet omissions after generation without inventing missing facts."""
+    required = [str(value) for value in task_spec.get("required_facets") or []]
+    text = str(answer or "")
+    lowered = text.casefold()
+    conclusion = re.sub(r"\[source:[^]]+\]", "", text, flags=re.IGNORECASE)
+    numeric_values = [
+        value for value in re.findall(r"(?<![A-Za-z0-9])\(?-?\$?\d[\d,]*(?:\.\d+)?\)?%?", conclusion)
+        if not re.fullmatch(r"(?:19|20)\d{2}", value.strip("()$"))
+    ]
+    checks = {
+        "numeric_value": bool(numeric_values),
+        "percentage": bool(re.search(r"\d(?:[\d,.]*\d)?\s*(?:%|percent)", lowered)),
+        "direction": bool(re.search(
+            r"\b(?:increase|increased|grew|growth|higher|decrease|decreased|declined|lower|unchanged|flat|equal)\b",
+            lowered,
+        )),
+        "reason": bool(re.search(r"\b(?:because|due to|driven by|result(?:ed)? from|reflects?|as a result)\b", lowered)),
+        "list": bool(re.search(r"(?:^|\n)\s*(?:[-*•]|\d+[.)])\s+", text)) or text.count(",") >= 2,
+        "entity": bool(re.search(r"[A-Za-z]{2,}", conclusion)) and not bool(re.search(
+            r"\b(?:cannot determine|insufficient evidence|not provided|unable to determine)\b",
+            lowered,
+        )),
+    }
+    missing = [facet for facet in required if not checks.get(facet, False)]
+    return {
+        "answer_type": task_spec.get("answer_type") or "direct",
+        "required_facets": required,
+        "facet_checks": {facet: bool(checks.get(facet, False)) for facet in required},
+        "missing_facets": missing,
+        "complete": not missing,
     }
 
 
@@ -887,6 +1164,13 @@ def build_answer_directives(question: str, task_spec: Dict[str, object]) -> List
     """Return concise task-specific answer rules; these are instructions, not evidence."""
     text = (question or "").lower()
     directives: List[str] = []
+    if os.getenv("ANSWER_REQUIRED_FACETS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        facets = [str(value) for value in task_spec.get("required_facets") or []]
+        if facets:
+            directives.append(
+                "Answer all explicitly requested facets: " + ", ".join(facets)
+                + ". If a facet is unsupported, identify that missing facet instead of inventing it."
+            )
     if "quick ratio" in text:
         directives.append("Calculate the quick ratio and give the requested healthy/not-healthy conclusion directly. Do not add or end with a generic business-model or cash-flow caveat unless the evidence explicitly states the ratio is inapplicable.")
     if task_spec.get("task_type") == "selection":

@@ -1159,3 +1159,118 @@ def validate_or_repair_structured_answer(
         return answer, trace
     trace.update({"conflict": True, "repaired": True, "reason": reason})
     return _authoritative_template(task_spec, calculation), trace
+
+
+def _verified_numeric_display_contract(
+    task_spec: Dict[str, object],
+    calculation: Dict[str, object] | None,
+) -> tuple[bool, str]:
+    if not calculation or calculation.get("authoritative"):
+        return False, "authoritative_result_uses_structured_validator" if calculation else "no_calculation"
+    if calculation.get("status") != "calculated":
+        return False, "calculation_not_deterministic"
+    if not calculation.get("formula") or calculation.get("result") in (None, ""):
+        return False, "formula_or_result_missing"
+    if task_spec.get("rounding_decimal_places") is None:
+        return False, "explicit_rounding_not_requested"
+    operands = calculation.get("operands") or {}
+    required_fields = [str(value) for value in task_spec.get("required_fields") or []]
+    if not isinstance(operands, dict) or not operands or any(field not in operands for field in required_fields):
+        return False, "operands_not_unique_or_complete"
+    for operand in operands.values():
+        if not isinstance(operand, dict):
+            return False, "operand_provenance_missing"
+        values = operand.get("value")
+        values = values if isinstance(values, list) else [values]
+        if not values or any(_normalized_number(value) == "" for value in values):
+            return False, "operand_value_invalid"
+        if not operand.get("filename") or operand.get("page_number") in (None, ""):
+            return False, "operand_provenance_missing"
+    return True, "eligible"
+
+
+def _expected_numeric_display(
+    task_spec: Dict[str, object],
+    calculation: Dict[str, object],
+) -> tuple[str, str]:
+    precision = max(0, min(12, int(task_spec["rounding_decimal_places"])))
+    value = Decimal(str(calculation["result"]))
+    result_unit = str(task_spec.get("result_unit") or calculation.get("result_unit") or calculation.get("unit") or "").casefold()
+    operation = str(calculation.get("operation") or task_spec.get("operation") or "")
+    if result_unit == "percent" and operation != "percentage_change":
+        value *= Decimal("100")
+    quantum = Decimal(1).scaleb(-precision)
+    display = value.quantize(quantum, rounding=ROUND_HALF_UP)
+    return f"{display:.{precision}f}", "%" if result_unit == "percent" else ""
+
+
+def _conclusion_number_match(answer: str):
+    number = r"(?P<number>\(?-?\d[\d,]*(?:\.\d+)?\)?)(?P<unit>\s*(?:%|percent)?)"
+    patterns = (
+        rf"(?im)^\s*\*\*{number}\*\*\s*$",
+        rf"(?im)\b(?:final\s+answer|answer|result|最终答案|结果)\s*(?:is|=|:|：)?\s*\*\*?{number}",
+        rf"(?im)\*\*{number}\*\*(?=\s*(?:\.|。|$))",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, answer or "")
+        if match:
+            return match
+    return None
+
+
+def validate_numeric_display(
+    answer: str,
+    task_spec: Dict[str, object],
+    calculation: Dict[str, object] | None,
+) -> tuple[str, Dict[str, object]]:
+    """Repair only explicit deterministic rounding/unit display; never change the calculation contract."""
+    enabled = os.getenv("NUMERIC_DISPLAY_VALIDATOR_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    trace: Dict[str, object] = {
+        "enabled": enabled,
+        "eligible": False,
+        "checked": False,
+        "repaired": False,
+        "reason": "",
+        "expected_display": "",
+        "observed_display": "",
+    }
+    if not enabled:
+        return answer, trace
+    eligible, reason = _verified_numeric_display_contract(task_spec, calculation)
+    trace.update({"eligible": eligible, "reason": reason})
+    if not eligible:
+        return answer, trace
+    try:
+        expected, expected_unit = _expected_numeric_display(task_spec, calculation or {})
+    except (KeyError, TypeError, ValueError, DecimalException):
+        trace["reason"] = "expected_display_invalid"
+        return answer, trace
+    match = _conclusion_number_match(answer)
+    trace.update({"checked": True, "expected_display": expected + expected_unit})
+    if not match:
+        trace["reason"] = "explicit_conclusion_number_not_found"
+        return answer, trace
+    observed_number = str(match.group("number") or "")
+    observed_unit = str(match.group("unit") or "").strip()
+    trace["observed_display"] = observed_number + observed_unit
+    normalized_observed = _normalized_number(observed_number)
+    if normalized_observed:
+        try:
+            same_number = Decimal(normalized_observed) == Decimal(expected)
+        except DecimalException:
+            same_number = False
+    else:
+        same_number = False
+    same_unit = (expected_unit == "%" and observed_unit in {"%", "percent"}) or (
+        not expected_unit and not observed_unit
+    )
+    if same_number and same_unit:
+        trace["reason"] = "display_already_consistent"
+        return answer, trace
+    start, end = match.span("number")
+    unit_start, unit_end = match.span("unit")
+    repaired = answer[:start] + expected + expected_unit + answer[unit_end if unit_end >= end else end:]
+    trace.update({"repaired": True, "reason": "explicit_numeric_display_corrected"})
+    return repaired, trace

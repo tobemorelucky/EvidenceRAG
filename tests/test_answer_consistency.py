@@ -1,4 +1,4 @@
-from calculation_service import validate_or_repair_structured_answer
+from calculation_service import validate_numeric_display, validate_or_repair_structured_answer
 
 
 def _authoritative(task_type, **extra):
@@ -135,3 +135,89 @@ def test_validator_ignores_failed_execution_contract_even_if_authoritative_flag_
     assert answer == original
     assert trace["checked"] is False
     assert trace["reason"] == "execution_contract_failed"
+
+
+def test_numeric_display_validator_repairs_only_explicit_rounded_conclusion(monkeypatch):
+    monkeypatch.setenv("NUMERIC_DISPLAY_VALIDATOR_ENABLED", "true")
+    task = {
+        "task_type": "calculation",
+        "required_fields": ["capital_expenditures", "revenue"],
+        "formula": "capital_expenditures / revenue",
+        "operation": "divide",
+        "result_unit": "percent",
+        "rounding_decimal_places": 1,
+    }
+    calculation = {
+        "status": "calculated",
+        "source": "structured_row_decimal",
+        "formula": "capital_expenditures / revenue",
+        "result": "0.01915",
+        "operands": {
+            "capital_expenditures": {"value": "134", "filename": "report.pdf", "page_number": 72},
+            "revenue": {"value": "7002", "filename": "report.pdf", "page_number": 69},
+        },
+    }
+
+    answer, trace = validate_numeric_display(
+        "**2.0%**\n\nCalculation: 134 / 7002 = 0.01915.",
+        task,
+        calculation,
+    )
+
+    assert answer.startswith("**1.9%**")
+    assert "134 / 7002 = 0.01915" in answer
+    assert trace["eligible"] is True
+    assert trace["repaired"] is True
+
+
+def test_numeric_display_validator_does_not_apply_without_explicit_rounding(monkeypatch):
+    monkeypatch.setenv("NUMERIC_DISPLAY_VALIDATOR_ENABLED", "true")
+    task = {"task_type": "lookup", "required_fields": ["ppe"], "rounding_decimal_places": None}
+    calculation = {
+        "status": "calculated",
+        "formula": "ppe",
+        "result": "8.738",
+        "operands": {"ppe": {"value": "8738", "filename": "report.pdf", "page_number": 57}},
+    }
+
+    answer, trace = validate_numeric_display("The result is **8.738 billion**.", task, calculation)
+
+    assert answer == "The result is **8.738 billion**."
+    assert trace["eligible"] is False
+    assert trace["reason"] == "explicit_rounding_not_requested"
+
+
+def test_numeric_display_validator_does_not_replace_operand_when_conclusion_is_implicit(monkeypatch):
+    monkeypatch.setenv("NUMERIC_DISPLAY_VALIDATOR_ENABLED", "true")
+    task = {
+        "task_type": "calculation",
+        "required_fields": ["revenue"],
+        "formula": "revenue",
+        "rounding_decimal_places": 1,
+    }
+    calculation = {
+        "status": "calculated",
+        "formula": "revenue",
+        "result": "100.04",
+        "operands": {"revenue": {"value": "100.04", "filename": "report.pdf", "page_number": 8}},
+    }
+    original = "Revenue of 100.04 was reported on page 8."
+
+    answer, trace = validate_numeric_display(original, task, calculation)
+
+    assert answer == original
+    assert trace["repaired"] is False
+    assert trace["reason"] == "explicit_conclusion_number_not_found"
+
+
+def test_numeric_display_validator_never_overlaps_authoritative_result(monkeypatch):
+    monkeypatch.setenv("NUMERIC_DISPLAY_VALIDATOR_ENABLED", "true")
+    answer, trace = validate_numeric_display(
+        "**2.0%**",
+        {"rounding_decimal_places": 1},
+        {"authoritative": True, "status": "calculated", "formula": "a/b", "result": "0.019"},
+    )
+
+    assert answer == "**2.0%**"
+    assert trace["eligible"] is False
+    assert trace["reason"] == "authoritative_result_uses_structured_validator"

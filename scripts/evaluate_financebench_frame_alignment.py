@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -40,6 +41,26 @@ def _summarize(records: list[dict]) -> dict:
         },
         "supplemental_triggered": sum(bool(item.get("supplemental_triggered")) for item in records),
         "supplemental_effective": sum(bool(item.get("supplemental_effective")) for item in records),
+        "candidate_coverage_complete": sum((item.get("candidate_coverage") or {}).get("status") == "complete" for item in records),
+        "selected_page_coverage_complete": sum((item.get("selected_page_coverage") or {}).get("status") == "complete" for item in records),
+        "compact_context_coverage_complete": sum((item.get("compact_context_coverage") or {}).get("status") == "complete" for item in records),
+        "candidate_complete_selected_incomplete": sum(
+            (item.get("candidate_coverage") or {}).get("status") == "complete"
+            and (item.get("selected_page_coverage") or {}).get("status") != "complete"
+            for item in records
+        ),
+        "candidate_complete_selected_incomplete_before_protection": sum(
+            (item.get("candidate_coverage") or {}).get("status") == "complete"
+            and (item.get("protected_page_coverage_before") or {}).get("status") != "complete"
+            for item in records
+        ),
+        "protected_page_questions": sum(int(item.get("protected_page_count") or 0) > 0 for item in records),
+        "protected_page_count": sum(int(item.get("protected_page_count") or 0) for item in records),
+        "protected_page_budget_violations": sum(
+            int(item.get("selected_page_count_after_protection") or 0)
+            > int(item.get("selected_page_count_before_protection") or 0)
+            for item in records
+        ),
     }
 
 
@@ -51,12 +72,24 @@ def main() -> None:
     parser.add_argument("--question-id", action="append", default=[])
     parser.add_argument("--enable-rerank", action="store_true")
     parser.add_argument("--enable-supplemental", action="store_true")
+    parser.add_argument(
+        "--enable-langsmith-tracing",
+        action="store_true",
+        help="Opt in to LangSmith tracing; local diagnostics disable it by default.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     with args.dataset.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     from run_financebench_langsmith_experiment import _configure_static_baseline, _development_ids
+
+    if not args.enable_langsmith_tracing:
+        # The experiment helper loads .env with override=True. Reset tracing
+        # afterwards so this no-LLM local diagnostic cannot consume trace quota.
+        os.environ["LANGSMITH_TRACING"] = "false"
+        os.environ["LANGSMITH_TRACING_V2"] = "false"
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
     dev_ids = _development_ids(list(rows))
     if args.split != "all":
@@ -71,7 +104,8 @@ def main() -> None:
 
     _configure_static_baseline(
         512, "disabled", False, True, args.enable_rerank, False, False,
-        True, True, True, True, True, True, True, args.enable_supplemental,
+        True, True, True, True, True, True, True,
+        True, True, True, True, True, args.enable_supplemental,
     )
     sys.path.insert(0, str(BACKEND))
     from rag_orchestrator import prepare_rag_response
@@ -97,6 +131,22 @@ def main() -> None:
             "frames_used_for_execution": trace.get("frames_used_for_execution", 0),
             "supplemental_triggered": trace.get("supplemental_triggered", False),
             "supplemental_effective": trace.get("supplemental_effective", False),
+            "supplemental_query": trace.get("supplemental_query") or "",
+            "supplemental_skip_reason": trace.get("supplemental_skip_reason") or "",
+            "candidate_missing_operands": trace.get("candidate_missing_operands") or [],
+            "supplemental_new_pages": trace.get("new_pages") or [],
+            "supplemental_requirement_improvements": trace.get("supplemental_requirement_improvements") or [],
+            "candidate_coverage": trace.get("candidate_coverage") or {},
+            "selected_page_coverage": trace.get("selected_page_coverage") or {},
+            "compact_context_coverage": trace.get("compact_context_coverage") or {},
+            "evidence_flow_stage": trace.get("evidence_flow_stage") or "",
+            "protected_pages": trace.get("protected_pages") or [],
+            "protected_page_replacements": trace.get("protected_page_replacements") or [],
+            "protected_page_coverage_before": trace.get("protected_page_coverage_before") or {},
+            "protected_page_coverage_after": trace.get("protected_page_coverage_after") or {},
+            "protected_page_count": trace.get("protected_page_count", 0),
+            "selected_page_count_before_protection": trace.get("selected_page_count_before_protection", 0),
+            "selected_page_count_after_protection": trace.get("selected_page_count_after_protection", 0),
         }
         records.append(record)
         print(

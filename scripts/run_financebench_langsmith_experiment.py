@@ -1,4 +1,4 @@
-"""Run a controlled, traced FinanceBench static baseline in LangSmith."""
+"""Run a controlled FinanceBench experiment locally or, when explicit, in LangSmith."""
 
 import argparse
 import csv
@@ -12,11 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langsmith import Client
-from langsmith.evaluation import evaluate
-from langsmith.run_helpers import get_current_run_tree, traceable
-
-
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 DATA_PATH = ROOT / "data" / "financebench_top40_100_langsmith_with_evidence.csv"
@@ -57,6 +52,11 @@ def _configure_static_baseline(
     structured_task_executor: bool,
     answer_consistency_validator: bool,
     protected_evidence_slots: bool,
+    stage_aware_coverage: bool,
+    protected_page_slots: bool,
+    numeric_display_validator: bool,
+    answer_required_facets: bool,
+    explicit_formula_advisory: bool,
     supplemental_find: bool,
 ) -> None:
     """Freeze the baseline before importing any backend module."""
@@ -98,6 +98,11 @@ def _configure_static_baseline(
             "STRUCTURED_TASK_EXECUTOR_ENABLED": "true" if structured_task_executor else "false",
             "ANSWER_CONSISTENCY_VALIDATOR_ENABLED": "true" if answer_consistency_validator else "false",
             "RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED": "true" if protected_evidence_slots else "false",
+            "STAGE_AWARE_COVERAGE_ENABLED": "true" if stage_aware_coverage else "false",
+            "PROTECTED_PAGE_SLOTS_ENABLED": "true" if protected_page_slots else "false",
+            "NUMERIC_DISPLAY_VALIDATOR_ENABLED": "true" if numeric_display_validator else "false",
+            "ANSWER_REQUIRED_FACETS_ENABLED": "true" if answer_required_facets else "false",
+            "EXPLICIT_FORMULA_ADVISORY_ENABLED": "true" if explicit_formula_advisory else "false",
             "SUPPLEMENTAL_FIND_ENABLED": "true" if supplemental_find else "false",
     }
     if not enable_rerank:
@@ -119,6 +124,12 @@ def _configure_static_baseline(
 def _normalized_document_name(value: object) -> str:
     name = Path(str(value or "")).stem
     return name.strip().casefold()
+
+
+def _example_financebench_id(example) -> str:
+    if isinstance(example, dict):
+        return str(example.get("financebench_id") or "")
+    return str((getattr(example, "metadata", None) or {}).get("financebench_id") or "")
 
 
 def citation_document_hit(run, example) -> dict:
@@ -144,6 +155,12 @@ def citation_document_hit(run, example) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a formal EvidenceRAG FinanceBench static experiment")
+    parser.add_argument(
+        "--evaluation-backend",
+        choices=("local", "langsmith"),
+        default=os.getenv("FINANCEBENCH_EVALUATION_BACKEND", "local").strip().lower(),
+        help="Evaluation storage backend. Local is the default and never accesses LangSmith.",
+    )
     parser.add_argument("--dataset-name", default="evidencerag_financebench_all100_v1")
     parser.add_argument("--split", choices=("dev", "holdout", "all"), default="dev")
     parser.add_argument("--limit", type=int, default=0, help="0 evaluates the whole selected split.")
@@ -170,6 +187,15 @@ def main() -> None:
     parser.add_argument("--structured-task-executor", action="store_true", help="Execute high-confidence comparison and selection matrices.")
     parser.add_argument("--answer-consistency-validator", action="store_true", help="Repair answer conflicts with authoritative local results.")
     parser.add_argument("--protected-evidence-slots", action="store_true", help="Reserve existing context slots for operands, periods, and candidate matrices.")
+    parser.add_argument("--stage-aware-coverage", action="store_true", help="Trace QuerySpec coverage across candidate, selected-page, and compact-context stages.")
+    parser.add_argument("--protected-page-slots", action="store_true", help="Replace low-value selected pages with requirement-complete candidate pages without growing the page budget.")
+    parser.add_argument("--numeric-display-validator", action="store_true", help="Repair only deterministic explicit rounding and unit-display errors.")
+    parser.add_argument("--answer-required-facets", action="store_true", help="Add and validate a concise question-derived answer facet contract.")
+    parser.add_argument(
+        "--explicit-formula-advisory",
+        action="store_true",
+        help="Use question-defined formula operands for coverage and page protection only.",
+    )
     parser.add_argument("--supplemental-find", action="store_true", help="Allow one document-scoped retrieval only for partial evidence.")
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval and generation stage timing.")
     parser.add_argument(
@@ -214,6 +240,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.evaluation_backend == "local":
+        os.environ.update({
+            "LANGSMITH_TRACING": "false",
+            "LANGSMITH_TRACING_V2": "false",
+            "LANGCHAIN_TRACING_V2": "false",
+        })
+
     if args.structured_executor and not args.evidence_frame:
         parser.error("--structured-executor requires --evidence-frame.")
     if args.structured_coverage and not args.evidence_frame:
@@ -242,37 +275,45 @@ def main() -> None:
         args.structured_task_executor,
         args.answer_consistency_validator,
         args.protected_evidence_slots,
+        args.stage_aware_coverage,
+        args.protected_page_slots,
+        args.numeric_display_validator,
+        args.answer_required_facets,
+        args.explicit_formula_advisory,
         args.supplemental_find,
     )
     with DATA_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
         source_rows = list(csv.DictReader(handle))
     id_by_question = {row.get("question", ""): row.get("financebench_id", "") for row in source_rows}
     dev_ids = _development_ids(source_rows)
-    client = Client()
-    try:
-        examples = list(client.list_examples(dataset_name=args.dataset_name))
-    except Exception as exc:
-        raise SystemExit(
-            "LangSmith is unavailable. Check access to api.smith.langchain.com:443 and your proxy settings."
-        ) from exc
+    client = None
+    if args.evaluation_backend == "local":
+        examples = list(source_rows)
+    else:
+        from langsmith import Client
+
+        client = Client()
+        try:
+            examples = list(client.list_examples(dataset_name=args.dataset_name))
+        except Exception as exc:
+            raise SystemExit(
+                "LangSmith is unavailable. Use --evaluation-backend local or check the LangSmith account."
+            ) from exc
     if args.split != "all":
         use_dev = args.split == "dev"
         examples = [
             example
             for example in examples
-            if ((getattr(example, "metadata", None) or {}).get("financebench_id") in dev_ids) == use_dev
+            if (_example_financebench_id(example) in dev_ids) == use_dev
         ]
     if args.question_id:
         requested_ids = set(args.question_id)
         examples = [
             example
             for example in examples
-            if (getattr(example, "metadata", None) or {}).get("financebench_id") in requested_ids
+            if _example_financebench_id(example) in requested_ids
         ]
-        selected_ids = {
-            (getattr(example, "metadata", None) or {}).get("financebench_id")
-            for example in examples
-        }
+        selected_ids = {_example_financebench_id(example) for example in examples}
         missing_ids = requested_ids - selected_ids
         if missing_ids:
             parser.error(f"question IDs not found in selected split: {', '.join(sorted(missing_ids))}")
@@ -293,7 +334,7 @@ def main() -> None:
         examples = [
             example
             for example in examples
-            if (getattr(example, "metadata", None) or {}).get("financebench_id") in retry_ids
+            if _example_financebench_id(example) in retry_ids
         ]
     if args.resume:
         if not args.output:
@@ -308,10 +349,12 @@ def main() -> None:
             examples = [
                 example
                 for example in examples
-                if (getattr(example, "metadata", None) or {}).get("financebench_id") not in completed_ids
+                if _example_financebench_id(example) not in completed_ids
             ]
     if not examples:
-        raise SystemExit("No LangSmith examples selected. Check --dataset-name and --split.")
+        raise SystemExit("No FinanceBench examples selected. Check the split and question IDs.")
+    if args.evaluation_backend == "local" and args.output is None:
+        args.output = ROOT / "reports" / f"{args.experiment_prefix}_answers.jsonl"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         output_handle = args.output.open("a" if args.resume else "w", encoding="utf-8")
@@ -321,9 +364,21 @@ def main() -> None:
     # Do not load the local embedding model until the remote experiment service is reachable.
     sys.path.insert(0, str(BACKEND))
     from answer_generator import generate_answer
-    from calculation_service import validate_or_repair_structured_answer
+    from calculation_service import validate_numeric_display, validate_or_repair_structured_answer
+    from query_parser import assess_answer_facets
     from rag_orchestrator import prepare_rag_response
     completed_run_ids: set[str] = set()
+
+    if args.evaluation_backend == "langsmith":
+        from langsmith.run_helpers import get_current_run_tree, traceable
+    else:
+        def traceable(*_args, **_kwargs):
+            def decorator(function):
+                return function
+            return decorator
+
+        def get_current_run_tree():
+            return None
 
     @traceable(name="EvidenceRAG.retrieve", run_type="retriever")
     def retrieve(question: str) -> dict:
@@ -390,6 +445,24 @@ def main() -> None:
                     prepared.get("calculation"),
                 )
                 prepared["rag_trace"]["answer_consistency"] = consistency_trace
+                answer, numeric_trace = validate_numeric_display(
+                    answer,
+                    prepared.get("query_spec") or {},
+                    prepared.get("calculation"),
+                )
+                prepared["rag_trace"]["numeric_display_validation"] = numeric_trace
+                facet_trace = assess_answer_facets(answer, prepared.get("query_spec") or {})
+                prepared["rag_trace"]["answer_facet_validation"] = facet_trace
+                if (
+                    facet_trace.get("missing_facets")
+                    and prepared["rag_trace"].get("evidence_flow_stage") == "evidence_ready_for_utilization"
+                ):
+                    prepared["rag_trace"]["evidence_flow_stage"] = "evidence_utilization_failure"
+                elif (
+                    facet_trace.get("complete")
+                    and prepared["rag_trace"].get("evidence_flow_stage") == "evidence_ready_for_utilization"
+                ):
+                    prepared["rag_trace"]["evidence_flow_stage"] = "evidence_utilization_complete"
             finally:
                 if args.slow_question_seconds > 0:
                     faulthandler.cancel_dump_traceback_later()
@@ -414,6 +487,7 @@ def main() -> None:
                 "total_ms": round((time.perf_counter() - question_started) * 1000, 2),
             },
             "application_trace_id": prepared["trace_id"],
+            "evaluation_run_id": prepared["trace_id"],
             "langsmith_trace_id": str(run_tree.id) if run_tree else "",
         }
         if output_handle:
@@ -451,40 +525,56 @@ def main() -> None:
         "structured_task_executor": args.structured_task_executor,
         "answer_consistency_validator": args.answer_consistency_validator,
         "protected_evidence_slots": args.protected_evidence_slots,
+        "stage_aware_coverage": args.stage_aware_coverage,
+        "protected_page_slots": args.protected_page_slots,
+        "numeric_display_validator": args.numeric_display_validator,
+        "answer_required_facets": args.answer_required_facets,
+        "explicit_formula_advisory": args.explicit_formula_advisory,
         "benchmark_status": "fixed_seen_regression",
         "candidate_k": 40,
         "final_evidence_k": 5,
         "model": os.getenv("MODEL", ""),
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "evaluation_backend": args.evaluation_backend,
     }
     print(
-        f"[setup] dataset={args.dataset_name} split={args.split} examples={len(examples)} "
+        f"[setup] backend={args.evaluation_backend} dataset={args.dataset_name} split={args.split} examples={len(examples)} "
         f"planner=false policy={str(args.finance_policy).lower()} frames={str(args.evidence_frame).lower()} "
         f"executor={str(args.structured_executor).lower()} coverage={str(args.structured_coverage).lower()} "
         f"alignment={str(args.frame_alignment).lower()} task_executor={str(args.structured_task_executor).lower()} "
         f"validator={str(args.answer_consistency_validator).lower()} protected={str(args.protected_evidence_slots).lower()} "
+        f"stage_coverage={str(args.stage_aware_coverage).lower()} page_slots={str(args.protected_page_slots).lower()} "
+        f"numeric_display={str(args.numeric_display_validator).lower()} facets={str(args.answer_required_facets).lower()} "
+        f"formula_advisory={str(args.explicit_formula_advisory).lower()} "
         f"supplemental={str(args.supplemental_find).lower()} thinking={args.thinking} "
         "benchmark=fixed_seen_regression",
         flush=True,
     )
     try:
-        results = evaluate(
-            target,
-            data=examples,
-            evaluators=[citation_document_hit],
-            experiment_prefix=args.experiment_prefix,
-            description="Controlled EvidenceRAG fixed, previously-seen FinanceBench regression.",
-            metadata=metadata,
-            max_concurrency=max(1, args.max_concurrency),
-            client=client,
-            blocking=True,
-        )
-        print(f"Experiment: {results.experiment_name}", flush=True)
+        if args.evaluation_backend == "local":
+            for index, example in enumerate(examples, 1):
+                target({"question": str(example.get("question") or "")})
+                print(f"[{index:02d}/{len(examples)}] {_example_financebench_id(example)} completed", flush=True)
+            experiment_name = args.experiment_prefix
+            print(f"Local experiment: {experiment_name}", flush=True)
+        else:
+            from langsmith.evaluation import evaluate
+
+            results = evaluate(
+                target,
+                data=examples,
+                evaluators=[citation_document_hit],
+                experiment_prefix=args.experiment_prefix,
+                description="Controlled EvidenceRAG fixed, previously-seen FinanceBench regression.",
+                metadata=metadata,
+                max_concurrency=max(1, args.max_concurrency),
+                client=client,
+                blocking=True,
+            )
+            experiment_name = results.experiment_name
+            print(f"Experiment: {experiment_name}", flush=True)
         if not args.skip_auto_judge:
-            expected_ids = {
-                (getattr(example, "metadata", None) or {}).get("financebench_id")
-                for example in examples
-            }
+            expected_ids = {_example_financebench_id(example) for example in examples}
             missing_completed_ids = set(filter(None, expected_ids)) - completed_run_ids
             if missing_completed_ids:
                 print(
@@ -493,23 +583,31 @@ def main() -> None:
                     flush=True,
                 )
                 return
-            judge_output = args.judge_output or (
-                ROOT / "reports" / f"{results.experiment_name}_judge.jsonl"
-            )
-            judge_command = [
-                sys.executable,
-                str(ROOT / "scripts" / "judge_financebench_langsmith_experiment.py"),
-                "--experiment-name",
-                results.experiment_name,
-                "--output",
-                str(judge_output),
-            ]
+            judge_output = args.judge_output or (ROOT / "reports" / f"{experiment_name}_judge.jsonl")
+            if args.evaluation_backend == "local":
+                judge_command = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "judge_financebench_local_answers.py"),
+                    "--answers",
+                    str(args.output),
+                    "--output",
+                    str(judge_output),
+                ]
+            else:
+                judge_command = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "judge_financebench_langsmith_experiment.py"),
+                    "--experiment-name",
+                    experiment_name,
+                    "--output",
+                    str(judge_output),
+                ]
             print(f"[judge] starting output={judge_output}", flush=True)
             completed = subprocess.run(judge_command, cwd=ROOT, check=False)
             if completed.returncode != 0:
                 raise SystemExit(
                     f"Experiment completed, but automatic judge failed (exit code {completed.returncode}). "
-                    f"Run the judge command manually for: {results.experiment_name}"
+                    f"Run the judge command manually for: {experiment_name}"
                 )
             print(f"[judge] completed output={judge_output}", flush=True)
     finally:

@@ -49,11 +49,16 @@ def _split_records(
     reference_answers: dict[str, str],
 ) -> tuple[list[dict], int]:
     answers = _read_jsonl(answers_path)
-    judges = {str(item.get("run_id") or ""): item for item in _read_jsonl(judge_path)}
+    judge_records = _read_jsonl(judge_path)
+    judges = {str(item.get("run_id") or ""): item for item in judge_records}
+    judges_by_id = {str(item.get("financebench_id") or ""): item for item in judge_records}
     rows = []
     for answer in answers:
         financebench_id = str(answer.get("financebench_id") or "")
-        judge = judges.get(str(answer.get("langsmith_trace_id") or ""))
+        judge = (
+            judges.get(str(answer.get("langsmith_trace_id") or answer.get("evaluation_run_id") or ""))
+            or judges_by_id.get(financebench_id)
+        )
         if not financebench_id or judge is None:
             raise SystemExit(f"{label}: answer/Judge records cannot be matched.")
         reference_answer = reference_answers.get(financebench_id, "")

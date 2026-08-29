@@ -7,18 +7,37 @@ modules.
 
 import asyncio
 import json
+import os
 import time
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from answer_generator import generate_answer, stream_answer, summarize_messages
-from calculation_service import validate_or_repair_structured_answer
+from calculation_service import validate_numeric_display, validate_or_repair_structured_answer
 from conversation_service import storage
 from rag_orchestrator import RetrievalServiceError, prepare_rag_response
+from query_parser import assess_answer_facets
 from tools import set_rag_step_queue
 
 
 INSUFFICIENT_EVIDENCE_MESSAGE = "未检索到足够证据，无法基于当前知识库可靠回答。"
+
+
+def _finalize_generated_answer(answer: str, prepared: dict) -> str:
+    task_spec = prepared.get("query_spec") or {}
+    calculation = prepared.get("calculation")
+    answer, consistency_trace = validate_or_repair_structured_answer(answer, task_spec, calculation)
+    answer, numeric_trace = validate_numeric_display(answer, task_spec, calculation)
+    facet_trace = assess_answer_facets(answer, task_spec)
+    trace = prepared["rag_trace"]
+    trace["answer_consistency"] = consistency_trace
+    trace["numeric_display_validation"] = numeric_trace
+    trace["answer_facet_validation"] = facet_trace
+    if facet_trace.get("missing_facets") and trace.get("evidence_flow_stage") == "evidence_ready_for_utilization":
+        trace["evidence_flow_stage"] = "evidence_utilization_failure"
+    elif facet_trace.get("complete") and trace.get("evidence_flow_stage") == "evidence_ready_for_utilization":
+        trace["evidence_flow_stage"] = "evidence_utilization_complete"
+    return answer
 
 
 def _compact_history(messages: list) -> list:
@@ -63,12 +82,7 @@ def chat_with_agent(
             history,
             prepared.get("task_policy", ""),
         )
-        response_content, consistency_trace = validate_or_repair_structured_answer(
-            response_content,
-            prepared.get("query_spec") or {},
-            prepared.get("calculation"),
-        )
-        prepared["rag_trace"]["answer_consistency"] = consistency_trace
+        response_content = _finalize_generated_answer(response_content, prepared)
 
     messages.append(AIMessage(content=response_content))
     rag_trace = prepared["rag_trace"]
@@ -150,7 +164,10 @@ async def chat_with_agent_stream(
     if prepared["evidence_status"] == "insufficient":
         full_response = INSUFFICIENT_EVIDENCE_MESSAGE
         yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
-    elif (prepared.get("calculation") or {}).get("authoritative"):
+    elif (prepared.get("calculation") or {}).get("authoritative") or (
+        prepared.get("calculation")
+        and os.getenv("NUMERIC_DISPLAY_VALIDATOR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    ):
         generated = ""
         async for content, chunk_usage in stream_answer(
             user_text,
@@ -160,12 +177,7 @@ async def chat_with_agent_stream(
         ):
             generated += content
             usage = chunk_usage or usage
-        full_response, consistency_trace = validate_or_repair_structured_answer(
-            generated,
-            prepared.get("query_spec") or {},
-            prepared.get("calculation"),
-        )
-        prepared["rag_trace"]["answer_consistency"] = consistency_trace
+        full_response = _finalize_generated_answer(generated, prepared)
         yield f"data: {json.dumps({'type': 'content', 'content': full_response}, ensure_ascii=False)}\n\n"
     else:
         async for content, chunk_usage in stream_answer(
@@ -177,6 +189,7 @@ async def chat_with_agent_stream(
             full_response += content
             usage = chunk_usage or usage
             yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"
+        _finalize_generated_answer(full_response, prepared)
 
     rag_trace = prepared["rag_trace"]
     trace_event = {"type": "trace", "rag_trace": rag_trace, **_response_metadata(prepared, usage)}

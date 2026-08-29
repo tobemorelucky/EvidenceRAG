@@ -69,12 +69,17 @@ def _summarize_split(
     answers = _read_jsonl(answers_path)
     judges = _read_jsonl(judge_path)
     judges_by_run = {str(item.get("run_id") or ""): item for item in judges}
+    judges_by_id = {str(item.get("financebench_id") or ""): item for item in judges}
     answer_ids = [str(item.get("financebench_id") or "") for item in answers]
     if not all(answer_ids) or len(answer_ids) != len(set(answer_ids)):
         raise SystemExit(f"{label}: missing or duplicate financebench_id in answer file.")
-    matched = [judges_by_run.get(str(item.get("langsmith_trace_id") or "")) for item in answers]
+    matched = [
+        judges_by_run.get(str(item.get("langsmith_trace_id") or item.get("evaluation_run_id") or ""))
+        or judges_by_id.get(str(item.get("financebench_id") or ""))
+        for item in answers
+    ]
     if any(item is None for item in matched):
-        raise SystemExit(f"{label}: not every answer has a matching Judge run_id.")
+        raise SystemExit(f"{label}: not every answer has a matching Judge run_id or financebench_id.")
 
     traces = [item.get("rag_trace") or {} for item in answers]
     usages = [item.get("usage") or {} for item in answers]
@@ -116,6 +121,7 @@ def _summarize_split(
         "frame_matched", "measure_validated", "period_validated",
         "metadata_validated", "operand_unique", "operation_validated",
     )
+    flow_stages = Counter(str(trace.get("evidence_flow_stage") or "unknown") for trace in traces)
     return (
         {
             "answers": len(answers),
@@ -155,6 +161,31 @@ def _summarize_split(
             },
             "answer_consistency_checked": sum(bool((trace.get("answer_consistency") or {}).get("checked")) for trace in traces),
             "answer_consistency_repaired": sum(bool((trace.get("answer_consistency") or {}).get("repaired")) for trace in traces),
+            "candidate_coverage_complete": sum((trace.get("candidate_coverage") or {}).get("status") == "complete" for trace in traces),
+            "selected_page_coverage_complete": sum((trace.get("selected_page_coverage") or {}).get("status") == "complete" for trace in traces),
+            "compact_context_coverage_complete": sum((trace.get("compact_context_coverage") or {}).get("status") == "complete" for trace in traces),
+            "candidate_complete_selected_incomplete": sum(
+                (trace.get("candidate_coverage") or {}).get("status") == "complete"
+                and (trace.get("selected_page_coverage") or {}).get("status") != "complete"
+                for trace in traces
+            ),
+            "candidate_complete_selected_incomplete_before_protection": sum(
+                (trace.get("candidate_coverage") or {}).get("status") == "complete"
+                and (trace.get("protected_page_coverage_before") or {}).get("status") != "complete"
+                for trace in traces
+            ),
+            "evidence_flow_stages": dict(sorted(flow_stages.items())),
+            "protected_page_questions": sum(int(trace.get("protected_page_count") or 0) > 0 for trace in traces),
+            "protected_page_count": sum(int(trace.get("protected_page_count") or 0) for trace in traces),
+            "protected_page_budget_violations": sum(
+                int(trace.get("selected_page_count_after_protection") or 0)
+                > int(trace.get("selected_page_count_before_protection") or 0)
+                for trace in traces
+            ),
+            "numeric_display_eligible": sum(bool((trace.get("numeric_display_validation") or {}).get("eligible")) for trace in traces),
+            "numeric_display_repaired": sum(bool((trace.get("numeric_display_validation") or {}).get("repaired")) for trace in traces),
+            "answer_facet_contract_questions": sum(bool((trace.get("answer_facet_validation") or {}).get("required_facets")) for trace in traces),
+            "answer_facet_omission_questions": sum(bool((trace.get("answer_facet_validation") or {}).get("missing_facets")) for trace in traces),
             "protected_evidence_questions": sum(bool(trace.get("answer_context_protected_evidence")) for trace in traces),
             "dropped_protected_evidence": sum(len(trace.get("answer_context_dropped_protected_evidence") or []) for trace in traces),
             "supplemental_triggered": sum(bool(trace.get("supplemental_triggered")) for trace in traces),
@@ -234,6 +265,20 @@ def main() -> None:
             "structured_executions": sum(item["structured_executions"] for item in splits.values()),
             "answer_consistency_checked": sum(item["answer_consistency_checked"] for item in splits.values()),
             "answer_consistency_repaired": sum(item["answer_consistency_repaired"] for item in splits.values()),
+            "candidate_coverage_complete": sum(item["candidate_coverage_complete"] for item in splits.values()),
+            "selected_page_coverage_complete": sum(item["selected_page_coverage_complete"] for item in splits.values()),
+            "compact_context_coverage_complete": sum(item["compact_context_coverage_complete"] for item in splits.values()),
+            "candidate_complete_selected_incomplete": sum(item["candidate_complete_selected_incomplete"] for item in splits.values()),
+            "candidate_complete_selected_incomplete_before_protection": sum(
+                item["candidate_complete_selected_incomplete_before_protection"] for item in splits.values()
+            ),
+            "protected_page_questions": sum(item["protected_page_questions"] for item in splits.values()),
+            "protected_page_count": sum(item["protected_page_count"] for item in splits.values()),
+            "protected_page_budget_violations": sum(item["protected_page_budget_violations"] for item in splits.values()),
+            "numeric_display_eligible": sum(item["numeric_display_eligible"] for item in splits.values()),
+            "numeric_display_repaired": sum(item["numeric_display_repaired"] for item in splits.values()),
+            "answer_facet_contract_questions": sum(item["answer_facet_contract_questions"] for item in splits.values()),
+            "answer_facet_omission_questions": sum(item["answer_facet_omission_questions"] for item in splits.values()),
             "protected_evidence_questions": sum(item["protected_evidence_questions"] for item in splits.values()),
             "dropped_protected_evidence": sum(item["dropped_protected_evidence"] for item in splits.values()),
             "supplemental_triggered": sum(item["supplemental_triggered"] for item in splits.values()),
@@ -294,6 +339,12 @@ def main() -> None:
         f"- EvidenceFrame questions / structured executions: {combined['evidence_frame_questions']} / {combined['structured_executions']}",
         f"- QuerySpec-related frames / structured answerable / execution ready: {combined['queryspec_related_frame_questions']} / {combined['structured_answerable_questions']} / {combined['structured_execution_ready_questions']}",
         f"- Consistency checked / repaired: {combined['answer_consistency_checked']} / {combined['answer_consistency_repaired']}",
+        f"- Candidate / selected-page / compact coverage complete: {combined['candidate_coverage_complete']} / {combined['selected_page_coverage_complete']} / {combined['compact_context_coverage_complete']}",
+        f"- Candidate-complete → selected-incomplete: {combined['candidate_complete_selected_incomplete']}",
+        f"- Candidate-complete → selected-incomplete before protection: {combined['candidate_complete_selected_incomplete_before_protection']}",
+        f"- Protected page questions / pages / budget violations: {combined['protected_page_questions']} / {combined['protected_page_count']} / {combined['protected_page_budget_violations']}",
+        f"- Numeric display eligible / repaired: {combined['numeric_display_eligible']} / {combined['numeric_display_repaired']}",
+        f"- Answer facet contracts / omissions: {combined['answer_facet_contract_questions']} / {combined['answer_facet_omission_questions']}",
         f"- Protected evidence questions / dropped protected units: {combined['protected_evidence_questions']} / {combined['dropped_protected_evidence']}",
         f"- Supplemental triggered / effective / recovered: {combined['supplemental_triggered']} / {combined['supplemental_effective']} / {combined['supplemental_recovered']}",
         "",

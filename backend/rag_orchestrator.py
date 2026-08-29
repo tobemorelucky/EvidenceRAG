@@ -11,8 +11,12 @@ from agent_tools import find_evidence, open_pages, select_pages
 from calculation_service import build_calculation_result, format_calculation_evidence
 from evidence_frame import build_evidence_frames
 from evidence_coverage import (
+    assess_stage_coverage,
     assess_structured_coverage,
     build_document_scoped_supplemental_query,
+    coverage_transition_reason,
+    protect_selected_page_slots,
+    stage_aware_coverage_enabled,
     structured_coverage_enabled,
 )
 from finance_policy import load_finance_policy
@@ -273,13 +277,31 @@ def _supplement_partial_evidence(
     query_parse: dict,
     documents: list[dict],
     coverage: dict,
+    candidate_coverage: dict | None = None,
 ) -> tuple[list[dict], dict]:
     """Perform at most one deterministic retrieval inside selected documents."""
     enabled = os.getenv("SUPPLEMENTAL_FIND_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    candidate_coverage = candidate_coverage or {}
+    candidate_diagnosis = str(candidate_coverage.get("candidate_miss_diagnosis") or "")
+    candidate_missing_operands = [
+        str(item) for item in candidate_coverage.get("missing_operands") or [] if str(item)
+    ]
+    explicit_formula_candidate_gap = bool(
+        candidate_missing_operands
+        and candidate_diagnosis == "target_document_hit_requirement_page_not_hit"
+        and query_parse.get("explicit_formula_source") == "question_explicit_definition"
+    )
+    base_coverage_incomplete = coverage.get("status") in {"partial", "insufficient", "incomplete"}
+    coverage_for_query = dict(coverage)
+    if explicit_formula_candidate_gap:
+        coverage_for_query["missing_operands"] = candidate_missing_operands
     trace = {
         "supplemental_find_enabled": enabled,
         "supplemental_triggered": False,
-        "missing_evidence": list(coverage.get("missing_fields") or coverage.get("structured_missing") or []),
+        "missing_evidence": list(dict.fromkeys([
+            *list(coverage.get("missing_fields") or coverage.get("structured_missing") or []),
+            *[f"operand:{item}" for item in candidate_missing_operands],
+        ])),
         "supplemental_query": "",
         "searched_documents": [],
         "new_pages": [],
@@ -289,17 +311,33 @@ def _supplement_partial_evidence(
         "coverage_before": coverage,
         "coverage_after": coverage,
         "supplemental_skip_reason": "",
+        "explicit_formula_candidate_gap": explicit_formula_candidate_gap,
+        "candidate_missing_operands": candidate_missing_operands,
     }
-    if not enabled or coverage.get("status") not in {"partial", "insufficient", "incomplete"}:
+    if not enabled or not (base_coverage_incomplete or explicit_formula_candidate_gap):
         return documents, trace
-    actionable_missing = list(coverage.get("missing_fields") or []) + list(coverage.get("missing_periods") or [])
+    if candidate_coverage:
+        if candidate_coverage.get("status") == "complete" and not base_coverage_incomplete:
+            trace["supplemental_skip_reason"] = "candidate_coverage_complete"
+            return documents, trace
+        if candidate_diagnosis == "target_document_not_hit":
+            trace["supplemental_skip_reason"] = "target_document_not_hit"
+            return documents, trace
+        if candidate_diagnosis != "target_document_hit_requirement_page_not_hit":
+            trace["supplemental_skip_reason"] = "target_document_not_high_confidence"
+            return documents, trace
+    actionable_missing = (
+        list(coverage.get("missing_fields") or [])
+        + list(coverage.get("missing_periods") or [])
+        + candidate_missing_operands
+    )
     if not actionable_missing and coverage.get("page_supported") is not False:
         trace["supplemental_skip_reason"] = "structural_metadata_gap_not_retrieval_actionable"
         return documents, trace
     filenames = list(dict.fromkeys(str(doc.get("filename") or "") for doc in documents if doc.get("filename")))
     if not filenames:
         return documents, trace
-    supplemental_query = build_document_scoped_supplemental_query(question, query_parse, coverage)
+    supplemental_query = build_document_scoped_supplemental_query(question, query_parse, coverage_for_query)
     if not supplemental_query:
         return documents, trace
     trace.update({
@@ -345,7 +383,6 @@ def _supplement_partial_evidence(
             new_hashes.append(item_hash)
             existing_hashes.add(item_hash)
         trace["new_evidence_hashes"] = new_hashes
-        trace["supplemental_effective"] = bool(new_hashes)
         if not new_pages:
             trace["supplemental_skip_reason"] = "no_new_evidence_hash"
             return documents, trace
@@ -353,7 +390,28 @@ def _supplement_partial_evidence(
             {"filename": doc.get("filename"), "page_number": doc.get("page_number")}
             for doc in new_pages
         ]
-        return _deduplicate_docs([*documents, *new_pages]), trace
+        supplemented_documents = _deduplicate_docs([*documents, *new_pages])
+        if explicit_formula_candidate_gap:
+            before_stage = assess_stage_coverage(
+                query_parse, documents, stage="selected_page_before_supplemental",
+            )
+            after_stage = assess_stage_coverage(
+                query_parse, supplemented_documents, stage="selected_page_after_supplemental",
+            )
+            before_missing = set(before_stage.get("missing_requirements") or [])
+            after_missing = set(after_stage.get("missing_requirements") or [])
+            resolved = sorted(before_missing - after_missing)
+            trace["stage_coverage_before"] = before_stage
+            trace["stage_coverage_after"] = after_stage
+            trace["supplemental_requirement_improvements"] = [
+                f"resolved:stage_requirement:{item}" for item in resolved
+            ]
+            trace["supplemental_effective"] = bool(resolved)
+        else:
+            # New content is not evidence of effectiveness. The caller checks
+            # base/structured requirements again after rebuilding frames.
+            trace["supplemental_effective"] = False
+        return supplemented_documents, trace
     except Exception as exc:
         # Supplemental retrieval is optional. Preserve the primary answer path
         # and expose the exact failure in trace instead of hiding it as no hit.
@@ -367,6 +425,8 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
     initial = _run_search(question)
     initial_docs = list(initial.get("docs") or [])
     initial_candidates = list(initial.get("initial_candidate_docs") or initial_docs)
+    candidate_pool = list(initial_candidates)
+    query_parse = parse_query(question)
     complex_question, route_reason = _is_complex_question(question)
     low_evidence = len(initial_docs) < 2
 
@@ -397,6 +457,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
                 break
 
         if all_candidates:
+            candidate_pool = _deduplicate_docs(all_candidates)
             finance_config = get_finance_rag_config()
             finalized = finalize_retrieved_documents(
                 question,
@@ -429,9 +490,21 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
                 for document in final_docs
             ]
 
+    candidate_coverage = (
+        assess_stage_coverage(query_parse, candidate_pool, stage="candidate")
+        if stage_aware_coverage_enabled() else {}
+    )
+    final_docs, protected_page_trace = protect_selected_page_slots(
+        query_parse,
+        candidate_pool,
+        final_docs,
+    )
     answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs)
+    selected_page_coverage = (
+        assess_stage_coverage(query_parse, answer_docs, stage="selected_page")
+        if stage_aware_coverage_enabled() else {}
+    )
     citations = build_citations(answer_docs)
-    query_parse = parse_query(question)
     evidence_frames, evidence_frame_trace = _build_evidence_frames_for_documents(
         answer_docs,
         str(query_parse.get("company") or ""),
@@ -455,6 +528,7 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         query_parse,
         answer_docs,
         evidence_coverage,
+        candidate_coverage if stage_aware_coverage_enabled() else None,
     )
     if supplemental_trace["supplemental_triggered"]:
         citations = build_citations(answer_docs)
@@ -477,7 +551,9 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         )
         supplemental_trace["coverage_after"] = evidence_coverage
         coverage_before = supplemental_trace.get("coverage_before") or {}
-        requirement_improvements = []
+        requirement_improvements = list(
+            supplemental_trace.get("supplemental_requirement_improvements") or []
+        )
         for name in ("missing_fields", "missing_periods", "structured_missing"):
             before_missing = {str(item) for item in coverage_before.get(name) or []}
             after_missing = {str(item) for item in evidence_coverage.get(name) or []}
@@ -494,6 +570,12 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
         supplemental_trace["coverage_improved"] = coverage_improved
         supplemental_trace["supplemental_requirement_improvements"] = requirement_improvements
         supplemental_trace["supplemental_effective"] = coverage_improved
+        if stage_aware_coverage_enabled():
+            selected_page_coverage = assess_stage_coverage(
+                query_parse,
+                answer_docs,
+                stage="selected_page_after_supplemental",
+            )
     calculation = build_calculation_result(
         query_parse,
         evidence_coverage,
@@ -536,6 +618,21 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             **supplemental_trace,
             **evidence_frame_trace,
             **answer_page_open_trace,
+            "candidate_coverage": candidate_coverage,
+            "selected_page_coverage": selected_page_coverage,
+            "candidate_to_selected_transition": (
+                coverage_transition_reason(candidate_coverage, selected_page_coverage)
+                if candidate_coverage and selected_page_coverage else "disabled"
+            ),
+            "protected_page_slots_enabled": protected_page_trace.get("protected_page_slots_enabled", False),
+            "protected_pages": protected_page_trace.get("protected_pages") or [],
+            "protected_page_replacements": protected_page_trace.get("protected_page_replacements") or [],
+            "protected_page_count": protected_page_trace.get("protected_page_count") or 0,
+            "protected_page_coverage_before": protected_page_trace.get("coverage_before") or {},
+            "protected_page_coverage_after": protected_page_trace.get("coverage_after") or {},
+            "protected_page_coverage_transition": protected_page_trace.get("coverage_transition_reason") or "",
+            "selected_page_count_before_protection": protected_page_trace.get("selected_page_count_before") or 0,
+            "selected_page_count_after_protection": protected_page_trace.get("selected_page_count_after") or 0,
         }
     )
     latency = dict(trace.get("latency_breakdown") or {})
@@ -554,6 +651,39 @@ def prepare_rag_response(question: str, profile: str | None = None, mode: str | 
             "answer_context_chars": len(evidence),
             "answer_context_unit_count": len(answer_docs),
         }
+    compact_context_coverage = (
+        assess_stage_coverage(
+            query_parse,
+            [{
+                "filename": " ".join(dict.fromkeys(
+                    str(document.get("filename") or "") for document in answer_docs if document.get("filename")
+                )),
+                "page_number": "compact",
+                "text": evidence,
+            }],
+            stage="compact_context",
+        )
+        if stage_aware_coverage_enabled() else {}
+    )
+    if candidate_coverage and selected_page_coverage and compact_context_coverage:
+        if candidate_coverage.get("status") != "complete":
+            evidence_flow_stage = "retrieval_miss"
+        elif selected_page_coverage.get("status") != "complete":
+            evidence_flow_stage = "candidate_to_page_selection_loss"
+        elif compact_context_coverage.get("status") != "complete":
+            evidence_flow_stage = "compression_loss"
+        else:
+            evidence_flow_stage = "evidence_ready_for_utilization"
+    else:
+        evidence_flow_stage = "disabled"
+    trace.update({
+        "compact_context_coverage": compact_context_coverage,
+        "selected_to_compact_transition": (
+            coverage_transition_reason(selected_page_coverage, compact_context_coverage)
+            if selected_page_coverage and compact_context_coverage else "disabled"
+        ),
+        "evidence_flow_stage": evidence_flow_stage,
+    })
     trace.update(answer_context_meta)
     answer_directives = build_answer_directives(question, query_parse)
     if answer_directives:

@@ -1,6 +1,7 @@
 from query_parser import (
-    assess_required_field_coverage,
+    assess_answer_facets,
     build_answer_directives,
+    assess_required_field_coverage,
     build_finance_query_rewrite,
     build_required_field_query,
     build_supplemental_field_query,
@@ -400,3 +401,120 @@ def test_explicit_selection_measure_can_request_argmax():
     assert parsed["operation"] == "argmax"
     assert parsed["candidate_dimension"] == "segment"
     assert parsed["operation_confidence"] >= 0.8
+
+
+def test_multi_part_answer_contract_comes_only_from_question_semantics(monkeypatch):
+    monkeypatch.setenv("ANSWER_REQUIRED_FACETS_ENABLED", "true")
+    question = "Which customer accounted for what percentage of FY2023 revenue?"
+    parsed = parse_query(question)
+
+    assert parsed["answer_type"] == "multi_part"
+    assert parsed["required_facets"] == ["entity", "numeric_value", "percentage"]
+    directives = build_answer_directives(question, parsed)
+    assert any("entity, numeric_value, percentage" in directive for directive in directives)
+
+
+def test_percentage_change_contract_requires_final_percentage_not_all_operands():
+    parsed = parse_query(
+        "What was the percentage change in revenue from FY2022 to FY2023, rounded to one decimal place?"
+    )
+
+    assert "percentage" in parsed["required_facets"]
+    assert "baseline_value" not in parsed["required_facets"]
+    assert "target_value" not in parsed["required_facets"]
+
+
+def test_answer_facet_check_records_omission_without_filling_it():
+    task = {
+        "answer_type": "multi_part",
+        "required_facets": ["entity", "numeric_value", "percentage"],
+    }
+
+    trace = assess_answer_facets("The U.S. government was the primary customer.", task)
+
+    assert trace["facet_checks"]["entity"] is True
+    assert trace["missing_facets"] == ["numeric_value", "percentage"]
+    assert trace["complete"] is False
+
+
+def test_explicit_formula_contract_extracts_existing_fields_acronym_and_period_bindings(monkeypatch):
+    monkeypatch.setenv("EXPLICIT_FORMULA_ADVISORY_ENABLED", "true")
+    parsed = parse_query(
+        "What is Example's FY2024 efficiency index? The index is defined as: "
+        "365 * (average accounts payable between FY2023 and FY2024) / "
+        "(FY2024 COGS + change in inventory between FY2023 and FY2024). "
+        "Round your answer to two decimal places."
+    )
+
+    operands = {item["key"]: item for item in parsed["explicit_formula_operands"]}
+    assert parsed["explicit_formula_present"] is True
+    assert parsed["explicit_formula_source"] == "question_explicit_definition"
+    assert parsed["explicit_formula_confidence"] == 1.0
+    assert parsed["task_type_original"] == "comparison"
+    assert parsed["task_type"] == "calculation"
+    assert parsed["task_type_resolution_method"] == "explicit_formula_direct_value"
+    assert parsed["answer_type"] == "numeric_value"
+    assert list(operands) == ["accounts_payable", "cogs", "inventory"]
+    assert operands["accounts_payable"]["periods"] == ["2023", "2024"]
+    assert operands["accounts_payable"]["transform"] == "average"
+    assert operands["cogs"]["field"] == ""
+    assert operands["cogs"]["periods"] == ["2024"]
+    assert operands["inventory"]["transform"] == "change"
+    # Advisory extraction must not alter the existing retrieval rewrite fields.
+    assert parsed["required_fields"] == ["inventory"]
+    expression = parsed["explicit_formula_expression"]
+    assert expression["kind"] == "question_defined_expression"
+    assert expression["operand_keys"] == ["accounts_payable", "cogs", "inventory"]
+    assert expression["constants"] == ["365"]
+    assert expression["execution_allowed"] is False
+
+
+def test_explicit_formula_does_not_override_real_comparison_intent(monkeypatch):
+    monkeypatch.setenv("EXPLICIT_FORMULA_ADVISORY_ENABLED", "true")
+    parsed = parse_query(
+        "The efficiency index is defined as revenue / assets. "
+        "Did the efficiency index increase from FY2023 to FY2024?"
+    )
+
+    assert parsed["task_type_original"] == "comparison"
+    assert parsed["task_type"] == "comparison"
+    assert parsed["task_type_resolution_method"] == "explicit_formula_outer_comparison"
+
+
+def test_explicit_formula_does_not_override_real_selection_intent(monkeypatch):
+    monkeypatch.setenv("EXPLICIT_FORMULA_ADVISORY_ENABLED", "true")
+    parsed = parse_query(
+        "The efficiency index is defined as revenue / assets. "
+        "Which segment had the highest efficiency index in FY2024?"
+    )
+
+    assert parsed["task_type"] == "selection"
+    assert parsed["task_type_resolution_method"] == "explicit_formula_outer_selection"
+
+
+def test_explicit_formula_task_type_override_is_fully_reversible(monkeypatch):
+    monkeypatch.setenv("EXPLICIT_FORMULA_ADVISORY_ENABLED", "false")
+    parsed = parse_query(
+        "What is the efficiency index? The index is defined as revenue / assets."
+    )
+
+    assert parsed["explicit_formula_present"] is True
+    assert parsed["task_type"] == parsed["task_type_original"]
+    assert parsed["task_type_resolution_method"] == "explicit_formula_advisory_disabled"
+
+
+def test_formula_advisory_does_not_infer_formula_without_explicit_definition():
+    parsed = parse_query("How efficiently did the company manage payables and inventory in FY2024?")
+
+    assert parsed["explicit_formula_present"] is False
+    assert parsed["explicit_formula_operands"] == []
+    assert parsed["explicit_formula_confidence"] == 0.0
+
+
+def test_explicit_formula_reuses_existing_metric_alias_mapping():
+    parsed = parse_query("Free cash flow is defined as (cash from operations - capex).")
+
+    assert [item["key"] for item in parsed["explicit_formula_operands"]] == [
+        "cash_from_operations", "capital_expenditures",
+    ]
+    assert parsed["explicit_formula_confidence"] == 1.0

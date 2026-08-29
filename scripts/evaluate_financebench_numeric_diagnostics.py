@@ -163,13 +163,17 @@ def main() -> None:
     answers = _read_jsonl(args.answers)
     judges = _read_jsonl(args.judge)
     judges_by_run = {str(item.get("run_id") or ""): item for item in judges}
+    judges_by_id = {str(item.get("financebench_id") or ""): item for item in judges}
     with args.dataset.open("r", encoding="utf-8-sig", newline="") as handle:
         references = {str(row.get("financebench_id") or ""): str(row.get("answer") or "") for row in csv.DictReader(handle)}
 
     output = []
     for answer in answers:
         financebench_id = str(answer.get("financebench_id") or "")
-        judge = judges_by_run.get(str(answer.get("langsmith_trace_id") or ""), {})
+        judge = (
+            judges_by_run.get(str(answer.get("langsmith_trace_id") or answer.get("evaluation_run_id") or ""))
+            or judges_by_id.get(str(answer.get("financebench_id") or ""), {})
+        )
         task_type = str((answer.get("rag_trace") or {}).get("task_type") or "")
         question = str(answer.get("question") or "")
         equivalent, details = _numeric_equivalent(

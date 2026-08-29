@@ -58,13 +58,15 @@ ANSWER_TEMPERATURE=0.1
 - 默认 `FINANCE_POLICY_ENABLED=false`，关闭时继续使用原有 v14 回答模板。当前 dev20 A/B 未证明 Policy 能提高准确率，因此正式 holdout 仍建议保持关闭；该功能保留为实验开关。
 - 开启后仅增加一次带缓存的本地配置读取；不会新增 LLM 调用、检索、重排或 Agent 循环。
 - trace 会记录 `task_type`、`policy`、策略字符数、估算 token、缓存命中和本地加载耗时。
-- LangSmith 评测脚本使用 `--finance-policy` 开启，使用 `--no-finance-policy` 或省略参数关闭，便于执行同样本 A/B。
+- 本地 FinanceBench 评测使用 `--finance-policy` 开启，使用 `--no-finance-policy` 或省略参数关闭，便于执行同样本 A/B。
 
 示例：
 
 ```powershell
-conda run --no-capture-output -n rag python -u scripts/run_financebench_langsmith_experiment.py --split dev --limit 10 --finance-policy --experiment-prefix evidencerag-finance-policy-smoke
+conda run --no-capture-output -n rag python -u scripts/run_financebench_local_experiment.py --split dev --limit 10 --finance-policy --experiment-prefix evidencerag-finance-policy-smoke
 ```
+
+FinanceBench 评测默认使用本地 CSV、JSONL 和独立 Judge，不访问 LangSmith。`.env` 中的 `FINANCEBENCH_EVALUATION_BACKEND=local`、`LANGSMITH_TRACING=false` 会同时关闭实验上传和应用 tracing。本地入口为 `scripts/run_financebench_local_experiment.py`，完成后会自动调用 `scripts/judge_financebench_local_answers.py`。旧 LangSmith 入口仅作为以后恢复服务时的兼容代码保留。
 
 ## 重建 40 份金融文档索引
 
@@ -120,10 +122,15 @@ STRUCTURED_COVERAGE_ADVISORY_ENABLED=true
 STRUCTURED_TASK_EXECUTOR_ENABLED=false
 ANSWER_CONSISTENCY_VALIDATOR_ENABLED=false
 RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED=false
+STAGE_AWARE_COVERAGE_ENABLED=false
+PROTECTED_PAGE_SLOTS_ENABLED=false
+NUMERIC_DISPLAY_VALIDATOR_ENABLED=false
+ANSWER_REQUIRED_FACETS_ENABLED=false
+EXPLICIT_FORMULA_ADVISORY_ENABLED=false
 SUPPLEMENTAL_FIND_ENABLED=false
 ```
 
-启用后流程仍保留现有 Dense/BM25、RRF、Jina 和页面选择。结构化 coverage 默认只作 advisory；高置信 executor 结果可由本地一致性校验器验证，protected slots 只重分配现有压缩预算；仅当 base coverage 确实不完整时允许一次目标文档内补搜。正式运行及 v14/Oracle 对比命令见 [`docs/financebench_fixed_regression_protocol.md`](docs/financebench_fixed_regression_protocol.md)。
+启用后流程仍保留现有 Dense/BM25、RRF、Jina 和页面选择。结构化 coverage 默认只作 advisory；高置信 executor 结果可由本地一致性校验器验证，protected slots 只重分配现有页面/压缩预算。显式公式 advisory 只读取问题明确给出的公式和操作数，不改变检索改写或 executor；一次性补搜仅在目标文档已确定且真实 QuerySpec requirement 缺失时触发。正式运行及 v14/Oracle 对比命令见 [`docs/financebench_fixed_regression_protocol.md`](docs/financebench_fixed_regression_protocol.md)。
 
 ## 数据与迁移说明
 

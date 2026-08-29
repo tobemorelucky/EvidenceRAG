@@ -68,3 +68,27 @@ def test_summary_reports_page_loss_structured_execution_and_supplement(tmp_path)
     assert summary["task_types"]["calculation"]["accuracy"] == 1.0
     assert summary["average_answer_tokens"] == 100.0
     assert summary["average_latency_ms"] == 400.0
+
+
+def test_summary_matches_local_judge_by_financebench_id(tmp_path):
+    answers = tmp_path / "local_answers.jsonl"
+    judges = tmp_path / "local_judges.jsonl"
+    _write_jsonl(
+        answers,
+        [{
+            "financebench_id": "q-local",
+            "evaluation_run_id": "local-run",
+            "langsmith_trace_id": "",
+            "usage": {"total_tokens": 10},
+            "rag_trace": {"task_type": "lookup"},
+        }],
+    )
+    _write_jsonl(
+        judges,
+        [{"run_id": "different-local-run", "financebench_id": "q-local", "score": 1, "verdict": "correct"}],
+    )
+
+    summary, identifiers = _summarize_split("local", answers, judges, {"q-local": set()})
+
+    assert identifiers == {"q-local"}
+    assert summary["accuracy"] == 1.0
