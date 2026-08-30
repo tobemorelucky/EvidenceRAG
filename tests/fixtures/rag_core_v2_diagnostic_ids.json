@@ -1,0 +1,34 @@
+{
+  "source": "evidencerag-clean-baseline-v1_answers.jsonl",
+  "selection_rule": "Five historical candidate misses, five candidate-to-context losses, five gold-context refusals, and five generic table/calculation questions. IDs are offline evaluation metadata only.",
+  "categories": {
+    "candidate_miss": [
+      "financebench_id_01865",
+      "financebench_id_00735",
+      "financebench_id_01275",
+      "financebench_id_01351",
+      "financebench_id_00956"
+    ],
+    "candidate_to_context_loss": [
+      "financebench_id_00601",
+      "financebench_id_07507",
+      "financebench_id_03029",
+      "financebench_id_03856",
+      "financebench_id_01009"
+    ],
+    "gold_context_refusal": [
+      "financebench_id_00606",
+      "financebench_id_04735",
+      "financebench_id_03069",
+      "financebench_id_00724",
+      "financebench_id_01911"
+    ],
+    "table_or_calculation": [
+      "financebench_id_03471",
+      "financebench_id_01198",
+      "financebench_id_06655",
+      "financebench_id_00678",
+      "financebench_id_00684"
+    ]
+  }
+}

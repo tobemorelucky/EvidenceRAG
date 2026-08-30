@@ -21,6 +21,12 @@ sys.path.insert(0, str(BACKEND))
 from runtime_profile import apply_runtime_profile, feature_state, print_feature_summary
 
 
+ISOLATED_PROFILES = {
+    "clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1",
+    "rag_core_v2", "rag_core_v2_skills",
+}
+
+
 def _development_ids(rows: list[dict[str, str]], size: int = 20) -> set[str]:
     groups: dict[str, list[dict[str, str]]] = {}
     for row in rows:
@@ -178,7 +184,10 @@ def main() -> None:
     parser.add_argument("--experiment-prefix", default="evidencerag-finance-static")
     parser.add_argument(
         "--rag-profile",
-        choices=("finance", "clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"),
+        choices=(
+            "finance", "clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1",
+            "rag_core_v2", "rag_core_v2_skills",
+        ),
         default="finance",
         help="Runtime profile. clean_baseline authoritatively disables all experimental answer paths.",
     )
@@ -227,6 +236,16 @@ def main() -> None:
     )
     parser.add_argument("--slow-question-seconds", type=int, default=90, help="Dump a stack trace after this many seconds per question (0 disables it).")
     parser.add_argument("--output", type=Path, help="Write each completed answer, citations, and trace to JSONL.")
+    parser.add_argument(
+        "--include-evidence-context",
+        action="store_true",
+        help="Include the exact answer evidence in local JSONL for targeted offline recall diagnostics.",
+    )
+    parser.add_argument(
+        "--retrieval-only",
+        action="store_true",
+        help="Run retrieval/context diagnostics without calling the answer model or judge.",
+    )
     parser.add_argument(
         "--skip-auto-judge",
         action="store_true",
@@ -436,7 +455,9 @@ def main() -> None:
         retrieval_seconds = time.perf_counter() - started
         if args.diagnose:
             print(f"[question] {financebench_id} retrieve finished in {retrieval_seconds:.2f}s", flush=True)
-        if prepared.get("skill_applied"):
+        if args.retrieval_only:
+            answer, usage = "", {}
+        elif prepared.get("skill_applied"):
             answer, usage = str(prepared.get("skill_answer") or ""), {}
         elif prepared["evidence_status"] == "insufficient":
             answer, usage = "未检索到足够证据，无法基于当前知识库可靠回答。", {}
@@ -452,7 +473,7 @@ def main() -> None:
                     prepared["evidence"],
                     prepared.get("task_policy", ""),
                 )
-                if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"}:
+                if args.rag_profile in ISOLATED_PROFILES:
                     prepared["rag_trace"].update({
                         "answer_consistency": {"enabled": False, "checked": False},
                         "numeric_display_validation": {"enabled": False, "checked": False},
@@ -519,6 +540,8 @@ def main() -> None:
             "evaluation_run_id": prepared["trace_id"],
             "langsmith_trace_id": str(run_tree.id) if run_tree else "",
         }
+        if args.include_evidence_context:
+            result["evidence_context"] = prepared["evidence"]
         if output_handle:
             output_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             output_handle.flush()
@@ -533,13 +556,13 @@ def main() -> None:
         "query_planner": False,
         "step_back": False,
         "field_aware": feature_state(args.rag_profile)["field_aware"],
-        "statement_aware": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware,
-        "required_field_page_scoring": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware,
-        "required_period_page_scoring": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware,
-        "legacy_supplemental_search": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware and not args.supplemental_find,
+        "statement_aware": False if args.rag_profile in ISOLATED_PROFILES else args.field_aware,
+        "required_field_page_scoring": False if args.rag_profile in ISOLATED_PROFILES else args.field_aware,
+        "required_period_page_scoring": False if args.rag_profile in ISOLATED_PROFILES else args.field_aware,
+        "legacy_supplemental_search": False if args.rag_profile in ISOLATED_PROFILES else args.field_aware and not args.supplemental_find,
         "supplemental_find": active_modules["Supplemental Retrieval"],
-        "page_neighbor_window": 0 if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else (2 if args.field_aware else 0),
-        "context_page_window": 0 if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else (2 if args.field_aware else 0),
+        "page_neighbor_window": 0 if args.rag_profile in ISOLATED_PROFILES else (2 if args.field_aware else 0),
+        "context_page_window": 0 if args.rag_profile in ISOLATED_PROFILES else (2 if args.field_aware else 0),
         "rerank": args.enable_rerank,
         "rerank_remote_max_attempts": int(os.getenv("RERANK_REMOTE_MAX_ATTEMPTS", "2")),
         "rerank_remote_backoff_seconds": float(os.getenv("RERANK_REMOTE_BACKOFF_SECONDS", "0.8")),
@@ -562,8 +585,8 @@ def main() -> None:
         "answer_required_facets": args.answer_required_facets,
         "explicit_formula_advisory": args.explicit_formula_advisory,
         "benchmark_status": "fixed_seen_regression",
-        "candidate_k": 40,
-        "final_evidence_k": 5,
+        "candidate_k": int(os.getenv("FINANCE_RAG_CANDIDATE_K", "40")),
+        "final_evidence_k": int(os.getenv("FINANCE_RAG_FINAL_TOP_K", "5")),
         "model": os.getenv("MODEL", ""),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "evaluation_backend": args.evaluation_backend,
@@ -605,7 +628,7 @@ def main() -> None:
             )
             experiment_name = results.experiment_name
             print(f"Experiment: {experiment_name}", flush=True)
-        if not args.skip_auto_judge:
+        if not args.skip_auto_judge and not args.retrieval_only:
             expected_ids = {_example_financebench_id(example) for example in examples}
             missing_completed_ids = set(filter(None, expected_ids)) - completed_run_ids
             if missing_completed_ids:

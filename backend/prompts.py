@@ -6,6 +6,7 @@ from retrieval code.
 
 PROMPT_VERSION = "2026-08-26.v10"
 CLEAN_BASELINE_PROMPT_VERSION = "2026-08-29.clean-baseline-v1"
+RAG_CORE_V2_PROMPT_VERSION = "2026-08-30.rag-core-v2"
 
 CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT = """You are EvidenceRAG, a retrieval-augmented assistant.
 

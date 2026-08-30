@@ -127,7 +127,7 @@ def _summarize_split(
     correct = sum(int(item.get("score") or 0) for item in matched if item)
     task_totals: Counter = Counter()
     task_correct: Counter = Counter()
-    candidate_page_hits = context_page_hits = candidate_context_losses = 0
+    candidate_page_hits = selected_page_hits = context_page_hits = candidate_context_losses = 0
     citation_page_hits = 0
     failure_stages: Counter = Counter()
     for answer, judge, trace in zip(answers, matched, traces):
@@ -148,10 +148,13 @@ def _summarize_split(
             or []
         )
         context = _page_keys(trace.get("answer_context_pages") or answer.get("citations") or [])
+        selected = _page_keys(trace.get("selected_pages") or trace.get("final_selected_pages") or [])
         citations = _page_keys(answer.get("citations") or [])
         candidate_hit = bool(gold & candidates)
+        selected_hit = bool(gold & selected)
         context_hit = bool(gold & context)
         candidate_page_hits += candidate_hit
+        selected_page_hits += selected_hit
         context_page_hits += context_hit
         citation_page_hits += bool(gold & citations)
         candidate_context_losses += candidate_hit and not context_hit
@@ -199,13 +202,27 @@ def _summarize_split(
             "answer_output_tokens": sum(int(usage.get("output_tokens") or 0) for usage in usages),
             "answer_total_tokens": sum(int(usage.get("total_tokens") or 0) for usage in usages),
             "average_answer_tokens": round(sum(int(usage.get("total_tokens") or 0) for usage in usages) / len(answers), 2) if answers else 0.0,
+            "average_answer_input_tokens": round(sum(int(usage.get("input_tokens") or 0) for usage in usages) / len(answers), 2) if answers else 0.0,
+            "average_answer_context_chars": round(sum(int(trace.get("answer_context_chars") or 0) for trace in traces) / len(answers), 2) if answers else 0.0,
             "average_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
             "candidate_gold_page_hits": candidate_page_hits,
             "candidate_gold_page_hit_rate": round(candidate_page_hits / len(answers), 4) if answers else 0.0,
+            "selected_gold_page_hits": selected_page_hits,
+            "selected_gold_page_hit_rate": round(selected_page_hits / len(answers), 4) if answers else 0.0,
             "context_gold_page_hits": context_page_hits,
             "context_gold_page_hit_rate": round(context_page_hits / len(answers), 4) if answers else 0.0,
             "citation_gold_page_hits": citation_page_hits,
             "candidate_to_context_losses": candidate_context_losses,
+            "page_pool_average": round(sum(len(trace.get("selected_pages") or []) for trace in traces) / len(answers), 2) if answers else 0.0,
+            "final_page_average": round(sum(len(trace.get("final_selected_pages") or trace.get("answer_context_pages") or []) for trace in traces) / len(answers), 2) if answers else 0.0,
+            "tables_available_on_selected_pages": sum(int(trace.get("tables_available_on_selected_pages") or 0) for trace in traces),
+            "tables_attached": sum(int(trace.get("tables_attached") or 0) for trace in traces),
+            "table_rows_attached": sum(int(trace.get("table_rows_attached") or 0) for trace in traces),
+            "table_context_chars": sum(int(trace.get("table_context_chars") or 0) for trace in traces),
+            "skill_routes": dict(sorted(Counter(
+                str((trace.get("skill_router") or {}).get("selected_skill") or "none") for trace in traces
+            ).items())),
+            "skill_applied_answers": sum(bool(answer.get("calculation", {}).get("authoritative")) for answer in answers if isinstance(answer.get("calculation"), dict)),
             "evidence_frame_questions": sum(int(trace.get("evidence_frame_count") or 0) > 0 for trace in traces),
             "queryspec_related_frame_questions": sum(int(trace.get("relevant_frame_count") or 0) > 0 for trace in traces),
             "structured_answerable_questions": sum(bool((trace.get("evidence_coverage") or {}).get("structured_answerable")) for trace in traces),
@@ -322,9 +339,15 @@ def main() -> None:
             "answer_output_tokens": sum(item["answer_output_tokens"] for item in splits.values()),
             "answer_total_tokens": sum(item["answer_total_tokens"] for item in splits.values()),
             "candidate_gold_page_hits": sum(item["candidate_gold_page_hits"] for item in splits.values()),
+            "selected_gold_page_hits": sum(item["selected_gold_page_hits"] for item in splits.values()),
             "context_gold_page_hits": sum(item["context_gold_page_hits"] for item in splits.values()),
             "citation_gold_page_hits": sum(item["citation_gold_page_hits"] for item in splits.values()),
             "candidate_to_context_losses": sum(item["candidate_to_context_losses"] for item in splits.values()),
+            "tables_available_on_selected_pages": sum(item["tables_available_on_selected_pages"] for item in splits.values()),
+            "tables_attached": sum(item["tables_attached"] for item in splits.values()),
+            "table_rows_attached": sum(item["table_rows_attached"] for item in splits.values()),
+            "table_context_chars": sum(item["table_context_chars"] for item in splits.values()),
+            "skill_applied_answers": sum(item["skill_applied_answers"] for item in splits.values()),
             "evidence_frame_questions": sum(item["evidence_frame_questions"] for item in splits.values()),
             "queryspec_related_frame_questions": sum(item["queryspec_related_frame_questions"] for item in splits.values()),
             "structured_answerable_questions": sum(item["structured_answerable_questions"] for item in splits.values()),
@@ -367,8 +390,14 @@ def main() -> None:
     for item in (combined["historical_fixed20"], combined["historical_regression80"]):
         item["accuracy"] = round(item["correct"] / item["questions"], 4) if item["questions"] else 0.0
     combined["candidate_gold_page_hit_rate"] = round(combined["candidate_gold_page_hits"] / total, 4) if total else 0.0
+    combined["selected_gold_page_hit_rate"] = round(combined["selected_gold_page_hits"] / total, 4) if total else 0.0
     combined["context_gold_page_hit_rate"] = round(combined["context_gold_page_hits"] / total, 4) if total else 0.0
     combined["average_answer_tokens"] = round(combined["answer_total_tokens"] / total, 2) if total else 0.0
+    combined["average_answer_input_tokens"] = round(combined["answer_input_tokens"] / total, 2) if total else 0.0
+    combined["average_answer_context_chars"] = round(
+        sum(item["average_answer_context_chars"] * item["answers"] for item in splits.values()) / total,
+        2,
+    ) if total else 0.0
     combined["average_latency_ms"] = round(
         sum(item["average_latency_ms"] * item["answers"] for item in splits.values()) / total,
         2,
@@ -410,13 +439,17 @@ def main() -> None:
         f"- Historical fixed20: {combined['historical_fixed20']['correct']}/{combined['historical_fixed20']['questions']} ({combined['historical_fixed20']['accuracy']:.2%})",
         f"- Historical regression80: {combined['historical_regression80']['correct']}/{combined['historical_regression80']['questions']} ({combined['historical_regression80']['accuracy']:.2%})",
         f"- Candidate gold-page hit: {combined['candidate_gold_page_hit_rate']:.2%}",
+        f"- Selected-page gold hit: {combined['selected_gold_page_hit_rate']:.2%}",
         f"- Context gold-page hit: {combined['context_gold_page_hit_rate']:.2%}",
         f"- Candidate → context losses: {combined['candidate_to_context_losses']}",
         f"- Oracle gap: {combined.get('oracle_gap', 'N/A')}",
         f"- Answer tokens: {combined['answer_total_tokens']} (avg {combined['average_answer_tokens']})",
+        f"- Average answer input tokens / context chars: {combined['average_answer_input_tokens']} / {combined['average_answer_context_chars']}",
         f"- Average latency: {combined['average_latency_ms']} ms",
         f"- Jina input chars: {combined['remote_rerank_input_chars']}",
         f"- Remote rerank attempts / cache hits / local fallbacks: {combined['remote_rerank_attempts']} / {combined['rerank_cache_hits']} / {combined['local_fallbacks']}",
+        f"- Tables available / attached / rows attached: {combined['tables_available_on_selected_pages']} / {combined['tables_attached']} / {combined['table_rows_attached']}",
+        f"- Skill-applied answers: {combined['skill_applied_answers']}",
         f"- EvidenceFrame questions / structured executions: {combined['evidence_frame_questions']} / {combined['structured_executions']}",
         f"- QuerySpec-related frames / structured answerable / execution ready: {combined['queryspec_related_frame_questions']} / {combined['structured_answerable_questions']} / {combined['structured_execution_ready_questions']}",
         f"- Consistency checked / repaired: {combined['answer_consistency_checked']} / {combined['answer_consistency_repaired']}",
@@ -431,13 +464,14 @@ def main() -> None:
         "",
         "## Split results",
         "",
-        "| Split | Questions | Correct | Accuracy | Candidate page hit | Context page hit |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Split | Questions | Correct | Accuracy | Candidate hit | Selected hit | Context hit |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for label, item in splits.items():
         lines.append(
             f"| {label} | {item['answers']} | {item['correct']} | {item['accuracy']:.2%} | "
-            f"{item['candidate_gold_page_hit_rate']:.2%} | {item['context_gold_page_hit_rate']:.2%} |"
+            f"{item['candidate_gold_page_hit_rate']:.2%} | {item['selected_gold_page_hit_rate']:.2%} | "
+            f"{item['context_gold_page_hit_rate']:.2%} |"
         )
     markdown_output.parent.mkdir(parents=True, exist_ok=True)
     markdown_output.write_text("\n".join(lines) + "\n", encoding="utf-8")

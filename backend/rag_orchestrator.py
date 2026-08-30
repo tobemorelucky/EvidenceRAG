@@ -10,9 +10,12 @@ from dataclasses import dataclass
 from runtime_profile import (
     EXPLICIT_FORMULA_SKILL_PROFILE,
     FINANCE_SKILLS_V1_PROFILE,
+    RAG_CORE_V2_PROFILE,
+    RAG_CORE_V2_SKILLS_PROFILE,
     apply_runtime_profile,
     feature_state,
     uses_clean_baseline_path,
+    uses_rag_core_v2_path,
 )
 
 apply_runtime_profile()
@@ -31,15 +34,22 @@ from evidence_coverage import (
 )
 from finance_policy import load_finance_policy
 from evidence_context import build_baseline_evidence, build_compact_evidence
-from prompts import CLEAN_BASELINE_PROMPT_VERSION, PROMPT_VERSION
+from prompts import CLEAN_BASELINE_PROMPT_VERSION, PROMPT_VERSION, RAG_CORE_V2_PROMPT_VERSION
 from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
 from rag_pipeline import run_rag_graph
+from rag_core_v2 import (
+    build_core_v2_evidence,
+    choose_core_v2_context_pages,
+    merge_opened_pages,
+    select_core_v2_pages,
+)
 from rag_utils import finalize_retrieved_documents, get_finance_rag_config, retrieve_document_scoped_candidates
 from table_store import TableStore
 
 
 VALID_PROFILES = {
     "general", "finance", "clean_baseline", EXPLICIT_FORMULA_SKILL_PROFILE, FINANCE_SKILLS_V1_PROFILE,
+    RAG_CORE_V2_PROFILE, RAG_CORE_V2_SKILLS_PROFILE,
 }
 VALID_MODES = {"static", "agentic", "auto"}
 _table_store = TableStore()
@@ -552,9 +562,193 @@ def _prepare_clean_baseline_response(question: str, config: ExecutionConfig, sta
     }
 
 
+def _prepare_rag_core_v2_response(question: str, config: ExecutionConfig, started: float) -> dict:
+    """Run hybrid retrieval, soft page aggregation, and contiguous page evidence."""
+    initial = _run_search(question)
+    reranked_chunks = list(initial.get("docs") or [])
+    candidate_pool = list(initial.get("initial_candidate_docs") or reranked_chunks)
+    selected_pages, selection_trace = select_core_v2_pages(
+        question, candidate_pool, reranked_chunks,
+    )
+    context_pages = choose_core_v2_context_pages(
+        selected_pages, selection_trace.get("global_escape_pages", []),
+    )
+    requested_pages = [
+        {"filename": page.get("filename"), "page_number": page.get("page_number")}
+        for page in context_pages
+    ]
+    page_started = time.perf_counter()
+    try:
+        opened = open_pages(requested_pages, limit=len(requested_pages)) if requested_pages else []
+        page_trace = {
+            "answer_page_open_requested": len(requested_pages),
+            "answer_page_opened": len(opened),
+            "answer_page_open_latency_ms": round((time.perf_counter() - page_started) * 1000, 2),
+        }
+    except Exception as exc:
+        opened = []
+        page_trace = {
+            "answer_page_open_requested": len(requested_pages),
+            "answer_page_opened": 0,
+            "answer_page_open_error": f"{type(exc).__name__}: {exc}",
+            "answer_page_open_latency_ms": round((time.perf_counter() - page_started) * 1000, 2),
+        }
+    answer_docs = merge_opened_pages(context_pages, opened)
+    filenames = list(dict.fromkeys(
+        str(page.get("filename") or "").strip() for page in answer_docs if page.get("filename")
+    ))
+    table_load_started = time.perf_counter()
+    tables = []
+    table_errors = []
+    for filename in filenames:
+        try:
+            tables.extend(_table_store.get_tables_by_filename(filename))
+        except Exception as exc:
+            table_errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+    selected_keys = {
+        (str(page.get("filename") or ""), int(page.get("page_number") or 0))
+        for page in answer_docs
+    }
+    tables = [
+        table for table in tables
+        if (str(table.get("filename") or ""), int(table.get("page_number") or 0)) in selected_keys
+    ]
+    evidence, context_meta = build_core_v2_evidence(question, answer_docs, tables)
+    if not evidence:
+        evidence = _format_evidence(reranked_chunks[:6])
+        answer_docs = reranked_chunks[:6]
+        context_meta = {
+            **context_meta,
+            "answer_context_chars": len(evidence),
+            "answer_context_unit_count": len(answer_docs),
+            "answer_context_fallback": "reranked_chunks",
+        }
+    citations = build_citations(answer_docs)
+
+    trace = dict(initial.get("rag_trace") or {})
+    latency = dict(trace.get("latency_breakdown") or {})
+    latency.update({
+        "core_v2_page_open_ms": page_trace.get("answer_page_open_latency_ms", 0),
+        "core_v2_table_load_ms": round((time.perf_counter() - table_load_started) * 1000, 2),
+        "orchestration_latency_ms": round((time.perf_counter() - started) * 1000, 2),
+    })
+    trace_id = str(uuid.uuid4())
+    candidate_k = int(os.getenv("FINANCE_RAG_CANDIDATE_K", "60"))
+    trace.update({
+        "profile": config.profile,
+        "execution_mode": "static",
+        "route_reason": "rag_core_v2_static",
+        "original_question": question,
+        "retrieval_queries": [question],
+        "initial_dense_candidates": trace.get("dense_candidate_count"),
+        "initial_bm25_candidates": trace.get("bm25_candidate_count"),
+        "initial_dense_candidates_requested": candidate_k * 2,
+        "initial_bm25_candidates_requested": candidate_k * 2,
+        "candidate_count_observability": "milvus_hybrid_api_exposes_fused_results_only",
+        "rrf_candidates": len(candidate_pool),
+        "reranked_chunks": [
+            {
+                "filename": chunk.get("filename"),
+                "page_number": chunk.get("page_number"),
+                "chunk_id": chunk.get("chunk_id"),
+                "score": chunk.get("score"),
+                "rerank_score": chunk.get("rerank_score"),
+            }
+            for chunk in reranked_chunks
+        ],
+        "final_selected_pages": [
+            {
+                "filename": page.get("filename"),
+                "page_number": page.get("page_number"),
+                "page_score": page.get("page_score"),
+            }
+            for page in context_pages
+        ],
+        "final_evidence_unit_count": context_meta.get("answer_context_unit_count", 0),
+        "evidence_status": "sufficient" if citations else "insufficient",
+        "trace_id": trace_id,
+        "prompt_version": RAG_CORE_V2_PROMPT_VERSION,
+        "feature_state": feature_state(config.profile),
+        "experiment_modules_in_answer_path": [],
+        "queryspec_used_for_retrieval": False,
+        "queryspec_used_for_context": False,
+        "queryspec_used_for_answer": False,
+        "finance_policy_enabled": False,
+        "structured_authoritative": False,
+        "agent_tool_calls": [{"tool": "search", "query": question, "new_evidence": len(candidate_pool)}],
+        "agent_tool_call_count": 1,
+        "table_load_errors": table_errors,
+        "latency_breakdown": latency,
+        **selection_trace,
+        **page_trace,
+        **context_meta,
+    })
+
+    skill_answer = ""
+    skill_applied = False
+    calculation = None
+    if config.profile == RAG_CORE_V2_SKILLS_PROFILE:
+        from skills.registry import execute_matching_skill
+
+        skill_result = execute_matching_skill(
+            question, answer_docs, candidate_pool,
+            ("explicit_formula", "canonical_finance_metric"),
+        )
+        skill_name = str(skill_result.trace.get("skill_name") or "none")
+        trace["skill_router"] = {
+            "enabled_skills": ["explicit_formula", "canonical_finance_metric"],
+            "selected_skill": skill_name,
+        }
+        if skill_name != "none":
+            trace[f"{skill_name}_skill"] = skill_result.trace
+        skill_answer = skill_result.answer
+        skill_applied = skill_result.applied
+        verified_evidence = str(skill_result.trace.get("verified_evidence") or "")
+        if skill_result.success and not skill_applied and verified_evidence:
+            evidence = f"{evidence}\n\n---\n\n{verified_evidence}"
+        if skill_applied:
+            citations = skill_result.citations
+            calculation = {
+                "source": f"{skill_name}_decimal",
+                "authoritative": True,
+                "formula": skill_result.trace.get("formula_text") or skill_result.trace.get("formula_variant", ""),
+                "operands": skill_result.trace.get("resolved_operands", []),
+                "result": skill_result.trace.get("full_precision_result") or skill_result.trace.get("metric_full_precision_result", ""),
+                "display_result": skill_result.trace.get("display_result") or skill_result.trace.get("metric_display_result", ""),
+            }
+        if skill_result.success:
+            trace["experiment_modules_in_answer_path"] = [f"{skill_name}_skill"]
+        latency[f"{skill_name}_skill_latency_ms"] = skill_result.trace.get("skill_latency_ms", 0)
+        latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        trace["latency_breakdown"] = latency
+
+    trace["answer_prompt_evidence_chars"] = len(evidence)
+    trace["answer_prompt_policy_chars"] = 0
+    trace["answer_prompt_total_chars"] = len(evidence)
+    return {
+        "evidence": evidence,
+        "task_policy": "",
+        "docs": answer_docs,
+        "rag_trace": trace,
+        "profile": config.profile,
+        "execution_mode": "static",
+        "route_reason": "rag_core_v2_static",
+        "citations": citations,
+        "evidence_status": "sufficient" if citations else "insufficient",
+        "calculation": calculation,
+        "query_spec": {},
+        "evidence_frames": [],
+        "trace_id": trace_id,
+        "skill_applied": skill_applied,
+        "skill_answer": skill_answer,
+    }
+
+
 def prepare_rag_response(question: str, profile: str | None = None, mode: str | None = None) -> dict:
     started = time.perf_counter()
     config = resolve_execution_config(profile, mode)
+    if uses_rag_core_v2_path(config.profile):
+        return _prepare_rag_core_v2_response(question, config, started)
     if uses_clean_baseline_path(config.profile):
         return _prepare_clean_baseline_response(question, config, started)
     initial = _run_search(question)

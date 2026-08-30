@@ -9,6 +9,8 @@ from typing import Mapping
 CLEAN_BASELINE_PROFILE = "clean_baseline"
 EXPLICIT_FORMULA_SKILL_PROFILE = "clean_baseline_formula_skill"
 FINANCE_SKILLS_V1_PROFILE = "finance_skills_v1"
+RAG_CORE_V2_PROFILE = "rag_core_v2"
+RAG_CORE_V2_SKILLS_PROFILE = "rag_core_v2_skills"
 
 # These values are authoritative for the clean baseline. They intentionally
 # override stale values from .env so an experiment cannot be polluted by a
@@ -53,6 +55,21 @@ CLEAN_BASELINE_OVERRIDES: Mapping[str, str] = {
     "RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED": "true",
 }
 
+RAG_CORE_V2_OVERRIDES: Mapping[str, str] = {
+    **CLEAN_BASELINE_OVERRIDES,
+    "RAG_PROFILE": RAG_CORE_V2_PROFILE,
+    "FINANCE_RAG_CANDIDATE_K": "60",
+    "FINANCE_RAG_FINAL_TOP_K": "16",
+    "RERANK_REMOTE_CANDIDATE_K": "18",
+    "RAG_CORE_V2_DOCUMENT_TOP_K": "4",
+    "RAG_CORE_V2_PAGE_POOL_K": "10",
+    "RAG_CORE_V2_FINAL_PAGE_K": "6",
+    "RAG_CORE_V2_GLOBAL_ESCAPE_PAGES": "2",
+    "RAG_CORE_V2_MAX_CONTEXT_CHARS": "28000",
+    "RAG_CORE_V2_MAX_TABLE_CHARS": "5000",
+    "RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED": "false",
+}
+
 
 FEATURE_LABELS: tuple[tuple[str, str], ...] = (
     ("Finance Policy", "FINANCE_POLICY_ENABLED"),
@@ -83,7 +100,12 @@ def is_clean_baseline(profile: str | None = None) -> bool:
 def uses_clean_baseline_path(profile: str | None = None) -> bool:
     return normalize_profile(profile) in {
         CLEAN_BASELINE_PROFILE, EXPLICIT_FORMULA_SKILL_PROFILE, FINANCE_SKILLS_V1_PROFILE,
+        RAG_CORE_V2_PROFILE, RAG_CORE_V2_SKILLS_PROFILE,
     }
+
+
+def uses_rag_core_v2_path(profile: str | None = None) -> bool:
+    return normalize_profile(profile) in {RAG_CORE_V2_PROFILE, RAG_CORE_V2_SKILLS_PROFILE}
 
 
 def apply_runtime_profile(profile: str | None = None) -> str:
@@ -101,6 +123,15 @@ def apply_runtime_profile(profile: str | None = None) -> str:
         os.environ.update(CLEAN_BASELINE_OVERRIDES)
         os.environ.update({
             "RAG_PROFILE": FINANCE_SKILLS_V1_PROFILE,
+            "EXPLICIT_FORMULA_SKILL_ENABLED": "true",
+            "CANONICAL_FINANCE_METRIC_SKILL_ENABLED": "true",
+        })
+    elif resolved == RAG_CORE_V2_PROFILE:
+        os.environ.update(RAG_CORE_V2_OVERRIDES)
+    elif resolved == RAG_CORE_V2_SKILLS_PROFILE:
+        os.environ.update(RAG_CORE_V2_OVERRIDES)
+        os.environ.update({
+            "RAG_PROFILE": RAG_CORE_V2_SKILLS_PROFILE,
             "EXPLICIT_FORMULA_SKILL_ENABLED": "true",
             "CANONICAL_FINANCE_METRIC_SKILL_ENABLED": "true",
         })
