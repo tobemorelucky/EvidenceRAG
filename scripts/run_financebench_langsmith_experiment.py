@@ -23,7 +23,7 @@ from runtime_profile import apply_runtime_profile, feature_state, print_feature_
 
 ISOLATED_PROFILES = {
     "clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1",
-    "rag_core_v2", "rag_core_v2_skills",
+    "rag_core_v2", "rag_core_v2_skills", "rag_core_v3", "rag_core_v3_skills",
 }
 
 
@@ -186,7 +186,7 @@ def main() -> None:
         "--rag-profile",
         choices=(
             "finance", "clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1",
-            "rag_core_v2", "rag_core_v2_skills",
+            "rag_core_v2", "rag_core_v2_skills", "rag_core_v3", "rag_core_v3_skills",
         ),
         default="finance",
         help="Runtime profile. clean_baseline authoritatively disables all experimental answer paths.",
@@ -217,6 +217,11 @@ def main() -> None:
         help="Use question-defined formula operands for coverage and page protection only.",
     )
     parser.add_argument("--supplemental-find", action="store_true", help="Allow one document-scoped retrieval only for partial evidence.")
+    parser.add_argument(
+        "--document-local-retrieval",
+        action="store_true",
+        help="For RAG Core v3 only, refine the original query inside a soft document shortlist.",
+    )
     parser.add_argument("--diagnose", action="store_true", help="Print retrieval and generation stage timing.")
     parser.add_argument(
         "--field-aware",
@@ -313,6 +318,10 @@ def main() -> None:
         args.explicit_formula_advisory,
         args.supplemental_find,
     )
+    if args.document_local_retrieval:
+        if args.rag_profile not in {"rag_core_v3", "rag_core_v3_skills"}:
+            parser.error("--document-local-retrieval requires a RAG Core v3 profile.")
+        os.environ["RAG_CORE_V3_DOCUMENT_LOCAL_RETRIEVAL"] = "true"
     with DATA_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
         source_rows = list(csv.DictReader(handle))
     id_by_question = {row.get("question", ""): row.get("financebench_id", "") for row in source_rows}
@@ -397,6 +406,11 @@ def main() -> None:
     from calculation_service import validate_numeric_display, validate_or_repair_structured_answer
     from query_parser import assess_answer_facets
     from rag_orchestrator import prepare_rag_response
+    if args.document_local_retrieval:
+        # rag_orchestrator reapplies the isolated profile at import time; apply
+        # this explicit experiment switch afterwards without weakening profile
+        # isolation for any other caller.
+        os.environ["RAG_CORE_V3_DOCUMENT_LOCAL_RETRIEVAL"] = "true"
     completed_run_ids: set[str] = set()
 
     if args.evaluation_backend == "langsmith":
@@ -412,7 +426,12 @@ def main() -> None:
 
     @traceable(name="EvidenceRAG.retrieve", run_type="retriever")
     def retrieve(question: str) -> dict:
-        return prepare_rag_response(question, profile=args.rag_profile, mode="static")
+        return prepare_rag_response(
+            question,
+            profile=args.rag_profile,
+            mode="static",
+            document_local_retrieval=args.document_local_retrieval,
+        )
 
     def failed_empty_retrieval(prepared: dict) -> bool:
         trace = prepared.get("rag_trace") or {}

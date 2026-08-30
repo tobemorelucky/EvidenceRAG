@@ -124,6 +124,131 @@ def test_operand_extraction_preserves_period_scale_sign_and_source():
     assert "Total current liabilities" in resolved.source_text
 
 
+def test_operand_extraction_drops_leading_parenthesized_footnote_marker():
+    operand = AtomicOperand(
+        key="cogs_2022",
+        concept="cost_of_goods_sold",
+        label="cost of goods sold",
+        aliases=("cost of goods sold",),
+        period="2022",
+        statement_types=("income_statement",),
+    )
+    documents = [{
+        "filename": "EXAMPLE_2022_10K.pdf",
+        "page_number": 31,
+        "text": (
+            "Example Corp Consolidated Statements of Income\n"
+            "(USD in millions)\n2022 2021\n"
+            "Cost of goods sold (1) 7,880 6,420"
+        ),
+    }]
+    candidates = extract_operand_candidates(
+        operand, documents, "Example Corp FY2022 cost of goods sold", ["EXAMPLE_2022_10K.pdf"],
+    )
+
+    assert candidates
+    assert candidates[0].normalized_value == Decimal("7880")
+    assert candidates[0].raw_value == "7,880"
+
+
+def test_operand_extraction_drops_leading_bracketed_footnote_marker():
+    operand = AtomicOperand(
+        key="cogs_2021", concept="cost_of_goods_sold", label="cost of goods sold",
+        aliases=("cost of goods sold",), period="2021", statement_types=("income_statement",),
+    )
+    documents = [{
+        "filename": "EXAMPLE_2022_10K.pdf",
+        "page_number": 31,
+        "text": "Consolidated Statement of Income\n2022 2021\nCost of goods sold [2] 7,880 6,420",
+    }]
+    candidates = extract_operand_candidates(
+        operand, documents, "Example Corp FY2021 cost of goods sold", ["EXAMPLE_2022_10K.pdf"],
+    )
+
+    assert candidates
+    assert candidates[0].normalized_value == Decimal("6420")
+
+
+def test_operand_extraction_preserves_genuine_small_and_parenthesized_values():
+    positive = AtomicOperand(
+        key="income_2022", concept="net_income", label="net income",
+        aliases=("net income",), period="2022", statement_types=("income_statement",),
+    )
+    negative = AtomicOperand(
+        key="loss_2022", concept="net_loss", label="net loss",
+        aliases=("net loss",), period="2022", statement_types=("income_statement",),
+    )
+    documents = [{
+        "filename": "EXAMPLE_2022_10K.pdf",
+        "page_number": 31,
+        "text": (
+            "Example Corp Consolidated Statements of Income\n2022 2021\n"
+            "Net income 1 2\nNet loss (1) (2)"
+        ),
+    }]
+
+    positive_candidates = extract_operand_candidates(
+        positive, documents, "Example Corp FY2022 net income", ["EXAMPLE_2022_10K.pdf"],
+    )
+    negative_candidates = extract_operand_candidates(
+        negative, documents, "Example Corp FY2022 net loss", ["EXAMPLE_2022_10K.pdf"],
+    )
+
+    assert positive_candidates[0].normalized_value == Decimal("1")
+    assert negative_candidates[0].normalized_value == Decimal("-1")
+
+
+def test_operand_extraction_rejects_unexplained_extra_leading_small_integer():
+    operand = AtomicOperand(
+        key="cogs_2022", concept="cost_of_goods_sold", label="cost of goods sold",
+        aliases=("cost of goods sold",), period="2022", statement_types=("income_statement",),
+    )
+    documents = [{
+        "filename": "EXAMPLE_2022_10K.pdf",
+        "page_number": 31,
+        "text": "Consolidated Statement of Income\n2022 2021\nCost of goods sold 1 7,880 6,420",
+    }]
+
+    assert extract_operand_candidates(
+        operand, documents, "Example Corp FY2022 cost of goods sold", ["EXAMPLE_2022_10K.pdf"],
+    ) == []
+
+
+def test_statement_operand_rejects_note_table_cross_reference_as_primary_statement():
+    operand = AtomicOperand(
+        key="cogs_2022", concept="cost_of_goods_sold", label="cost of goods sold",
+        aliases=("cost of goods sold",), period="2022", statement_types=("income_statement",),
+    )
+    note_page = {
+        "filename": "EXAMPLE_2022_10K.pdf",
+        "page_number": 180,
+        "text": (
+            "Notes to Consolidated Financial Statements (Continued)\n2022 2021 2020\n"
+            "AOCL Components Affected Line Item in the Consolidated Statements of Operations\n"
+            "Non-regulated cost of goods sold (1) 1 (3)"
+        ),
+    }
+    statement_page = {
+        "filename": "EXAMPLE_2022_10K.pdf",
+        "page_number": 50,
+        "text": (
+            "Example Corp Consolidated Statements of Operations\n2022 2021\n"
+            "Cost of goods sold 7,880 6,420"
+        ),
+    }
+
+    candidates = extract_operand_candidates(
+        operand,
+        [note_page, statement_page],
+        "Example Corp FY2022 cost of goods sold",
+        ["EXAMPLE_2022_10K.pdf"],
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].page_number == 50
+    assert candidates[0].normalized_value == Decimal("7880")
+
+
 def test_equal_confidence_conflicting_operand_values_are_rejected():
     operand = AtomicOperand(
         key="revenue_2022", concept="revenue", label="revenue", aliases=("revenue",), period="2022",

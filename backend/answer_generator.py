@@ -15,10 +15,11 @@ from prompts import (
     CLEAN_BASELINE_PROMPT_VERSION,
     PROMPT_VERSION,
     RAG_CORE_V2_PROMPT_VERSION,
+    RAG_CORE_V3_PROMPT_VERSION,
     SUMMARY_SYSTEM_PROMPT,
     SUMMARY_USER_TEMPLATE,
 )
-from runtime_profile import uses_clean_baseline_path, uses_rag_core_v2_path
+from runtime_profile import uses_clean_baseline_path, uses_rag_core_v2_path, uses_rag_core_v3_path
 
 
 def _create_model():
@@ -67,7 +68,8 @@ def build_answer_messages(
 ) -> list:
     clean_baseline = uses_clean_baseline_path(profile)
     prompt_version = (
-        RAG_CORE_V2_PROMPT_VERSION if uses_rag_core_v2_path(profile)
+        RAG_CORE_V3_PROMPT_VERSION if uses_rag_core_v3_path(profile)
+        else RAG_CORE_V2_PROMPT_VERSION if uses_rag_core_v2_path(profile)
         else CLEAN_BASELINE_PROMPT_VERSION if clean_baseline
         else PROMPT_VERSION
     )

@@ -1,0 +1,109 @@
+{
+  "source_commit": "7cfd9cd5acf41fa36fc10e3d8f22326f3748a38e",
+  "selection_loss10": [
+    {
+      "financebench_id": "financebench_id_00540"
+    },
+    {
+      "financebench_id": "financebench_id_00566"
+    },
+    {
+      "financebench_id": "financebench_id_00603"
+    },
+    {
+      "financebench_id": "financebench_id_00678"
+    },
+    {
+      "financebench_id": "financebench_id_00711"
+    },
+    {
+      "financebench_id": "financebench_id_01028"
+    },
+    {
+      "financebench_id": "financebench_id_01275"
+    },
+    {
+      "financebench_id": "financebench_id_01328"
+    },
+    {
+      "financebench_id": "financebench_id_01351"
+    },
+    {
+      "financebench_id": "financebench_id_03882"
+    }
+  ],
+  "candidate_miss10": [
+    {
+      "financebench_id": "financebench_id_00005"
+    },
+    {
+      "financebench_id": "financebench_id_00216"
+    },
+    {
+      "financebench_id": "financebench_id_00222"
+    },
+    {
+      "financebench_id": "financebench_id_00299"
+    },
+    {
+      "financebench_id": "financebench_id_00302"
+    },
+    {
+      "financebench_id": "financebench_id_00438"
+    },
+    {
+      "financebench_id": "financebench_id_00464"
+    },
+    {
+      "financebench_id": "financebench_id_00499"
+    },
+    {
+      "financebench_id": "financebench_id_00605"
+    },
+    {
+      "financebench_id": "financebench_id_00606"
+    }
+  ],
+  "correct_regression10": [
+    {
+      "financebench_id": "financebench_id_01148",
+      "family": "lookup"
+    },
+    {
+      "financebench_id": "financebench_id_00684",
+      "family": "narrative"
+    },
+    {
+      "financebench_id": "financebench_id_00215",
+      "family": "table_or_lookup"
+    },
+    {
+      "financebench_id": "financebench_id_00702",
+      "family": "calculation"
+    },
+    {
+      "financebench_id": "financebench_id_01930",
+      "family": "multi_period"
+    },
+    {
+      "financebench_id": "financebench_id_00382",
+      "family": "selection"
+    },
+    {
+      "financebench_id": "financebench_id_00720",
+      "family": "narrative"
+    },
+    {
+      "financebench_id": "financebench_id_00288",
+      "family": "table_or_lookup"
+    },
+    {
+      "financebench_id": "financebench_id_01279",
+      "family": "calculation"
+    },
+    {
+      "financebench_id": "financebench_id_00476",
+      "family": "selection"
+    }
+  ]
+}

@@ -6,16 +6,20 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from runtime_profile import (
     EXPLICIT_FORMULA_SKILL_PROFILE,
     FINANCE_SKILLS_V1_PROFILE,
     RAG_CORE_V2_PROFILE,
     RAG_CORE_V2_SKILLS_PROFILE,
+    RAG_CORE_V3_PROFILE,
+    RAG_CORE_V3_SKILLS_PROFILE,
     apply_runtime_profile,
     feature_state,
     uses_clean_baseline_path,
     uses_rag_core_v2_path,
+    uses_rag_core_v3_path,
 )
 
 apply_runtime_profile()
@@ -34,7 +38,12 @@ from evidence_coverage import (
 )
 from finance_policy import load_finance_policy
 from evidence_context import build_baseline_evidence, build_compact_evidence
-from prompts import CLEAN_BASELINE_PROMPT_VERSION, PROMPT_VERSION, RAG_CORE_V2_PROMPT_VERSION
+from prompts import (
+    CLEAN_BASELINE_PROMPT_VERSION,
+    PROMPT_VERSION,
+    RAG_CORE_V2_PROMPT_VERSION,
+    RAG_CORE_V3_PROMPT_VERSION,
+)
 from query_parser import assess_required_field_coverage, build_answer_directives, build_finance_query_rewrite, parse_query
 from rag_pipeline import run_rag_graph
 from rag_core_v2 import (
@@ -43,13 +52,25 @@ from rag_core_v2 import (
     merge_opened_pages,
     select_core_v2_pages,
 )
-from rag_utils import finalize_retrieved_documents, get_finance_rag_config, retrieve_document_scoped_candidates
+from rag_core_v3 import (
+    build_core_v3_evidence,
+    merge_core_v3_candidate_routes,
+    merge_opened_pages as merge_opened_pages_v3,
+    select_core_v3_pages,
+)
+from rag_utils import (
+    finalize_retrieved_documents,
+    get_finance_rag_config,
+    retrieve_candidate_documents,
+    retrieve_document_scoped_candidates,
+)
 from table_store import TableStore
 
 
 VALID_PROFILES = {
     "general", "finance", "clean_baseline", EXPLICIT_FORMULA_SKILL_PROFILE, FINANCE_SKILLS_V1_PROFILE,
     RAG_CORE_V2_PROFILE, RAG_CORE_V2_SKILLS_PROFILE,
+    RAG_CORE_V3_PROFILE, RAG_CORE_V3_SKILLS_PROFILE,
 }
 VALID_MODES = {"static", "agentic", "auto"}
 _table_store = TableStore()
@@ -744,9 +765,367 @@ def _prepare_rag_core_v2_response(question: str, config: ExecutionConfig, starte
     }
 
 
-def prepare_rag_response(question: str, profile: str | None = None, mode: str | None = None) -> dict:
+def _context_tokens(value: object) -> set[str]:
+    return {
+        token.casefold() for token in re.findall(r"[A-Za-z0-9]+", str(value or ""))
+        if len(token) > 1
+    }
+
+
+def _rank_core_v3_scoped_documents(
+    question: str,
+    candidates: list[dict],
+    retrieval_context: dict | None,
+    *,
+    limit: int = 3,
+) -> tuple[list[str], list[dict]]:
+    """Build a soft document shortlist from global candidates and optional metadata."""
+    _, discovery_trace = select_core_v3_pages(
+        question,
+        candidates,
+        [],
+        document_top_k=max(1, limit),
+        page_pool_k=max(12, len(candidates)),
+        final_page_k=1,
+        global_escape_pages=0,
+    )
+    context = retrieval_context or {}
+    selected_hints = {
+        Path(str(item)).stem.casefold()
+        for item in (context.get("selected_documents") or [])
+        if str(item).strip()
+    }
+    company_terms = _context_tokens(context.get("company"))
+    period = str(context.get("period") or "").strip().casefold()
+    document_type = str(context.get("document_type") or "").strip().casefold()
+    candidates_by_filename: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        filename = str(candidate.get("filename") or "").strip()
+        if filename:
+            candidates_by_filename.setdefault(filename, []).append(candidate)
+    scores = []
+    for item in discovery_trace.get("document_scores") or []:
+        filename = str(item.get("filename") or "")
+        filename_stem = Path(filename).stem.casefold()
+        document_items = candidates_by_filename.get(filename, [])
+        metadata_text = " ".join(
+            str(value)
+            for document in document_items[:3]
+            for value in (
+                document.get("filename"), document.get("company"), document.get("doc_period"),
+                document.get("doc_type"), document.get("type"),
+            )
+        )
+        metadata_terms = _context_tokens(metadata_text)
+        boost = 0.0
+        reasons = []
+        if filename_stem in selected_hints:
+            boost += 0.60
+            reasons.append("selected_document_hint")
+        if company_terms and company_terms <= metadata_terms:
+            boost += 0.35
+            reasons.append("company_hint")
+        if period and period in metadata_text.casefold():
+            boost += 0.15
+            reasons.append("period_hint")
+        if document_type and document_type in metadata_text.casefold():
+            boost += 0.10
+            reasons.append("document_type_hint")
+        scores.append({
+            **item,
+            "retrieval_context_boost": boost,
+            "retrieval_context_boost_reasons": reasons,
+            "document_score_after_context": float(item.get("document_score") or 0.0) + boost,
+        })
+    scores.sort(key=lambda item: (-item["document_score_after_context"], item["filename"].casefold()))
+    return [item["filename"] for item in scores[: max(1, limit)]], scores
+
+
+def _run_core_v3_search(question: str, retrieval_context: dict | None = None) -> dict:
+    """Global discovery followed by original-query document-local refinement."""
+    try:
+        candidate_k = int(os.getenv("FINANCE_RAG_CANDIDATE_K", "60"))
+        stage1 = retrieve_candidate_documents(question, candidate_k=candidate_k)
+        global_candidates = list(stage1.get("docs") or [])
+        scoped_documents, document_scores = _rank_core_v3_scoped_documents(
+            question,
+            global_candidates,
+            retrieval_context,
+            limit=max(1, int(os.getenv("RAG_CORE_V3_SCOPED_DOCUMENTS", "3"))),
+        )
+        scoped_routes = []
+        stage2_counts = []
+        scoped_top_k = max(1, int(os.getenv("RAG_CORE_V3_SCOPED_CANDIDATE_K", "20")))
+        for filename in scoped_documents:
+            documents = retrieve_document_scoped_candidates(
+                question,
+                [filename],
+                top_k=scoped_top_k,
+                retrieval_scope="rag_core_v3:document_local",
+            )
+            source = f"scoped:{filename}"
+            scoped_routes.append((source, documents))
+            stage2_counts.append({"filename": filename, "query": question, "candidate_count": len(documents)})
+        merged_candidates = merge_core_v3_candidate_routes(global_candidates, scoped_routes)
+        finalized = finalize_retrieved_documents(
+            question,
+            merged_candidates,
+            final_top_k=int(os.getenv("FINANCE_RAG_FINAL_TOP_K", "16")),
+            enable_page_merge=False,
+            adjacent_page_window=0,
+            adjacent_chunk_window=0,
+        )
+        reranked = list(finalized.get("final_retrieved_docs") or finalized.get("context_docs") or [])
+        stage1_meta = dict(stage1.get("meta") or {})
+        final_meta = dict(finalized.get("meta") or {})
+        return {
+            "docs": reranked,
+            "initial_candidate_docs": merged_candidates,
+            "rag_trace": {
+                **stage1_meta,
+                **final_meta,
+                "stage1_global_chunks": global_candidates,
+                "initial_retrieved_chunks": merged_candidates,
+                "stage1_global_candidate_count": len(global_candidates),
+                "stage1_document_scores": document_scores,
+                "stage2_scoped_documents": scoped_documents,
+                "stage2_candidate_count": sum(item["candidate_count"] for item in stage2_counts),
+                "stage2_queries": [question] * len(scoped_documents),
+                "stage2_route_counts": stage2_counts,
+                "merged_candidate_count": len(merged_candidates),
+                "merged_candidates": [
+                    {
+                        "filename": item.get("filename"),
+                        "page_number": item.get("page_number"),
+                        "chunk_id": item.get("chunk_id"),
+                        "candidate_source": item.get("candidate_source"),
+                        "candidate_sources": item.get("candidate_sources"),
+                        "score": item.get("score"),
+                    }
+                    for item in merged_candidates
+                ],
+                "final_retrieved_chunks": reranked,
+                "core_v3_dense_bm25_calls": 1 + len(scoped_documents),
+                "retrieval_context": retrieval_context or {},
+                "retrieval_context_applied": bool(retrieval_context),
+            },
+        }
+    except Exception as exc:
+        raise RetrievalServiceError(f"检索服务暂不可用：{exc}") from exc
+
+
+def _prepare_rag_core_v3_response(
+    question: str,
+    config: ExecutionConfig,
+    started: float,
+    retrieval_context: dict | None = None,
+    document_local_retrieval: bool | None = None,
+) -> dict:
+    """Run the isolated v3 evidence-flow path without changing v2 behavior."""
+    document_local_enabled = (
+        document_local_retrieval
+        if document_local_retrieval is not None
+        else os.getenv("RAG_CORE_V3_DOCUMENT_LOCAL_RETRIEVAL", "false").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    initial = (
+        _run_core_v3_search(question, retrieval_context)
+        if document_local_enabled else _run_search(question)
+    )
+    reranked_chunks = list(initial.get("docs") or [])
+    candidate_pool = list(initial.get("initial_candidate_docs") or reranked_chunks)
+    context_pages, selection_trace = select_core_v3_pages(
+        question, candidate_pool, reranked_chunks,
+    )
+    requested_pages = [
+        {"filename": page.get("filename"), "page_number": page.get("page_number")}
+        for page in context_pages
+    ]
+    page_started = time.perf_counter()
+    try:
+        opened = open_pages(requested_pages, limit=len(requested_pages)) if requested_pages else []
+        page_trace = {
+            "answer_page_open_requested": len(requested_pages),
+            "answer_page_opened": len(opened),
+            "answer_page_open_latency_ms": round((time.perf_counter() - page_started) * 1000, 2),
+        }
+    except Exception as exc:
+        opened = []
+        page_trace = {
+            "answer_page_open_requested": len(requested_pages),
+            "answer_page_opened": 0,
+            "answer_page_open_error": f"{type(exc).__name__}: {exc}",
+            "answer_page_open_latency_ms": round((time.perf_counter() - page_started) * 1000, 2),
+        }
+    answer_docs = merge_opened_pages_v3(context_pages, opened)
+    filenames = list(dict.fromkeys(
+        str(page.get("filename") or "").strip() for page in answer_docs if page.get("filename")
+    ))
+    table_load_started = time.perf_counter()
+    tables = []
+    table_errors = []
+    for filename in filenames:
+        try:
+            tables.extend(_table_store.get_tables_by_filename(filename))
+        except Exception as exc:
+            table_errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+    selected_keys = {
+        (str(page.get("filename") or ""), int(page.get("page_number") or 0))
+        for page in answer_docs
+    }
+    tables = [
+        table for table in tables
+        if (str(table.get("filename") or ""), int(table.get("page_number") or 0)) in selected_keys
+    ]
+    evidence, context_meta = build_core_v3_evidence(question, answer_docs, tables)
+    if not evidence:
+        evidence = _format_evidence(reranked_chunks[:6])
+        answer_docs = reranked_chunks[:6]
+        context_meta = {
+            **context_meta,
+            "answer_context_chars": len(evidence),
+            "answer_context_unit_count": len(answer_docs),
+            "answer_context_fallback": "reranked_chunks",
+        }
+    citations = build_citations(answer_docs)
+
+    trace = dict(initial.get("rag_trace") or {})
+    latency = dict(trace.get("latency_breakdown") or {})
+    latency.update({
+        "core_v3_page_open_ms": page_trace.get("answer_page_open_latency_ms", 0),
+        "core_v3_table_load_ms": round((time.perf_counter() - table_load_started) * 1000, 2),
+        "orchestration_latency_ms": round((time.perf_counter() - started) * 1000, 2),
+    })
+    trace_id = str(uuid.uuid4())
+    candidate_k = int(os.getenv("FINANCE_RAG_CANDIDATE_K", "60"))
+    trace.update({
+        "profile": config.profile,
+        "execution_mode": "static",
+        "route_reason": "rag_core_v3_evidence_flow_static",
+        "original_question": question,
+        "retrieval_queries": [question],
+        "core_v3_document_local_retrieval": document_local_enabled,
+        "initial_dense_candidates": trace.get("dense_candidate_count"),
+        "initial_bm25_candidates": trace.get("bm25_candidate_count"),
+        "initial_dense_candidates_requested": candidate_k * 2,
+        "initial_bm25_candidates_requested": candidate_k * 2,
+        "candidate_count_observability": "milvus_hybrid_api_exposes_fused_results_only",
+        "rrf_candidates": len(candidate_pool),
+        "reranked_chunks": [
+            {
+                "filename": chunk.get("filename"),
+                "page_number": chunk.get("page_number"),
+                "chunk_id": chunk.get("chunk_id"),
+                "score": chunk.get("score"),
+                "rerank_score": chunk.get("rerank_score"),
+            }
+            for chunk in reranked_chunks
+        ],
+        "final_selected_pages": [
+            {
+                "filename": page.get("filename"),
+                "page_number": page.get("page_number"),
+                "page_score": page.get("page_score"),
+            }
+            for page in context_pages
+        ],
+        "final_evidence_unit_count": context_meta.get("answer_context_unit_count", 0),
+        "evidence_status": "sufficient" if citations else "insufficient",
+        "trace_id": trace_id,
+        "prompt_version": RAG_CORE_V3_PROMPT_VERSION,
+        "feature_state": feature_state(config.profile),
+        "experiment_modules_in_answer_path": ["rag_core_v3_evidence_flow"],
+        "queryspec_used_for_retrieval": False,
+        "queryspec_used_for_context": False,
+        "queryspec_used_for_answer": False,
+        "finance_policy_enabled": False,
+        "structured_authoritative": False,
+        "agent_tool_calls": [{"tool": "search", "query": question, "new_evidence": len(candidate_pool)}],
+        "agent_tool_call_count": 1,
+        "table_load_errors": table_errors,
+        "latency_breakdown": latency,
+        **selection_trace,
+        **page_trace,
+        **context_meta,
+    })
+
+    skill_answer = ""
+    skill_applied = False
+    calculation = None
+    if config.profile == RAG_CORE_V3_SKILLS_PROFILE:
+        from skills.registry import execute_matching_skill
+
+        skill_result = execute_matching_skill(
+            question, answer_docs, candidate_pool,
+            ("explicit_formula", "canonical_finance_metric"),
+        )
+        skill_name = str(skill_result.trace.get("skill_name") or "none")
+        trace["skill_router"] = {
+            "enabled_skills": ["explicit_formula", "canonical_finance_metric"],
+            "selected_skill": skill_name,
+        }
+        if skill_name != "none":
+            trace[f"{skill_name}_skill"] = skill_result.trace
+        skill_answer = skill_result.answer
+        skill_applied = skill_result.applied
+        verified_evidence = str(skill_result.trace.get("verified_evidence") or "")
+        if skill_result.success and not skill_applied and verified_evidence:
+            evidence = f"{evidence}\n\n---\n\n{verified_evidence}"
+        if skill_applied:
+            citations = skill_result.citations
+            calculation = {
+                "source": f"{skill_name}_decimal",
+                "authoritative": True,
+                "formula": skill_result.trace.get("formula_text") or skill_result.trace.get("formula_variant", ""),
+                "operands": skill_result.trace.get("resolved_operands", []),
+                "result": skill_result.trace.get("full_precision_result") or skill_result.trace.get("metric_full_precision_result", ""),
+                "display_result": skill_result.trace.get("display_result") or skill_result.trace.get("metric_display_result", ""),
+            }
+        if skill_result.success:
+            trace["experiment_modules_in_answer_path"].append(f"{skill_name}_skill")
+        latency[f"{skill_name}_skill_latency_ms"] = skill_result.trace.get("skill_latency_ms", 0)
+        latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        trace["latency_breakdown"] = latency
+
+    trace["answer_prompt_evidence_chars"] = len(evidence)
+    trace["answer_prompt_policy_chars"] = 0
+    trace["answer_prompt_total_chars"] = len(evidence)
+    return {
+        "evidence": evidence,
+        "task_policy": "",
+        "docs": answer_docs,
+        "rag_trace": trace,
+        "profile": config.profile,
+        "execution_mode": "static",
+        "route_reason": "rag_core_v3_evidence_flow_static",
+        "citations": citations,
+        "evidence_status": "sufficient" if citations else "insufficient",
+        "calculation": calculation,
+        "query_spec": {},
+        "evidence_frames": [],
+        "trace_id": trace_id,
+        "skill_applied": skill_applied,
+        "skill_answer": skill_answer,
+    }
+
+
+def prepare_rag_response(
+    question: str,
+    profile: str | None = None,
+    mode: str | None = None,
+    retrieval_context: dict | None = None,
+    document_local_retrieval: bool | None = None,
+) -> dict:
     started = time.perf_counter()
     config = resolve_execution_config(profile, mode)
+    if uses_rag_core_v3_path(config.profile):
+        return _prepare_rag_core_v3_response(
+            question,
+            config,
+            started,
+            retrieval_context,
+            document_local_retrieval,
+        )
     if uses_rag_core_v2_path(config.profile):
         return _prepare_rag_core_v2_response(question, config, started)
     if uses_clean_baseline_path(config.profile):

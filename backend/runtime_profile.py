@@ -11,6 +11,8 @@ EXPLICIT_FORMULA_SKILL_PROFILE = "clean_baseline_formula_skill"
 FINANCE_SKILLS_V1_PROFILE = "finance_skills_v1"
 RAG_CORE_V2_PROFILE = "rag_core_v2"
 RAG_CORE_V2_SKILLS_PROFILE = "rag_core_v2_skills"
+RAG_CORE_V3_PROFILE = "rag_core_v3"
+RAG_CORE_V3_SKILLS_PROFILE = "rag_core_v3_skills"
 
 # These values are authoritative for the clean baseline. They intentionally
 # override stale values from .env so an experiment cannot be polluted by a
@@ -70,6 +72,19 @@ RAG_CORE_V2_OVERRIDES: Mapping[str, str] = {
     "RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED": "false",
 }
 
+RAG_CORE_V3_OVERRIDES: Mapping[str, str] = {
+    **RAG_CORE_V2_OVERRIDES,
+    "RAG_PROFILE": RAG_CORE_V3_PROFILE,
+    "RAG_CORE_V3_DOCUMENT_TOP_K": "4",
+    "RAG_CORE_V3_PAGE_POOL_K": "12",
+    "RAG_CORE_V3_FINAL_PAGE_K": "8",
+    "RAG_CORE_V3_GLOBAL_ESCAPE_PAGES": "2",
+    "RAG_CORE_V3_MAX_CONTEXT_CHARS": "28000",
+    "RAG_CORE_V3_MAX_TABLE_CHARS": "5000",
+    "RAG_CORE_V3_MIN_PAGE_CHARS": "2200",
+    "RAG_CORE_V3_DOCUMENT_LOCAL_RETRIEVAL": "false",
+}
+
 
 FEATURE_LABELS: tuple[tuple[str, str], ...] = (
     ("Finance Policy", "FINANCE_POLICY_ENABLED"),
@@ -100,12 +115,16 @@ def is_clean_baseline(profile: str | None = None) -> bool:
 def uses_clean_baseline_path(profile: str | None = None) -> bool:
     return normalize_profile(profile) in {
         CLEAN_BASELINE_PROFILE, EXPLICIT_FORMULA_SKILL_PROFILE, FINANCE_SKILLS_V1_PROFILE,
-        RAG_CORE_V2_PROFILE, RAG_CORE_V2_SKILLS_PROFILE,
+        RAG_CORE_V2_PROFILE, RAG_CORE_V2_SKILLS_PROFILE, RAG_CORE_V3_PROFILE, RAG_CORE_V3_SKILLS_PROFILE,
     }
 
 
 def uses_rag_core_v2_path(profile: str | None = None) -> bool:
     return normalize_profile(profile) in {RAG_CORE_V2_PROFILE, RAG_CORE_V2_SKILLS_PROFILE}
+
+
+def uses_rag_core_v3_path(profile: str | None = None) -> bool:
+    return normalize_profile(profile) in {RAG_CORE_V3_PROFILE, RAG_CORE_V3_SKILLS_PROFILE}
 
 
 def apply_runtime_profile(profile: str | None = None) -> str:
@@ -132,6 +151,15 @@ def apply_runtime_profile(profile: str | None = None) -> str:
         os.environ.update(RAG_CORE_V2_OVERRIDES)
         os.environ.update({
             "RAG_PROFILE": RAG_CORE_V2_SKILLS_PROFILE,
+            "EXPLICIT_FORMULA_SKILL_ENABLED": "true",
+            "CANONICAL_FINANCE_METRIC_SKILL_ENABLED": "true",
+        })
+    elif resolved == RAG_CORE_V3_PROFILE:
+        os.environ.update(RAG_CORE_V3_OVERRIDES)
+    elif resolved == RAG_CORE_V3_SKILLS_PROFILE:
+        os.environ.update(RAG_CORE_V3_OVERRIDES)
+        os.environ.update({
+            "RAG_PROFILE": RAG_CORE_V3_SKILLS_PROFILE,
             "EXPLICIT_FORMULA_SKILL_ENABLED": "true",
             "CANONICAL_FINANCE_METRIC_SKILL_ENABLED": "true",
         })

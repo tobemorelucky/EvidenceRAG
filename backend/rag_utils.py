@@ -4280,6 +4280,7 @@ def retrieve_document_scoped_candidates(
     filenames: list[str],
     *,
     top_k: int = 12,
+    retrieval_scope: str = "supplemental:document_scoped_once",
 ) -> list[dict[str, Any]]:
     """Run one leaf retrieval restricted to an already-selected document set."""
     scoped_filenames = list(dict.fromkeys(str(item).strip() for item in filenames if str(item).strip()))
@@ -4293,7 +4294,7 @@ def retrieve_document_scoped_candidates(
         query,
         top_k=max(1, top_k),
         filter_expr=filter_expr,
-        retrieval_scope="supplemental:document_scoped_once",
+        retrieval_scope=retrieval_scope,
     )
     return list(result.get("docs") or [])
 

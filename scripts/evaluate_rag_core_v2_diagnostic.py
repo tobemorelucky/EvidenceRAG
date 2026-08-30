@@ -123,7 +123,15 @@ def evaluate(answers_path: Path, fixture_path: Path | None, rows: dict[str, dict
         expected_ids = list(rows)
     else:
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-        expected_ids = [item for values in fixture["categories"].values() for item in values]
+        groups = fixture.get("categories") or {
+            key: value for key, value in fixture.items() if isinstance(value, list)
+        }
+        expected_ids = []
+        for values in groups.values():
+            for item in values:
+                financebench_id = item if isinstance(item, str) else item.get("financebench_id")
+                if financebench_id and financebench_id not in expected_ids:
+                    expected_ids.append(financebench_id)
     answers = {str(item.get("financebench_id") or ""): item for item in _read_jsonl(answers_path)}
     records = []
     for item_id in expected_ids:

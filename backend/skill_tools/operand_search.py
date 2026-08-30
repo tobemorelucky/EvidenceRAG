@@ -12,8 +12,9 @@ from agent_tools import open_pages, select_pages
 from skills.explicit_formula.schema import AtomicOperand, ResolvedOperand
 
 
-_NUMBER = re.compile(r"\(?-?\$?\d[\d,]*(?:\.\d+)?\)?")
+_NUMBER = re.compile(r"\[\d{1,2}\]|\(?-?\$?\d[\d,]*(?:\.\d+)?\)?")
 _YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+_FOOTNOTE_MARKER = re.compile(r"^(?:\(\d{1,2}\)|\[\d{1,2}\])$")
 _GENERIC_FILE_TOKENS = {
     "annual", "earnings", "financial", "form", "quarterly", "report", "results",
     "10k", "10q", "20f", "pdf", "q1", "q2", "q3", "q4",
@@ -148,7 +149,7 @@ def search_missing_operands(
 def _number(value: str) -> Decimal | None:
     source = str(value or "").strip()
     negative = source.startswith("(") and source.endswith(")")
-    source = source.replace("$", "").replace(",", "").strip("() ")
+    source = source.replace("$", "").replace(",", "").strip("()[] ")
     try:
         number = Decimal(source)
     except InvalidOperation:
@@ -186,6 +187,51 @@ def _header_years(lines: list[str], row_index: int, value_count: int) -> list[st
     return years[-value_count:]
 
 
+def _nearby_header_years(lines: list[str], row_index: int) -> list[str]:
+    """Return the closest compact year header immediately above a data row."""
+    groups: list[list[str]] = []
+    gap_after_year = 0
+    for line in reversed(lines[max(0, row_index - 16):row_index]):
+        years = _YEAR.findall(line)
+        if years:
+            groups.append(years)
+            gap_after_year = 0
+            continue
+        if groups:
+            gap_after_year += 1
+            if gap_after_year >= 2:
+                break
+    ordered = []
+    for group in reversed(groups):
+        for year in group:
+            if year not in ordered:
+                ordered.append(year)
+    return ordered
+
+
+def _align_row_values(
+    raw_values: list[str], lines: list[str], row_index: int
+) -> tuple[list[str] | None, list[str]]:
+    """Align row values to an explicit year header without treating notes as values.
+
+    A leading parenthesized/bracketed integer is a footnote only when removing it
+    produces exactly one value per nearby header year.  If an unexplained leading
+    small integer leaves the same N+1 shape, the row is ambiguous and is rejected.
+    This preserves a genuine value of 1 (including ``(1)``) when it occupies an
+    actual year column.
+    """
+    header_years = _nearby_header_years(lines, row_index)
+    if not header_years or len(raw_values) != len(header_years) + 1:
+        return raw_values, header_years
+    leading = raw_values[0].strip()
+    if _FOOTNOTE_MARKER.fullmatch(leading):
+        return raw_values[1:], header_years
+    leading_number = _number(leading)
+    if leading_number is not None and abs(leading_number) <= 9:
+        return None, header_years
+    return raw_values, header_years
+
+
 def _scope_allowed(text: str, line: str) -> bool:
     head = text[:2500].casefold()
     line_lower = line.casefold()
@@ -200,6 +246,12 @@ def _scope_allowed(text: str, line: str) -> bool:
 
 def _statement_types(text: str) -> set[str]:
     head = text[:3500].casefold()
+    first_lines = "\n".join(text.splitlines()[:8]).casefold()
+    if "notes to consolidated financial statements" in first_lines:
+        # A notes table may contain a column such as "Affected Line Item in the
+        # Consolidated Statements of Operations".  That is a cross-reference,
+        # not the primary statement and cannot support an authoritative total.
+        return set()
     result: set[str] = set()
     if re.search(r"consolidated (?:balance sheets?|statements? of financial position)", head):
         result.add("balance_sheet")
@@ -247,11 +299,18 @@ def extract_operand_candidates(
                 continue
             tail = line[position + len(alias):]
             raw_values = _NUMBER.findall(tail)
+            raw_values, nearby_header_years = _align_row_values(raw_values, lines, row_index)
+            if raw_values is None:
+                continue
             values = [(raw, _number(raw)) for raw in raw_values]
             values = [(raw, value) for raw, value in values if value is not None]
             if not values:
                 continue
-            years = _header_years(lines, row_index, len(values))
+            years = (
+                nearby_header_years
+                if len(nearby_header_years) == len(values)
+                else _header_years(lines, row_index, len(values))
+            )
             if operand.period:
                 if operand.period in years:
                     index = years.index(operand.period)
