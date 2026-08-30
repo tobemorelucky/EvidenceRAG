@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from runtime_profile import (
     EXPLICIT_FORMULA_SKILL_PROFILE,
+    FINANCE_SKILLS_V1_PROFILE,
     apply_runtime_profile,
     feature_state,
     uses_clean_baseline_path,
@@ -37,7 +38,9 @@ from rag_utils import finalize_retrieved_documents, get_finance_rag_config, retr
 from table_store import TableStore
 
 
-VALID_PROFILES = {"general", "finance", "clean_baseline", EXPLICIT_FORMULA_SKILL_PROFILE}
+VALID_PROFILES = {
+    "general", "finance", "clean_baseline", EXPLICIT_FORMULA_SKILL_PROFILE, FINANCE_SKILLS_V1_PROFILE,
+}
 VALID_MODES = {"static", "agentic", "auto"}
 _table_store = TableStore()
 
@@ -488,25 +491,43 @@ def _prepare_clean_baseline_response(question: str, config: ExecutionConfig, sta
     skill_answer = ""
     skill_applied = False
     calculation = None
-    if config.profile == EXPLICIT_FORMULA_SKILL_PROFILE:
+    if config.profile in {EXPLICIT_FORMULA_SKILL_PROFILE, FINANCE_SKILLS_V1_PROFILE}:
         from skills.registry import execute_matching_skill
 
-        skill_result = execute_matching_skill(question, answer_docs, candidate_pool)
-        trace["explicit_formula_skill"] = skill_result.trace
+        enabled_skills = ("explicit_formula",) if config.profile == EXPLICIT_FORMULA_SKILL_PROFILE else (
+            "explicit_formula", "canonical_finance_metric",
+        )
+        skill_result = execute_matching_skill(question, answer_docs, candidate_pool, enabled_skills)
+        skill_name = str(skill_result.trace.get("skill_name") or "none")
+        trace["skill_router"] = {
+            "enabled_skills": list(enabled_skills),
+            "selected_skill": skill_name,
+        }
+        if skill_name != "none":
+            trace[f"{skill_name}_skill"] = skill_result.trace
         skill_answer = skill_result.answer
         skill_applied = skill_result.applied
+        verified_evidence = str(skill_result.trace.get("verified_evidence") or "")
+        if skill_result.success and not skill_applied and verified_evidence:
+            evidence = f"{evidence}\n\n---\n\n{verified_evidence}"
+            existing_citations = {(item.get("filename"), item.get("page_number")) for item in citations}
+            citations.extend(
+                item for item in skill_result.citations
+                if (item.get("filename"), item.get("page_number")) not in existing_citations
+            )
         if skill_applied:
             citations = skill_result.citations
             calculation = {
-                "source": "explicit_formula_skill_decimal",
+                "source": f"{skill_name}_decimal",
                 "authoritative": True,
-                "formula": skill_result.trace.get("formula_text", ""),
+                "formula": skill_result.trace.get("formula_text") or skill_result.trace.get("formula_variant", ""),
                 "operands": skill_result.trace.get("resolved_operands", []),
-                "result": skill_result.trace.get("full_precision_result", ""),
-                "display_result": skill_result.trace.get("display_result", ""),
+                "result": skill_result.trace.get("full_precision_result") or skill_result.trace.get("metric_full_precision_result", ""),
+                "display_result": skill_result.trace.get("display_result") or skill_result.trace.get("metric_display_result", ""),
             }
-            trace["experiment_modules_in_answer_path"] = ["explicit_formula_skill"]
-        latency["explicit_formula_skill_latency_ms"] = skill_result.trace.get("skill_latency_ms", 0)
+        if skill_result.success:
+            trace["experiment_modules_in_answer_path"] = [f"{skill_name}_skill"]
+        latency[f"{skill_name}_skill_latency_ms"] = skill_result.trace.get("skill_latency_ms", 0)
         latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
         trace["latency_breakdown"] = latency
     trace["answer_prompt_evidence_chars"] = len(evidence)

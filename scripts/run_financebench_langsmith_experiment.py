@@ -178,7 +178,7 @@ def main() -> None:
     parser.add_argument("--experiment-prefix", default="evidencerag-finance-static")
     parser.add_argument(
         "--rag-profile",
-        choices=("finance", "clean_baseline", "clean_baseline_formula_skill"),
+        choices=("finance", "clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"),
         default="finance",
         help="Runtime profile. clean_baseline authoritatively disables all experimental answer paths.",
     )
@@ -452,7 +452,7 @@ def main() -> None:
                     prepared["evidence"],
                     prepared.get("task_policy", ""),
                 )
-                if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill"}:
+                if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"}:
                     prepared["rag_trace"].update({
                         "answer_consistency": {"enabled": False, "checked": False},
                         "numeric_display_validation": {"enabled": False, "checked": False},
@@ -533,13 +533,13 @@ def main() -> None:
         "query_planner": False,
         "step_back": False,
         "field_aware": feature_state(args.rag_profile)["field_aware"],
-        "statement_aware": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill"} else args.field_aware,
-        "required_field_page_scoring": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill"} else args.field_aware,
-        "required_period_page_scoring": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill"} else args.field_aware,
-        "legacy_supplemental_search": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill"} else args.field_aware and not args.supplemental_find,
+        "statement_aware": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware,
+        "required_field_page_scoring": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware,
+        "required_period_page_scoring": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware,
+        "legacy_supplemental_search": False if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else args.field_aware and not args.supplemental_find,
         "supplemental_find": active_modules["Supplemental Retrieval"],
-        "page_neighbor_window": 0 if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill"} else (2 if args.field_aware else 0),
-        "context_page_window": 0 if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill"} else (2 if args.field_aware else 0),
+        "page_neighbor_window": 0 if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else (2 if args.field_aware else 0),
+        "context_page_window": 0 if args.rag_profile in {"clean_baseline", "clean_baseline_formula_skill", "finance_skills_v1"} else (2 if args.field_aware else 0),
         "rerank": args.enable_rerank,
         "rerank_remote_max_attempts": int(os.getenv("RERANK_REMOTE_MAX_ATTEMPTS", "2")),
         "rerank_remote_backoff_seconds": float(os.getenv("RERANK_REMOTE_BACKOFF_SECONDS", "0.8")),

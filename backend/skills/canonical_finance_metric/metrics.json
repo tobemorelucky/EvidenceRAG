@@ -1,0 +1,46 @@
+{
+  "quick_ratio": {
+    "aliases": ["quick ratio", "acid-test ratio", "acid test ratio"],
+    "formula": "(cash_and_equivalents + short_term_investments + accounts_receivable + current_related_party_receivables) / current_liabilities",
+    "output_unit": "ratio",
+    "default_decimal_places": 2,
+    "fields": {
+      "cash_and_equivalents": ["cash and cash equivalents", "cash and equivalents", "cash equivalents and restricted cash", "cash"],
+      "short_term_investments": ["short-term investments", "short term investments", "marketable securities", "current investments"],
+      "accounts_receivable": ["accounts receivable, net", "accounts receivable net", "trade receivables, net", "trade receivables", "receivables, net"],
+      "current_related_party_receivables": ["current related party receivables", "related party receivables", "due from related parties"],
+      "current_liabilities": ["total current liabilities", "current liabilities"]
+    }
+  },
+  "inventory_turnover": {
+    "aliases": ["inventory turnover", "inventory turnover ratio"],
+    "formula": "cost_of_goods_sold / average(beginning_inventory, ending_inventory)",
+    "output_unit": "times",
+    "default_decimal_places": 2,
+    "fields": {
+      "cost_of_goods_sold": ["cost of goods sold", "cost of sales", "cost of revenues", "cost of revenue"],
+      "inventory": ["inventories", "inventory"]
+    }
+  },
+  "gross_margin": {
+    "aliases": ["gross margin", "gross profit margin"],
+    "formula": "gross_profit / revenue; fallback: (revenue - cost_of_goods_sold) / revenue",
+    "output_unit": "percent",
+    "default_decimal_places": 2,
+    "fields": {
+      "gross_profit": ["gross profit"],
+      "revenue": ["net revenues", "net revenue", "total revenues", "total revenue", "revenues", "revenue", "net sales", "sales"],
+      "cost_of_goods_sold": ["cost of goods sold", "cost of sales", "cost of revenues", "cost of revenue"]
+    }
+  },
+  "operating_margin": {
+    "aliases": ["operating margin", "operating profit margin", "operating income margin"],
+    "formula": "operating_income / revenue",
+    "output_unit": "percent",
+    "default_decimal_places": 2,
+    "fields": {
+      "operating_income": ["operating income", "income from operations", "operating profit"],
+      "revenue": ["net revenues", "net revenue", "total revenues", "total revenue", "revenues", "revenue", "net sales", "sales"]
+    }
+  }
+}
