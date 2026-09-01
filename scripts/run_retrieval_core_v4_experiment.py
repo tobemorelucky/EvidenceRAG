@@ -23,16 +23,24 @@ if str(BACKEND) not in sys.path:
 
 from document_page_store import DocumentPageStore  # noqa: E402
 from rag_core_v3 import build_core_v3_evidence, merge_opened_pages, select_core_v3_pages  # noqa: E402
-from rag_core_v4 import retrieve_dense_primary  # noqa: E402
+from rag_core_v4 import (  # noqa: E402
+    expand_and_rank_pages,
+    retrieve_dense_primary,
+    select_document_first_pages,
+)
 from rag_utils import _rerank_documents  # noqa: E402
-from runtime_profile import RETRIEVAL_DENSE_PRIMARY_PROFILE, apply_runtime_profile  # noqa: E402
+from runtime_profile import (  # noqa: E402
+    RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE,
+    RETRIEVAL_DENSE_PRIMARY_PROFILE,
+    apply_runtime_profile,
+)
 from table_store import TableStore  # noqa: E402
 
 
 DEFAULT_DATASET = ROOT / "data" / "financebench_top40_100_langsmith_with_evidence.csv"
 DEFAULT_FIXTURE = ROOT / "tests" / "fixtures" / "rag_core_v3_diagnostic_ids.json"
 DEFAULT_BASELINE = ROOT / "reports" / "evidencerag-rag-core-v3-skills-all100-final-evidence-diagnostic.json"
-PROFILES = {RETRIEVAL_DENSE_PRIMARY_PROFILE}
+PROFILES = {RETRIEVAL_DENSE_PRIMARY_PROFILE, RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE}
 
 
 def _normalize_filename(value: object) -> str:
@@ -92,6 +100,36 @@ def _first_document_rank(items: list[dict], gold: set[tuple[str, int]]) -> int |
         document_rank += 1
         if filename in gold_documents:
             return document_rank
+    return None
+
+
+def _gold_page_rank_within_document(items: list[dict], gold: set[tuple[str, int]]) -> int | None:
+    gold_documents = {filename for filename, _ in gold}
+    rank = 0
+    for item in items:
+        if _page_key(item)[0] not in gold_documents:
+            continue
+        rank += 1
+        if _page_key(item) in gold:
+            return rank
+    return None
+
+
+def _aggregated_document_rank(items: list[dict], gold: set[tuple[str, int]]) -> int | None:
+    gold_documents = {filename for filename, _ in gold}
+    grouped: dict[str, list[float]] = {}
+    for item in items:
+        filename = _page_key(item)[0]
+        grouped.setdefault(filename, []).append(float(item.get("page_score") or 0.0))
+    scores = []
+    for filename, values in grouped.items():
+        ordered = sorted(values, reverse=True)
+        score = ordered[0] + (0.35 * ordered[1] if len(ordered) > 1 else 0.0) + (0.15 * ordered[2] if len(ordered) > 2 else 0.0)
+        scores.append((score, filename))
+    scores.sort(key=lambda item: (-item[0], item[1]))
+    for rank, (_, filename) in enumerate(scores, 1):
+        if filename in gold_documents:
+            return rank
     return None
 
 
@@ -167,24 +205,49 @@ def main() -> None:
         started = time.perf_counter()
         retrieval = retrieve_dense_primary(row["question"], dense_k=120, bm25_k=30)
         candidates = retrieval["merged"]
-        if last_remote_request_at is not None and args.rerank_interval_seconds > 0:
-            wait = args.rerank_interval_seconds - (time.monotonic() - last_remote_request_at)
-            if wait > 0:
-                print(f"[rate-limit] waiting {wait:.1f}s", flush=True)
-                time.sleep(wait)
-        reranked, rerank_meta = _rerank_documents(
-            row["question"], candidates, top_k=16, remote_candidate_k=18,
-        )
-        if rerank_meta.get("remote_success") and not rerank_meta.get("rerank_cache_hit"):
-            last_remote_request_at = time.monotonic()
-        selected, selector_trace = select_core_v3_pages(row["question"], candidates, reranked)
+        page_trace = {}
+        if args.profile == RETRIEVAL_DENSE_PRIMARY_PROFILE:
+            if last_remote_request_at is not None and args.rerank_interval_seconds > 0:
+                wait = args.rerank_interval_seconds - (time.monotonic() - last_remote_request_at)
+                if wait > 0:
+                    print(f"[rate-limit] waiting {wait:.1f}s", flush=True)
+                    time.sleep(wait)
+            reranked, rerank_meta = _rerank_documents(
+                row["question"], candidates, top_k=16, remote_candidate_k=18,
+            )
+            if rerank_meta.get("remote_success") and not rerank_meta.get("rerank_cache_hit"):
+                last_remote_request_at = time.monotonic()
+            selected, selector_trace = select_core_v3_pages(row["question"], candidates, reranked)
+            metric_candidates = candidates
+        else:
+            page_candidates, page_trace = expand_and_rank_pages(
+                row["question"], candidates, retrieval["query_embedding"],
+                neighbor_window=1, page_store=page_store,
+            )
+            metric_candidates = page_candidates
+            selected, document_trace = select_document_first_pages(
+                page_candidates, final_page_k=8, global_escape_pages=1,
+            )
+            selector_trace = {
+                "selected_pages": [
+                    {
+                        "filename": item.get("filename"),
+                        "page_number": item.get("page_number"),
+                        "page_score": item.get("page_score"),
+                        "page_candidate_rank": item.get("page_candidate_rank"),
+                    }
+                    for item in selected
+                ],
+                **document_trace,
+            }
+            rerank_meta = {}
         selected_keys = [(item["filename"], int(item["page_number"])) for item in selected]
         opened = page_store.get_pages_by_keys(selected_keys)
         answer_docs = merge_opened_pages(selected, opened)
         tables = table_store.get_tables_by_page_keys(selected_keys)
         evidence, context_meta = build_core_v3_evidence(row["question"], answer_docs, tables)
         gold = _gold(row)
-        candidate_keys = {_page_key(item) for item in candidates}
+        candidate_keys = {_page_key(item) for item in metric_candidates}
         selected_keys_normalized = {_page_key(item) for item in selected}
         context_keys = {
             (_normalize_filename(item.get("filename")), int(item.get("page_number") or 0))
@@ -197,8 +260,10 @@ def main() -> None:
             "candidate_hit": bool(gold & candidate_keys),
             "selected_hit": bool(gold & selected_keys_normalized),
             "context_hit": bool(gold & context_keys),
-            "gold_page_rank": _first_page_rank(candidates, gold),
-            "gold_document_rank": _first_document_rank(candidates, gold),
+            "gold_page_rank": _first_page_rank(metric_candidates, gold),
+            "gold_document_rank": _first_document_rank(metric_candidates, gold),
+            "gold_page_rank_within_document": _gold_page_rank_within_document(metric_candidates, gold),
+            "aggregated_gold_document_rank": _aggregated_document_rank(metric_candidates, gold),
             "dense_gold_page_rank": _first_page_rank(retrieval["dense"], gold),
             "bm25_gold_page_rank": _first_page_rank(retrieval["bm25"], gold),
             "merged_rank_trace": [
@@ -212,6 +277,8 @@ def main() -> None:
                 for item in candidates
             ],
             "selected_pages": selector_trace.get("selected_pages") or [],
+            "page_candidate_count": len(metric_candidates),
+            "page_expansion_trace": page_trace,
             "jina_calls": int(bool(rerank_meta.get("remote_success") or rerank_meta.get("rerank_cache_hit"))),
             "jina_chars": jina_chars,
             "rerank_provider": rerank_meta.get("rerank_provider") or "none",

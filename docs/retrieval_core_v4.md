@@ -34,3 +34,31 @@ Fixed diagnostic30 result:
 The phase gate passed: candidate coverage improved materially, context did not
 decline, and the frozen context budget did not expand. The low selected/context
 rate confirms that candidate-to-page selection is now the primary bottleneck.
+
+## Phase 2: Page Neighbor Expansion
+
+Profile: `retrieval_dense_primary_neighbors`
+
+- Every merged page opens only the same document's page −1/current/page +1.
+- Existing offline page embeddings, lexical overlap, and merged source rank
+  produce a deterministic page order; there is no query-time page embedding.
+- Document aggregation keeps seven of eight final slots in the strongest
+  document and reserves one generic global escape slot.
+- Jina calls are zero and Context Budget v3 remains capped at 28,000 chars.
+
+Fixed diagnostic30 result:
+
+| Metric | Dense Primary | Page Neighbors |
+|---|---:|---:|
+| Candidate hit | 93.33% | 96.67% |
+| Selected hit | 30.00% | 33.33% |
+| Context hit | 30.00% | 33.33% |
+| Selection-loss group context | 40.00% | 30.00% |
+| Correct-regression group context | 50.00% | 60.00% |
+| Average context chars | 26,326 | 26,034 |
+| Jina calls | 30 | 0 |
+
+Phase 2 did **not** pass its gate. Aggregate context improved and no Core v3
+context hit regressed, but the dedicated selection-loss group became worse than
+Profile 1. Consequently Profile 3 page-level Jina is intentionally not run.
+This prevents remote spend and avoids tuning page weights against the fixed set.

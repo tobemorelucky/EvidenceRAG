@@ -1,10 +1,15 @@
 from backend import retrieval_ablation
 from backend.retrieval_ablation import build_page_candidates, rank_pages, rrf_fuse
-from backend.rag_core_v4 import merge_dense_primary
+from backend.rag_core_v4 import (
+    expand_and_rank_pages,
+    merge_dense_primary,
+    select_document_first_pages,
+)
 from backend.runtime_profile import (
     RETRIEVAL_ABLATION_FIELD_AWARE_PROFILE,
     RETRIEVAL_ABLATION_STRUCTURAL_PROFILE,
     RETRIEVAL_DENSE_PRIMARY_PROFILE,
+    RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE,
     apply_runtime_profile,
     feature_state,
 )
@@ -45,6 +50,46 @@ def test_dense_primary_merge_preserves_dense_order_and_appends_only_new_bm25():
     assert result[3]["dense_rank"] is None
     assert result[3]["bm25_rank"] == 2
     assert [item["merged_rank"] for item in result] == [1, 2, 3, 4, 5]
+
+
+class _NeighborPageStore:
+    def get_pages_by_keys(self, keys):
+        pages = {
+            ("one.pdf", 3): {"filename": "one.pdf", "page_number": 3, "page_text": "footnote", "page_dense_embedding": [0.2, 0.8]},
+            ("one.pdf", 4): {"filename": "one.pdf", "page_number": 4, "page_text": "unrelated", "page_dense_embedding": [0.0, 1.0]},
+            ("one.pdf", 5): {"filename": "one.pdf", "page_number": 5, "page_text": "target revenue 2023", "page_dense_embedding": [1.0, 0.0]},
+        }
+        return [pages[key] for key in keys if key in pages]
+
+
+def test_page_expansion_stays_in_document_and_ranks_relevant_neighbor():
+    chunks = [{**_chunk("a", "one.pdf", 4, "target"), "merged_rank": 1}]
+
+    pages, trace = expand_and_rank_pages(
+        "target revenue 2023", chunks, [1.0, 0.0], page_store=_NeighborPageStore(),
+    )
+
+    assert [(item["filename"], item["page_number"]) for item in pages] == [
+        ("one.pdf", 5), ("one.pdf", 3), ("one.pdf", 4),
+    ]
+    assert trace["requested_page_count"] == 3
+    assert pages[0]["neighbor_distance"] == 1
+
+
+def test_document_first_selection_keeps_one_global_escape():
+    pages = [
+        {"filename": "primary.pdf", "page_number": page, "page_score": 1.0 - page / 100}
+        for page in range(1, 10)
+    ] + [
+        {"filename": "other.pdf", "page_number": 1, "page_score": 0.7},
+    ]
+
+    selected, trace = select_document_first_pages(pages, final_page_k=8, global_escape_pages=1)
+
+    assert len(selected) == 8
+    assert sum(item["filename"] == "primary.pdf" for item in selected) == 7
+    assert selected[-1]["filename"] == "other.pdf"
+    assert trace["primary_document"] == "primary.pdf"
 
 
 class _PageStore:
@@ -106,3 +151,8 @@ def test_retrieval_ablation_profiles_are_isolated(monkeypatch):
     assert dense_primary["modules"]["Explicit Formula Skill"] is True
     assert dense_primary["modules"]["Canonical Finance Metric Skill"] is True
     assert dense_primary["page_first"] is False
+
+    apply_runtime_profile(RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE)
+    neighbors = feature_state(RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE)
+    assert neighbors["profile"] == RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE
+    assert neighbors["modules"]["Explicit Formula Skill"] is True
