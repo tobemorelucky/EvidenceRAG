@@ -330,3 +330,138 @@ def select_document_first_pages(
             for item in escapes
         ],
     }
+
+
+def score_candidate_documents(
+    merged_chunks: list[dict],
+    *,
+    shortlist_k: int = 3,
+) -> tuple[list[str], list[dict]]:
+    """Rank documents using route ranks and structural support only."""
+    grouped: dict[str, list[dict]] = {}
+    for chunk in merged_chunks:
+        filename = str(chunk.get("filename") or "").strip()
+        if filename:
+            grouped.setdefault(filename, []).append(chunk)
+    documents = []
+    for filename, chunks in grouped.items():
+        dense_ranks = [int(item["dense_rank"]) for item in chunks if item.get("dense_rank") is not None]
+        bm25_ranks = [int(item["bm25_rank"]) for item in chunks if item.get("bm25_rank") is not None]
+        best_dense_rank = min(dense_ranks, default=None)
+        best_bm25_rank = min(bm25_ranks, default=None)
+        dense_rank_score = 1.0 / math.log2(best_dense_rank + 2.0) if best_dense_rank is not None else 0.0
+        bm25_rank_score = 1.0 / math.log2(best_bm25_rank + 2.0) if best_bm25_rank is not None else 0.0
+        chunk_support = min(1.0, math.log2(len(chunks) + 1.0) / math.log2(7.0))
+        page_count = len({page_key(item)[1] for item in chunks})
+        page_coverage = min(1.0, math.log2(page_count + 1.0) / math.log2(6.0))
+        score = (
+            0.55 * dense_rank_score
+            + 0.20 * bm25_rank_score
+            + 0.15 * chunk_support
+            + 0.10 * page_coverage
+        )
+        documents.append({
+            "filename": filename,
+            "document_score": round(score, 8),
+            "best_dense_rank": best_dense_rank,
+            "best_bm25_rank": best_bm25_rank,
+            "chunk_count": len(chunks),
+            "page_count": page_count,
+            "dense_rank_contribution": round(0.55 * dense_rank_score, 8),
+            "bm25_rank_contribution": round(0.20 * bm25_rank_score, 8),
+            "chunk_support_contribution": round(0.15 * chunk_support, 8),
+            "page_coverage_contribution": round(0.10 * page_coverage, 8),
+        })
+    documents.sort(key=lambda item: (-item["document_score"], item["filename"].casefold()))
+    for rank, document in enumerate(documents, 1):
+        document["document_rank"] = rank
+    return [item["filename"] for item in documents[: max(1, shortlist_k)]], documents
+
+
+def _escape_milvus_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def retrieve_document_local_chunks(
+    question: str,
+    filenames: list[str],
+    query_embedding: list[float],
+    *,
+    local_k: int = 30,
+    dense_slots: int = 20,
+    manager: MilvusManager | None = None,
+) -> dict[str, Any]:
+    """Run independent Dense/BM25 retrieval inside shortlisted documents."""
+    manager = manager or MilvusManager()
+    started = time.perf_counter()
+    routes = []
+    combined: list[dict] = []
+    dense_calls = 0
+    bm25_calls = 0
+    for document_rank, filename in enumerate(filenames, 1):
+        escaped = _escape_milvus_string(filename)
+        filter_expr = f'({_LEAF_FILTER}) and filename == "{escaped}"'
+        route_started = time.perf_counter()
+        dense = manager.dense_retrieve(query_embedding, top_k=local_k, filter_expr=filter_expr)
+        dense_calls += 1
+        bm25 = manager.bm25_retrieve(question, top_k=local_k, filter_expr=filter_expr)
+        bm25_calls += 1
+        merged = merge_dense_primary(
+            dense,
+            bm25,
+            dense_k=min(local_k, max(1, dense_slots)),
+            bm25_k=local_k,
+        )[:local_k]
+        for item in merged:
+            item["local_document_rank"] = document_rank
+            item["local_dense_rank"] = item.pop("dense_rank", None)
+            item["local_bm25_rank"] = item.pop("bm25_rank", None)
+            item["local_chunk_rank"] = item.pop("merged_rank", None)
+            item["candidate_source"] = "document_local"
+        combined.extend(merged)
+        routes.append({
+            "filename": filename,
+            "document_rank": document_rank,
+            "dense_count": len(dense),
+            "bm25_count": len(bm25),
+            "local_chunk_count": len(merged),
+            "dense_slots": min(local_k, max(1, dense_slots)),
+            "bm25_supplement_slots": max(0, local_k - min(local_k, max(1, dense_slots))),
+            "latency_ms": round((time.perf_counter() - route_started) * 1000, 2),
+        })
+    combined.sort(key=lambda item: (
+        int(item.get("local_document_rank") or 10**9),
+        int(item.get("local_chunk_rank") or 10**9),
+    ))
+    for rank, item in enumerate(combined, 1):
+        item["merged_rank"] = rank
+    return {
+        "chunks": combined,
+        "routes": routes,
+        "dense_calls": dense_calls,
+        "bm25_calls": bm25_calls,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
+
+
+def merge_global_local_chunks(global_chunks: list[dict], local_chunks: list[dict]) -> list[dict]:
+    """Prefer local ranks, then append global chunks that add new evidence."""
+    merged = []
+    seen: set[tuple] = set()
+    global_ranks = {chunk_key(item): rank for rank, item in enumerate(global_chunks, 1)}
+    local_ranks = {chunk_key(item): rank for rank, item in enumerate(local_chunks, 1)}
+    for source, items in (("local", local_chunks), ("global", global_chunks)):
+        for item in items:
+            key = chunk_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({
+                **item,
+                "global_rank": global_ranks.get(key),
+                "local_rank": local_ranks.get(key),
+                "candidate_source": "both" if key in global_ranks and key in local_ranks else source,
+            })
+    for rank, item in enumerate(merged, 1):
+        item["merged_rank"] = rank
+    return merged

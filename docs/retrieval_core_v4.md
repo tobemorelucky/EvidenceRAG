@@ -62,3 +62,36 @@ Phase 2 did **not** pass its gate. Aggregate context improved and no Core v3
 context hit regressed, but the dedicated selection-loss group became worse than
 Profile 1. Consequently Profile 3 page-level Jina is intentionally not run.
 This prevents remote spend and avoids tuning page weights against the fixed set.
+
+## Phase 3: Document-local Page Retrieval
+
+Profile: `retrieval_document_local`
+
+The global Dense Primary result is aggregated into a Top3 document shortlist
+using only Dense/BM25 ranks, chunk count, and distinct-page coverage. The query
+embedding is reused. Each shortlisted document receives one Dense Top30 and one
+BM25 Top30 search; the final local capacity reserves 20 Dense slots and up to 10
+BM25-only supplement slots. No Jina, answer model, or Judge is called.
+
+The fixed diagnostic30 compares:
+
+- A: current global page selection;
+- B: document-local-only page selection;
+- C: local-first chunks plus the global candidate pool.
+
+| Metric | A global | B document-local | C global+local |
+|---|---:|---:|---:|
+| Candidate hit | 96.67% | 70.00% | 96.67% |
+| Selected hit | 33.33% | 33.33% | 26.67% |
+| Context hit | 33.33% | 33.33% | 26.67% |
+| Average gold page rank | 36.24 | 14.38 | 36.17 |
+| Average candidate pages | 291.57 | 80.70 | 356.40 |
+| Average context chars | 26,034 | 26,380 | 26,374 |
+
+Rank improved below the `<15` target, but context did not exceed 50%. B recovered
+`financebench_id_00540` and `financebench_id_01351` while losing
+`financebench_id_00605` and `financebench_id_01328`. C retained global candidate
+coverage but its enlarged mixed page pool worsened final selection. Average
+document-local Milvus latency was 33.44 ms, with four Dense and four BM25 calls
+per question including global discovery. The phase gate therefore failed and
+page-level Jina remains disabled.

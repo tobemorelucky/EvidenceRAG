@@ -2,7 +2,10 @@ from backend import retrieval_ablation
 from backend.retrieval_ablation import build_page_candidates, rank_pages, rrf_fuse
 from backend.rag_core_v4 import (
     expand_and_rank_pages,
+    merge_global_local_chunks,
     merge_dense_primary,
+    retrieve_document_local_chunks,
+    score_candidate_documents,
     select_document_first_pages,
 )
 from backend.runtime_profile import (
@@ -10,6 +13,7 @@ from backend.runtime_profile import (
     RETRIEVAL_ABLATION_STRUCTURAL_PROFILE,
     RETRIEVAL_DENSE_PRIMARY_PROFILE,
     RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE,
+    RETRIEVAL_DOCUMENT_LOCAL_PROFILE,
     apply_runtime_profile,
     feature_state,
 )
@@ -92,6 +96,81 @@ def test_document_first_selection_keeps_one_global_escape():
     assert trace["primary_document"] == "primary.pdf"
 
 
+def test_document_shortlist_uses_rank_and_structural_support_only():
+    chunks = [
+        {**_chunk("a1", "a.pdf", 1), "dense_rank": 1, "bm25_rank": None},
+        {**_chunk("a2", "a.pdf", 2), "dense_rank": 8, "bm25_rank": 3},
+        {**_chunk("b1", "b.pdf", 1), "dense_rank": 2, "bm25_rank": None},
+    ]
+
+    shortlist, trace = score_candidate_documents(chunks, shortlist_k=2)
+
+    assert shortlist == ["a.pdf", "b.pdf"]
+    assert trace[0]["document_rank"] == 1
+    assert trace[0]["chunk_count"] == 2
+    assert trace[0]["page_count"] == 2
+
+
+class _LocalManager:
+    def __init__(self):
+        self.filters = []
+
+    def dense_retrieve(self, embedding, top_k, filter_expr):
+        self.filters.append(("dense", filter_expr, top_k))
+        filename = "a.pdf" if 'a.pdf' in filter_expr else "b.pdf"
+        return [_chunk(f"{filename}-dense", filename, 4)]
+
+    def bm25_retrieve(self, question, top_k, filter_expr):
+        self.filters.append(("bm25", filter_expr, top_k))
+        filename = "a.pdf" if 'a.pdf' in filter_expr else "b.pdf"
+        return [_chunk(f"{filename}-bm25", filename, 5)]
+
+
+def test_document_local_search_scopes_each_dense_and_bm25_call():
+    manager = _LocalManager()
+
+    result = retrieve_document_local_chunks(
+        "revenue", ["a.pdf", "b.pdf"], [1.0, 0.0], local_k=20, manager=manager,
+    )
+
+    assert result["dense_calls"] == 2
+    assert result["bm25_calls"] == 2
+    assert len(result["chunks"]) == 4
+    assert all('filename == "' in item[1] for item in manager.filters)
+    assert all(item[2] == 20 for item in manager.filters)
+
+
+def test_document_local_search_reserves_bm25_supplement_slots():
+    class ManyResults:
+        def dense_retrieve(self, embedding, top_k, filter_expr):
+            return [_chunk(f"d{index}", "a.pdf", index) for index in range(30)]
+
+        def bm25_retrieve(self, question, top_k, filter_expr):
+            return [_chunk(f"b{index}", "a.pdf", 100 + index) for index in range(30)]
+
+    result = retrieve_document_local_chunks(
+        "revenue", ["a.pdf"], [1.0], local_k=30, dense_slots=20, manager=ManyResults(),
+    )
+
+    assert len(result["chunks"]) == 30
+    assert sum(item["local_dense_rank"] is not None for item in result["chunks"]) == 20
+    assert sum(item["local_bm25_rank"] is not None for item in result["chunks"]) == 10
+    assert result["routes"][0]["bm25_supplement_slots"] == 10
+
+
+def test_global_local_merge_prefers_local_and_records_both_ranks():
+    shared = _chunk("shared", "a.pdf", 1)
+    local = [shared, _chunk("local", "a.pdf", 2)]
+    global_chunks = [_chunk("global", "b.pdf", 3), shared]
+
+    merged = merge_global_local_chunks(global_chunks, local)
+
+    assert [item["chunk_id"] for item in merged] == ["shared", "local", "global"]
+    assert merged[0]["candidate_source"] == "both"
+    assert merged[0]["local_rank"] == 1
+    assert merged[0]["global_rank"] == 2
+
+
 class _PageStore:
     def get_pages_by_keys(self, keys):
         return [{"filename": "one.pdf", "page_number": 4, "page_text": "Revenue table heading"}]
@@ -156,3 +235,10 @@ def test_retrieval_ablation_profiles_are_isolated(monkeypatch):
     neighbors = feature_state(RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE)
     assert neighbors["profile"] == RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE
     assert neighbors["modules"]["Explicit Formula Skill"] is True
+
+    apply_runtime_profile(RETRIEVAL_DOCUMENT_LOCAL_PROFILE)
+    document_local = feature_state(RETRIEVAL_DOCUMENT_LOCAL_PROFILE)
+    assert document_local["profile"] == RETRIEVAL_DOCUMENT_LOCAL_PROFILE
+    assert document_local["modules"]["Explicit Formula Skill"] is True
+    assert document_local["modules"]["Canonical Finance Metric Skill"] is True
+    assert document_local["modules"]["Agent/Planner"] is False

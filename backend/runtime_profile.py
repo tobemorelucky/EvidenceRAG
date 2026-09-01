@@ -17,6 +17,7 @@ RETRIEVAL_ABLATION_STRUCTURAL_PROFILE = "retrieval_ablation_structural"
 RETRIEVAL_ABLATION_FIELD_AWARE_PROFILE = "retrieval_ablation_field_aware"
 RETRIEVAL_DENSE_PRIMARY_PROFILE = "retrieval_dense_primary"
 RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE = "retrieval_dense_primary_neighbors"
+RETRIEVAL_DOCUMENT_LOCAL_PROFILE = "retrieval_document_local"
 
 # These values are authoritative for the clean baseline. They intentionally
 # override stale values from .env so an experiment cannot be polluted by a
@@ -129,6 +130,14 @@ RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_OVERRIDES: Mapping[str, str] = {
     "RAG_CORE_V4_NEIGHBOR_WINDOW": "1",
 }
 
+RETRIEVAL_DOCUMENT_LOCAL_OVERRIDES: Mapping[str, str] = {
+    **RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_OVERRIDES,
+    "RAG_PROFILE": RETRIEVAL_DOCUMENT_LOCAL_PROFILE,
+    "RAG_CORE_V4_DOCUMENT_SHORTLIST_K": "3",
+    "RAG_CORE_V4_DOCUMENT_LOCAL_K": "30",
+    "RAG_CORE_V4_PAGE_JINA_ENABLED": "false",
+}
+
 
 FEATURE_LABELS: tuple[tuple[str, str], ...] = (
     ("Finance Policy", "FINANCE_POLICY_ENABLED"),
@@ -215,6 +224,8 @@ def apply_runtime_profile(profile: str | None = None) -> str:
         os.environ.update(RETRIEVAL_DENSE_PRIMARY_OVERRIDES)
     elif resolved == RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_PROFILE:
         os.environ.update(RETRIEVAL_DENSE_PRIMARY_NEIGHBORS_OVERRIDES)
+    elif resolved == RETRIEVAL_DOCUMENT_LOCAL_PROFILE:
+        os.environ.update(RETRIEVAL_DOCUMENT_LOCAL_OVERRIDES)
     return resolved
 
 
