@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import List
+from sqlalchemy import tuple_
 
 try:
     from database import SessionLocal
@@ -133,6 +134,24 @@ class TableStore:
                 .order_by(DocumentTable.page_number.asc(), DocumentTable.table_index.asc())
                 .all()
             )
+            return [self._to_dict(row) for row in rows]
+        finally:
+            db.close()
+
+    def get_tables_by_page_keys(self, keys: List[tuple[str, int]]) -> List[dict]:
+        """Read tables attached to an explicit page set for rerank representations."""
+        normalized = list(dict.fromkeys(
+            (self._normalize_string(filename).strip(), self._normalize_int(page_number))
+            for filename, page_number in keys
+            if self._normalize_string(filename).strip()
+        ))
+        if not normalized:
+            return []
+        db = SessionLocal()
+        try:
+            rows = db.query(DocumentTable).filter(
+                tuple_(DocumentTable.filename, DocumentTable.page_number).in_(normalized)
+            ).order_by(DocumentTable.filename.asc(), DocumentTable.page_number.asc(), DocumentTable.table_index.asc()).all()
             return [self._to_dict(row) for row in rows]
         finally:
             db.close()

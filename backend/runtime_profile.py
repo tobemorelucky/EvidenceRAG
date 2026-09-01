@@ -13,6 +13,8 @@ RAG_CORE_V2_PROFILE = "rag_core_v2"
 RAG_CORE_V2_SKILLS_PROFILE = "rag_core_v2_skills"
 RAG_CORE_V3_PROFILE = "rag_core_v3"
 RAG_CORE_V3_SKILLS_PROFILE = "rag_core_v3_skills"
+RETRIEVAL_ABLATION_STRUCTURAL_PROFILE = "retrieval_ablation_structural"
+RETRIEVAL_ABLATION_FIELD_AWARE_PROFILE = "retrieval_ablation_field_aware"
 
 # These values are authoritative for the clean baseline. They intentionally
 # override stale values from .env so an experiment cannot be polluted by a
@@ -83,6 +85,29 @@ RAG_CORE_V3_OVERRIDES: Mapping[str, str] = {
     "RAG_CORE_V3_MAX_TABLE_CHARS": "5000",
     "RAG_CORE_V3_MIN_PAGE_CHARS": "2200",
     "RAG_CORE_V3_DOCUMENT_LOCAL_RETRIEVAL": "false",
+}
+
+RETRIEVAL_ABLATION_STRUCTURAL_OVERRIDES: Mapping[str, str] = {
+    **CLEAN_BASELINE_OVERRIDES,
+    "RAG_PROFILE": RETRIEVAL_ABLATION_STRUCTURAL_PROFILE,
+    "FINANCE_RAG_CANDIDATE_K": "60",
+    "FINANCE_RAG_FINAL_TOP_K": "8",
+    "RERANK_REMOTE_CANDIDATE_K": "18",
+    "RAG_PAGE_FIRST_ENABLED": "true",
+    "FINANCE_RAG_ENABLE_PAGE_MERGE": "true",
+    "FINANCE_RAG_ADJACENT_PAGE_WINDOW": "1",
+    "FINANCE_RAG_ADJACENT_CHUNK_WINDOW": "1",
+    "RAG_CONTEXT_PAGE_WINDOW": "1",
+    "RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED": "false",
+}
+
+RETRIEVAL_ABLATION_FIELD_AWARE_OVERRIDES: Mapping[str, str] = {
+    **RETRIEVAL_ABLATION_STRUCTURAL_OVERRIDES,
+    "RAG_PROFILE": RETRIEVAL_ABLATION_FIELD_AWARE_PROFILE,
+    "RAG_FIELD_AWARE_ENABLED": "true",
+    "RAG_SUPPLEMENTAL_SEARCH_ENABLED": "true",
+    "FINANCE_RAG_ADJACENT_PAGE_WINDOW": "2",
+    "RAG_CONTEXT_PAGE_WINDOW": "2",
 }
 
 
@@ -163,6 +188,10 @@ def apply_runtime_profile(profile: str | None = None) -> str:
             "EXPLICIT_FORMULA_SKILL_ENABLED": "true",
             "CANONICAL_FINANCE_METRIC_SKILL_ENABLED": "true",
         })
+    elif resolved == RETRIEVAL_ABLATION_STRUCTURAL_PROFILE:
+        os.environ.update(RETRIEVAL_ABLATION_STRUCTURAL_OVERRIDES)
+    elif resolved == RETRIEVAL_ABLATION_FIELD_AWARE_PROFILE:
+        os.environ.update(RETRIEVAL_ABLATION_FIELD_AWARE_OVERRIDES)
     return resolved
 
 

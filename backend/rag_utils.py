@@ -1979,7 +1979,16 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
     }
 
 
-def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
+def _rerank_documents(
+    query: str,
+    docs: List[dict],
+    top_k: int,
+    *,
+    remote_candidate_k: int | None = None,
+    remote_max_chars: int | None = None,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    remote_candidate_k = max(1, remote_candidate_k or RERANK_REMOTE_CANDIDATE_K)
+    remote_max_chars = max(256, remote_max_chars or RERANK_REMOTE_MAX_CHARS)
     docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
     meta: Dict[str, Any] = {
         "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
@@ -2020,10 +2029,10 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
             anchor_docs.append(doc)
             covered_fields.update((doc.get("matched_required_fields") or {}).keys())
             covered_statements.update(doc.get("statement_types") or [])
-            if len(anchor_docs) >= min(6, RERANK_REMOTE_CANDIDATE_K):
+            if len(anchor_docs) >= min(6, remote_candidate_k):
                 break
         for doc in docs_with_rank:
-            if len(anchor_docs) >= min(6, RERANK_REMOTE_CANDIDATE_K):
+            if len(anchor_docs) >= min(6, remote_candidate_k):
                 break
             fields = set((doc.get("matched_required_fields") or {}).keys())
             statements = set(doc.get("statement_types") or [])
@@ -2033,7 +2042,7 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
                 anchor_docs.append(doc)
                 covered_fields.update(fields)
                 covered_statements.update(statements)
-        remote_docs = _deduplicate_docs(anchor_docs + docs_with_rank)[:RERANK_REMOTE_CANDIDATE_K]
+        remote_docs = _deduplicate_docs(anchor_docs + docs_with_rank)[:remote_candidate_k]
         meta["remote_rerank_anchor_count"] = sum(
             1
             for doc in remote_docs
@@ -2042,7 +2051,7 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
             or doc.get("matched_required_fields")
             or doc.get("selection_scope_anchor")
         )
-        remote_texts = [str(doc.get("text", "") or "")[:RERANK_REMOTE_MAX_CHARS] for doc in remote_docs]
+        remote_texts = [str(doc.get("text", "") or "")[:remote_max_chars] for doc in remote_docs]
         meta["remote_rerank_candidate_count"] = len(remote_docs)
         meta["remote_rerank_input_chars"] = sum(len(text) for text in remote_texts)
         payload = {

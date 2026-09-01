@@ -7,7 +7,7 @@ from database import SessionLocal, engine
 from embedding import embedding_service
 from finance_rag_features import build_embedding_cache_key, compute_page_features
 from models import DocumentPage
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, tuple_
 from text_sanitizer import sanitize_text
 
 
@@ -262,6 +262,25 @@ class DocumentPageStore:
                         payload,
                     )
             return sorted(results, key=lambda item: ((item.get("filename") or "").lower(), int(item.get("page_number", 0) or 0)))
+        finally:
+            db.close()
+
+    def get_pages_by_keys(self, keys: List[tuple[str, int]]) -> List[dict]:
+        """Read only the requested pages instead of loading whole documents."""
+        normalized = list(dict.fromkeys(
+            (str(filename).strip(), int(page_number))
+            for filename, page_number in keys
+            if str(filename).strip()
+        ))
+        if not normalized:
+            return []
+        db = SessionLocal()
+        try:
+            rows = db.query(DocumentPage).filter(
+                tuple_(DocumentPage.filename, DocumentPage.page_number).in_(normalized)
+            ).all()
+            by_key = {(row.filename, row.page_number): self._to_dict(row) for row in rows}
+            return [by_key[key] for key in normalized if key in by_key]
         finally:
             db.close()
 

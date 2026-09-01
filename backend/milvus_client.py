@@ -497,6 +497,56 @@ class MilvusManager:
         
         return formatted_results
 
+    def bm25_retrieve(self, query_text: str, top_k: int = 5, filter_expr: str = "") -> list[dict]:
+        """Run an independent sparse search for offline retrieval diagnostics.
+
+        Production hybrid retrieval continues to use :meth:`hybrid_retrieve`.
+        This method exists so an ablation can observe the BM25 rank before RRF.
+        """
+        if not self.uses_builtin_bm25:
+            raise RuntimeError("independent BM25 diagnostics require a Milvus built-in BM25 collection")
+        output_fields = [
+            "text", "filename", "file_type", "page_number", "evidence_type",
+            "table_id", "row_id", "table_title", "chunk_id", "parent_chunk_id",
+            "root_chunk_id", "chunk_level", "chunk_idx", "company", "report_year",
+            "financial_document_type", "location", "content_hash",
+        ]
+        self._log_search_params(
+            retrieval_type="bm25_diagnostic",
+            candidate_k=top_k,
+            final_top_k=top_k,
+            actual_search_k=top_k,
+            final_limit=top_k,
+            metric_type="BM25",
+            effective_ef=None,
+        )
+        results = self._run_with_reconnect(
+            lambda client: client.search(
+                collection_name=self.collection_name,
+                data=[query_text],
+                anns_field="sparse_embedding",
+                search_params={"metric_type": "BM25", "params": {}},
+                limit=max(1, top_k),
+                output_fields=output_fields,
+                filter=filter_expr,
+            )
+        )
+        formatted_results = []
+        for hits in results:
+            for hit in hits:
+                entity = hit.get("entity", {})
+                formatted_results.append({
+                    "id": hit.get("id"),
+                    **{field: entity.get(field, "") for field in output_fields},
+                    "page_number": entity.get("page_number", 0),
+                    "chunk_level": entity.get("chunk_level", 0),
+                    "chunk_idx": entity.get("chunk_idx", 0),
+                    "report_year": entity.get("report_year", 0),
+                    "evidence_type": entity.get("evidence_type", "text_chunk") or "text_chunk",
+                    "score": hit.get("distance", 0.0),
+                })
+        return formatted_results
+
     def delete(self, filter_expr: str):
         """删除数据"""
         return self._run_with_reconnect(
