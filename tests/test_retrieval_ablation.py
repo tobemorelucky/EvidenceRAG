@@ -1,8 +1,10 @@
 from backend import retrieval_ablation
 from backend.retrieval_ablation import build_page_candidates, rank_pages, rrf_fuse
+from backend.rag_core_v4 import merge_dense_primary
 from backend.runtime_profile import (
     RETRIEVAL_ABLATION_FIELD_AWARE_PROFILE,
     RETRIEVAL_ABLATION_STRUCTURAL_PROFILE,
+    RETRIEVAL_DENSE_PRIMARY_PROFILE,
     apply_runtime_profile,
     feature_state,
 )
@@ -28,6 +30,21 @@ def test_rrf_preserves_independent_route_ranks():
     assert fused[0]["dense_rank"] == 2
     assert fused[0]["bm25_rank"] == 1
     assert [page["filename"] for page in rank_pages(fused)] == ["two.pdf", "one.pdf", "three.pdf"]
+
+
+def test_dense_primary_merge_preserves_dense_order_and_appends_only_new_bm25():
+    dense = [_chunk("a", "one.pdf", 1), _chunk("b", "one.pdf", 2), _chunk("c", "one.pdf", 3)]
+    bm25 = [_chunk("c", "one.pdf", 3), _chunk("d", "one.pdf", 4), _chunk("e", "one.pdf", 5)]
+
+    result = merge_dense_primary(dense, bm25)
+
+    assert [item["chunk_id"] for item in result] == ["a", "b", "c", "d", "e"]
+    assert result[2]["dense_rank"] == 3
+    assert result[2]["bm25_rank"] == 1
+    assert result[2]["candidate_source"] == "both"
+    assert result[3]["dense_rank"] is None
+    assert result[3]["bm25_rank"] == 2
+    assert [item["merged_rank"] for item in result] == [1, 2, 3, 4, 5]
 
 
 class _PageStore:
@@ -82,3 +99,10 @@ def test_retrieval_ablation_profiles_are_isolated(monkeypatch):
     assert field_aware["field_aware"] is True
     assert field_aware["modules"]["Agent/Planner"] is False
     assert field_aware["modules"]["Finance Policy"] is False
+
+    apply_runtime_profile(RETRIEVAL_DENSE_PRIMARY_PROFILE)
+    dense_primary = feature_state(RETRIEVAL_DENSE_PRIMARY_PROFILE)
+    assert dense_primary["profile"] == RETRIEVAL_DENSE_PRIMARY_PROFILE
+    assert dense_primary["modules"]["Explicit Formula Skill"] is True
+    assert dense_primary["modules"]["Canonical Finance Metric Skill"] is True
+    assert dense_primary["page_first"] is False
