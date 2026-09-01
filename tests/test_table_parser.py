@@ -75,7 +75,8 @@ def test_extract_tables_uses_pdfplumber_structure(monkeypatch):
     tables = parser.extract_tables("demo.pdf", "demo.pdf")
 
     assert len(tables) == 1
-    assert tables[0]["page_number"] == 1
+    assert tables[0]["page_number"] == 0
+    assert tables[0]["page_id"].endswith(":page:000000")
     assert tables[0]["table_index"] == 1
     assert tables[0]["columns"] == ["Metric", "FY2022", "FY2021"]
     assert tables[0]["parser_backend"] == "pdfplumber"
@@ -177,5 +178,7 @@ def test_extract_tables_pdfplumber_words_include_rejected_flag(monkeypatch):
     accepted_only = parser.extract_tables("demo.pdf", "demo.pdf")
     with_rejected = parser.extract_tables("demo.pdf", "demo.pdf", include_rejected=True)
 
-    assert [item["table_id"] for item in accepted_only] == ["accepted"]
-    assert [item["table_id"] for item in with_rejected] == ["accepted", "rejected"]
+    assert len(accepted_only) == 1
+    assert len(with_rejected) == 2
+    assert with_rejected[0]["table_id"].endswith(":table:0001")
+    assert with_rejected[1]["table_id"].endswith(":table:0002")

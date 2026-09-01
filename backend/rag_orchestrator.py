@@ -38,6 +38,7 @@ from evidence_coverage import (
 )
 from finance_policy import load_finance_policy
 from evidence_context import build_baseline_evidence, build_compact_evidence
+from evidence_fusion_v2 import build_evidence_fusion_v2
 from prompts import (
     CLEAN_BASELINE_PROMPT_VERSION,
     PROMPT_VERSION,
@@ -958,26 +959,15 @@ def _prepare_rag_core_v3_response(
             "answer_page_open_latency_ms": round((time.perf_counter() - page_started) * 1000, 2),
         }
     answer_docs = merge_opened_pages_v3(context_pages, opened)
-    filenames = list(dict.fromkeys(
-        str(page.get("filename") or "").strip() for page in answer_docs if page.get("filename")
-    ))
     table_load_started = time.perf_counter()
-    tables = []
+    page_ids = [str(page.get("page_id") or "").strip() for page in answer_docs if page.get("page_id")]
     table_errors = []
-    for filename in filenames:
-        try:
-            tables.extend(_table_store.get_tables_by_filename(filename))
-        except Exception as exc:
-            table_errors.append(f"{filename}: {type(exc).__name__}: {exc}")
-    selected_keys = {
-        (str(page.get("filename") or ""), int(page.get("page_number") or 0))
-        for page in answer_docs
-    }
-    tables = [
-        table for table in tables
-        if (str(table.get("filename") or ""), int(table.get("page_number") or 0)) in selected_keys
-    ]
-    evidence, context_meta = build_core_v3_evidence(question, answer_docs, tables)
+    try:
+        tables = _table_store.get_tables_by_page_ids(page_ids)
+    except Exception as exc:
+        tables = []
+        table_errors.append(f"{type(exc).__name__}: {exc}")
+    evidence, context_meta = build_evidence_fusion_v2(question, answer_docs, tables)
     if not evidence:
         evidence = _format_evidence(reranked_chunks[:6])
         answer_docs = reranked_chunks[:6]

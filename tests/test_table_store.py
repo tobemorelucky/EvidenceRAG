@@ -96,6 +96,41 @@ def test_table_store_prefers_normalized_financial_structure(monkeypatch):
     assert table["rows"] == [{"Metric": "Cash", "2024": "100"}]
 
 
+def test_table_store_persists_evidence_assembly_identity_and_quality(monkeypatch):
+    store = _make_store(monkeypatch)
+    document_id = "doc_123"
+    page_id = f"{document_id}:page:000003"
+
+    store.upsert_tables([
+        {
+            "table_id": f"{page_id}:table:0001",
+            "document_id": document_id,
+            "page_id": page_id,
+            "filename": "report.pdf",
+            "page_number": 3,
+            "start_page": 3,
+            "end_page": 4,
+            "table_index": 1,
+            "parser_backend": "pdfplumber_words",
+            "quality_score": 0.88,
+            "columns": ["Metric", "2024"],
+            "rows": [{"Metric": "Revenue", "2024": "100"}],
+            "unit": "USD",
+            "scale": "millions",
+        }
+    ])
+
+    table = store.get_tables_by_page_ids([page_id])[0]
+    assert table["document_id"] == document_id
+    assert table["page_id"] == page_id
+    assert table["start_page"] == 3
+    assert table["end_page"] == 4
+    assert table["parser_backend"] == "pdfplumber_words"
+    assert table["quality_score"] == 0.88
+    assert table["unit"] == "USD"
+    assert table["scale"] == "millions"
+
+
 def test_table_store_get_by_filename_orders_by_page_and_index(monkeypatch):
     store = _make_store(monkeypatch)
 

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 try:
@@ -70,6 +70,8 @@ class DocumentPage(Base):
     __table_args__ = (UniqueConstraint("filename", "page_number", name="uq_document_page"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    document_id: Mapped[str] = mapped_column(String(64), default="", nullable=False, index=True)
+    page_id: Mapped[str] = mapped_column(String(128), default="", nullable=False, index=True)
     doc_name: Mapped[str] = mapped_column(String(255), default="", nullable=False, index=True)
     filename: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     file_type: Mapped[str] = mapped_column(String(50), default="", nullable=False)
@@ -96,12 +98,18 @@ class DocumentTable(Base):
     __tablename__ = "document_tables"
 
     table_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    document_id: Mapped[str] = mapped_column(String(64), default="", nullable=False, index=True)
+    page_id: Mapped[str] = mapped_column(String(128), default="", nullable=False, index=True)
     filename: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     doc_name: Mapped[str] = mapped_column(String(255), default="", nullable=False, index=True)
     file_type: Mapped[str] = mapped_column(String(50), default="", nullable=False)
     file_path: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
     page_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
+    start_page: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    end_page: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     table_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    parser_backend: Mapped[str] = mapped_column(String(50), default="", nullable=False)
+    quality_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     title: Mapped[str] = mapped_column(Text, default="", nullable=False)
     caption: Mapped[str] = mapped_column(Text, default="", nullable=False)
     before_context: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -110,4 +118,6 @@ class DocumentTable(Base):
     rows: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     html: Mapped[str] = mapped_column(Text, default="", nullable=False)
     csv_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    unit: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    scale: Mapped[str] = mapped_column(String(100), default="", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

@@ -17,9 +17,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 try:
+    from evidence_identity import build_document_id, build_page_id
     from table_parser import TableAwareParser
     from text_sanitizer import sanitize_text
 except ModuleNotFoundError:
+    from backend.evidence_identity import build_document_id, build_page_id
     from backend.table_parser import TableAwareParser
     from backend.text_sanitizer import sanitize_text
 
@@ -287,6 +289,7 @@ class DocumentLoader:
 
         try:
             raw_docs = loader.load()
+            document_id = build_document_id(file_path=file_path, filename=filename)
             documents = []
             pages = []
             page_global_chunk_idx = 0
@@ -294,6 +297,8 @@ class DocumentLoader:
                 page_number = self._resolve_page_number(doc.metadata)
                 page_text = sanitize_text(doc.page_content).strip()
                 base_doc = {
+                    "document_id": document_id,
+                    "page_id": build_page_id(document_id, page_number),
                     "filename": filename,
                     "file_path": file_path,
                     "file_type": doc_type,
@@ -313,6 +318,8 @@ class DocumentLoader:
                 pages.append(
                     {
                         "doc_name": os.path.splitext(filename)[0],
+                        "document_id": document_id,
+                        "page_id": build_page_id(document_id, page_number),
                         "filename": filename,
                         "file_type": doc_type,
                         "file_path": file_path,

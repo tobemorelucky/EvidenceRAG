@@ -7,6 +7,7 @@ from database import SessionLocal, engine
 from embedding import embedding_service
 from finance_rag_features import build_embedding_cache_key, compute_page_features
 from models import DocumentPage
+from evidence_identity import build_document_id, build_page_id
 from sqlalchemy import inspect, text, tuple_
 from text_sanitizer import sanitize_text
 
@@ -19,11 +20,14 @@ class DocumentPageStore:
 
     def _ensure_schema(self) -> None:
         try:
-            inspector = inspect(engine)
+            bound_engine = getattr(SessionLocal, "kw", {}).get("bind") or engine
+            inspector = inspect(bound_engine)
             if "document_pages" not in inspector.get_table_names():
                 return
             columns = {item["name"] for item in inspector.get_columns("document_pages")}
             alter_sql = {
+                "document_id": "ALTER TABLE document_pages ADD COLUMN document_id VARCHAR(64) NOT NULL DEFAULT ''",
+                "page_id": "ALTER TABLE document_pages ADD COLUMN page_id VARCHAR(128) NOT NULL DEFAULT ''",
                 "embedding_cache_key": "ALTER TABLE document_pages ADD COLUMN embedding_cache_key VARCHAR(255) NOT NULL DEFAULT ''",
                 "page_dense_embedding": "ALTER TABLE document_pages ADD COLUMN page_dense_embedding JSON NOT NULL DEFAULT '[]'",
                 "page_tokens": "ALTER TABLE document_pages ADD COLUMN page_tokens JSON NOT NULL DEFAULT '[]'",
@@ -39,7 +43,7 @@ class DocumentPageStore:
             for name, sql in alter_sql.items():
                 if name in columns:
                     continue
-                with engine.begin() as conn:
+                with bound_engine.begin() as conn:
                     conn.execute(text(sql))
         except Exception:
             return
@@ -47,6 +51,8 @@ class DocumentPageStore:
     @staticmethod
     def _to_dict(item: DocumentPage) -> dict:
         return {
+            "document_id": item.document_id,
+            "page_id": item.page_id,
             "doc_name": item.doc_name,
             "filename": item.filename,
             "file_type": item.file_type,
@@ -92,11 +98,17 @@ class DocumentPageStore:
             if not filename:
                 continue
             page_number = int(page.get("page_number", 0) or 0)
+            document_id = str(page.get("document_id") or "").strip() or build_document_id(
+                file_path=page.get("file_path", ""), filename=filename
+            )
+            page_id = str(page.get("page_id") or "").strip() or build_page_id(document_id, page_number)
             page_text = sanitize_text(page.get("page_text", ""))
             table_text = sanitize_text(page.get("table_text", ""))
             features = compute_page_features(page_text, table_text)
             normalized_pages.append(
                 {
+                    "document_id": document_id,
+                    "page_id": page_id,
                     "doc_name": page.get("doc_name", ""),
                     "filename": filename,
                     "file_type": page.get("file_type", ""),
@@ -133,10 +145,18 @@ class DocumentPageStore:
                 page_number = page["page_number"]
                 record = (
                     db.query(DocumentPage)
-                    .filter(DocumentPage.filename == filename, DocumentPage.page_number == page_number)
+                    .filter(DocumentPage.page_id == page["page_id"])
                     .first()
                 )
+                if record is None:
+                    record = (
+                        db.query(DocumentPage)
+                        .filter(DocumentPage.filename == filename, DocumentPage.page_number == page_number)
+                        .first()
+                    )
                 payload = {
+                    "document_id": page["document_id"],
+                    "page_id": page["page_id"],
                     "doc_name": page["doc_name"],
                     "company": page["company"],
                     "report_year": page["report_year"],
@@ -157,6 +177,8 @@ class DocumentPageStore:
                     "updated_at": datetime.utcnow(),
                 }
                 cache_payload = {
+                    "document_id": payload["document_id"],
+                    "page_id": payload["page_id"],
                     "doc_name": payload["doc_name"],
                     "filename": filename,
                     "file_type": payload["file_type"],
@@ -213,13 +235,19 @@ class DocumentPageStore:
                 continue
             page_text = sanitize_text(page.get("page_text", ""))
             table_text = sanitize_text(page.get("table_text", ""))
+            page_number = int(page.get("page_number", 0) or 0)
+            document_id = str(page.get("document_id") or "").strip() or build_document_id(
+                file_path=page.get("file_path", ""), filename=filename
+            )
             mappings.append(
                 {
+                    "document_id": document_id,
+                    "page_id": str(page.get("page_id") or "").strip() or build_page_id(document_id, page_number),
                     "doc_name": page.get("doc_name", ""),
                     "filename": filename,
                     "file_type": page.get("file_type", ""),
                     "file_path": page.get("file_path", ""),
-                    "page_number": int(page.get("page_number", 0) or 0),
+                    "page_number": page_number,
                     "company": page.get("company", ""),
                     "report_year": int(page.get("report_year", 0) or 0),
                     "financial_document_type": page.get("financial_document_type", ""),
@@ -281,6 +309,20 @@ class DocumentPageStore:
             ).all()
             by_key = {(row.filename, row.page_number): self._to_dict(row) for row in rows}
             return [by_key[key] for key in normalized if key in by_key]
+        finally:
+            db.close()
+
+    def get_pages_by_ids(self, page_ids: List[str]) -> List[dict]:
+        normalized = list(dict.fromkeys(
+            str(page_id).strip() for page_id in page_ids if str(page_id).strip()
+        ))
+        if not normalized:
+            return []
+        db = SessionLocal()
+        try:
+            rows = db.query(DocumentPage).filter(DocumentPage.page_id.in_(normalized)).all()
+            by_id = {row.page_id: self._to_dict(row) for row in rows}
+            return [by_id[page_id] for page_id in normalized if page_id in by_id]
         finally:
             db.close()
 

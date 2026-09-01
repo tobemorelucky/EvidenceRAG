@@ -7,12 +7,16 @@ import os
 from typing import List
 
 try:
+    from evidence_identity import build_document_id, build_page_id, build_table_id, external_page_to_internal
     from table_config import get_table_aware_config
     from table_reconstructor import reconstruct_tables_from_words
+    from table_quality import structural_quality_score
     from text_sanitizer import sanitize_text
 except ModuleNotFoundError:
+    from backend.evidence_identity import build_document_id, build_page_id, build_table_id, external_page_to_internal
     from backend.table_config import get_table_aware_config
     from backend.table_reconstructor import reconstruct_tables_from_words
+    from backend.table_quality import structural_quality_score
     from backend.text_sanitizer import sanitize_text
 
 logger = logging.getLogger(__name__)
@@ -379,4 +383,24 @@ class TableAwareParser:
             effective_timeout_seconds,
             effective_max_pages,
         )
+        document_id = build_document_id(file_path=file_path, filename=filename)
+        for position, table in enumerate(tables, start=1):
+            internal_page = external_page_to_internal(table.get("page_number", 1), external_base=1)
+            external_start = table.get("start_page", table.get("page_number", 1))
+            external_end = table.get("end_page", table.get("page_number", 1))
+            start_page = external_page_to_internal(external_start, external_base=1)
+            end_page = max(start_page, external_page_to_internal(external_end, external_base=1))
+            page_id = build_page_id(document_id, internal_page)
+            table_index = max(1, int(table.get("table_index") or position))
+            table["table_index"] = table_index
+            table.update({
+                "document_id": document_id,
+                "page_id": page_id,
+                "page_number": internal_page,
+                "start_page": start_page,
+                "end_page": end_page,
+                "table_id": build_table_id(page_id, table_index),
+                "parser_backend": table.get("parser_backend") or resolved_backend,
+                "quality_score": float(table.get("quality_score") or structural_quality_score(table)),
+            })
         return tables
