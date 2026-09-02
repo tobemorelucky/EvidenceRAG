@@ -82,6 +82,8 @@ def build_evidence_fusion_v2(
     max_context_chars: int | None = None,
     quality_threshold: float | None = None,
     page_match_threshold: float | None = None,
+    _table_formatter=None,
+    _version: str = "fusion_v2",
 ) -> tuple[str, dict]:
     """Fuse page text with eligible table evidence inside the existing budget."""
     max_context_chars = max_context_chars or int(os.getenv("RAG_CORE_V3_MAX_CONTEXT_CHARS", "28000"))
@@ -103,6 +105,11 @@ def build_evidence_fusion_v2(
     table_units = []
     trusted_table_ids = []
     rejected_tables = []
+    row_selection = []
+    table_formatter = _table_formatter or (lambda current_question, current_table: (
+        _format_table(current_question, current_table),
+        None,
+    ))
     for page_index, page in enumerate(pages, 1):
         page_id = str(page.get("page_id") or "").strip()
         source = f"Source: {page.get('filename', '')}, internal page {int(page.get('page_number') or 0)}"
@@ -134,7 +141,13 @@ def build_evidence_fusion_v2(
         page_text = str(page.get("page_text") or page.get("text") or "").strip()
         page_sources.append((reference, page_text))
         for table in trusted:
-            table_units.append(f"{source}\nPage reference: {reference}\n{_format_table(question, table)}")
+            formatted_table, selection_trace = table_formatter(question, table)
+            table_units.append(f"{source}\nPage reference: {reference}\n{formatted_table}")
+            if selection_trace is not None:
+                row_selection.append({
+                    "table_id": table.get("table_id"),
+                    **selection_trace,
+                })
 
     metadata_cap = int(max_context_chars * 0.05)
     table_cap = int(max_context_chars * 0.25)
@@ -159,7 +172,7 @@ def build_evidence_fusion_v2(
     evidence = _fit("\n\n".join(sections), max_context_chars)
 
     return evidence, {
-        "evidence_assembly_version": "fusion_v2",
+        "evidence_assembly_version": _version,
         "answer_context_chars": len(evidence),
         "answer_context_max_chars": max_context_chars,
         "selected_page_count": len(pages),
@@ -168,6 +181,7 @@ def build_evidence_fusion_v2(
         "trusted_table_ids": trusted_table_ids,
         "rejected_table_count": len(rejected_tables),
         "rejected_tables": rejected_tables,
+        "row_selection": row_selection,
         "quality_threshold": quality_threshold,
         "page_match_threshold": page_match_threshold,
         "budget": {

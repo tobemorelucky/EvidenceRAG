@@ -38,7 +38,7 @@ from evidence_coverage import (
 )
 from finance_policy import load_finance_policy
 from evidence_context import build_baseline_evidence, build_compact_evidence
-from evidence_fusion_v2 import build_evidence_fusion_v2
+from evidence_fusion_v3 import build_evidence_fusion_v3
 from prompts import (
     CLEAN_BASELINE_PROMPT_VERSION,
     PROMPT_VERSION,
@@ -967,7 +967,7 @@ def _prepare_rag_core_v3_response(
     except Exception as exc:
         tables = []
         table_errors.append(f"{type(exc).__name__}: {exc}")
-    evidence, context_meta = build_evidence_fusion_v2(question, answer_docs, tables)
+    evidence, context_meta = build_evidence_fusion_v3(question, answer_docs, tables)
     if not evidence:
         evidence = _format_evidence(reranked_chunks[:6])
         answer_docs = reranked_chunks[:6]

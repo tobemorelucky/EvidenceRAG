@@ -1,0 +1,146 @@
+[PDF text]
+Note 7. Debt 
+Outstanding long-term debt obligations as of December 31, 2022 and 2021 are as follows: 
+(dollars in millions) 
+At December 31, Maturities 
+Interest 
+Rates % 2022 2021 
+Verizon Communications < 5 Years 0.75 - 5.82 $ 23,929 $ 18,406 
+5-10 Years 1.50 - 7.88 42,637 43,225 
+> 10 Years 1.13 - 8.95 60,134 73,520 
+< 5 Years Floating
+(1) 2,992 4,086 
+5-10 Years Floating
+(1) 3,029 824 
+Alltel Corporation 5-10 Years 6.80 - 7.88 94 38 
+> 10 Years N/A N/A 58 
+Operating telephone company subsidiaries—debentures < 5 Years N/A N/A 141 
+5-10 Years 6.00 - 8.75 475 375 
+> 10 Years 5.13 - 7.38 139 250 
+Other subsidiaries—asset-backed debt < 5 Years 0.41 - 5.72 9,767 9,620 
+< 5 Years Floating
+(2) 10,271 4,610 
+Finance lease obligations (average rate of 2.5% and 2.2% in 
+2022 and 2021, respectively)
+1,732 1,325 
+Unamortized discount, net of premium (4,039) (4,922) 
+Unamortized debt issuance costs (671) (688) 
+Total long-term debt, including current maturities 150,489 150,868 
+Less long-term debt maturing within one year 9,813 7,443 
+Total long-term debt $ 140,676 $ 143,425 
+Long-term debt maturing within one year $ 9,813 $ 7,443 
+Add commercial paper 150 — 
+Debt maturing within one year 9,963 7,443 
+Add long-term debt 140,676 143,425 
+Total debt $ 150,639 $ 150,868 
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+(1) The debt obligations bore interest at a floating rate based on the Compounded Secured Overnight Financing Rate (SOFR) for 
+the interest period or the London Interbank Offered Rate (LIBOR) plus an applicable interest margin per annum, as applicable. 
+Compounded SOFR is calculated using the SOFR Index published by the Federal Reserve Bank of New York in accordance 
+with the formula set forth in the terms of the notes. The Compounded SOFR for the interest period ending in December 2022 
+was 3.450%. The one-month and three-month LIBOR at December 31, 2022 was 4.392% and 4.767%, respectively. 
+(2) The debt obligations bore interest at floating rates, including floating rates associated with SOFR for the interest period, or 
+LIBOR plus an applicable interest margin per annum, as applicable. Floating rates associated with SOFR for the interest 
+period ending in December 2022 ranged from 3.807% to 4.372%. 
+ 
+Maturities of long-term debt (secured and unsecured) outstanding, including current maturities, excluding unamortized debt 
+issuance costs, at December 31, 2022 are as follows: 
+Years (dollars in millions) 
+2023 $ 9,279  
+2024 16,252 
+2025 8,706 
+2026 8,304 
+2027 6,962 
+Thereafter 99,925 
+ 
+ 
+ 
+ 
+ 
+During 2022, we received $17.8 billion of proceeds from long-term borrowings, which included $10.7 billion of proceeds from 
+asset-backed debt transactions. The net proceeds were primarily used for general corporate purposes including the repayment 
+of debt and the funding of certain renewable energy projects. We used $13.6 billion of cash to repay, redeem and repurchase 
+long-term borrowings and finance lease obligations, including $4.9 billion to prepay and repay asset-backed, long-term 
+borrowings. The net proceeds of approximately $1.0 billion from the green bond issued in 2022 are expected to be used to fund 
+certain renewable energy projects. 
+During 2021, we received $41.4 billion of proceeds from long-term borrowings, which included $8.4 billion of proceeds from 
+asset-backed debt transactions. The net proceeds were primarily used to finance the purchase of wireless licenses won in 
+connection with the FCC's auction for C-Band wireless spectrum, Auction 107, and fund certain renewable energy projects. We 
+   77              Verizon 2022 Annual Report on Form 10-K
+
+[DocumentPage text]
+Note 7. Debt 
+Outstanding long-term debt obligations as of December 31, 2022 and 2021 are as follows: 
+(dollars in millions) 
+At December 31, Maturities 
+Interest 
+Rates % 2022 2021 
+Verizon Communications < 5 Years 0.75 - 5.82 $ 23,929 $ 18,406 
+5-10 Years 1.50 - 7.88 42,637 43,225 
+> 10 Years 1.13 - 8.95 60,134 73,520 
+< 5 Years Floating (1) 2,992 4,086 
+5-10 Years Floating (1) 3,029 824 
+Alltel Corporation 5-10 Years 6.80 - 7.88 94 38 
+> 10 Years N/A N/A 58 
+Operating telephone company subsidiaries—debentures < 5 Years N/A N/A 141 
+5-10 Years 6.00 - 8.75 475 375 
+> 10 Years 5.13 - 7.38 139 250 
+Other subsidiaries—asset-backed debt < 5 Years 0.41 - 5.72 9,767 9,620 
+< 5 Years Floating (2) 10,271 4,610 
+Finance lease obligations (average rate of 2.5% and 2.2% in 
+2022 and 2021, respectively) 1,732 1,325 
+Unamortized discount, net of premium (4,039) (4,922) 
+Unamortized debt issuance costs (671) (688) 
+Total long-term debt, including current maturities 150,489 150,868 
+Less long-term debt maturing within one year 9,813 7,443 
+Total long-term debt $ 140,676 $ 143,425 
+Long-term debt maturing within one year $ 9,813 $ 7,443 
+Add commercial paper 150 — 
+Debt maturing within one year 9,963 7,443 
+Add long-term debt 140,676 143,425 
+Total debt $ 150,639 $ 150,868 
+(1) The debt obligations bore interest at a floating rate based on the Compounded Secured Overnight Financing Rate (SOFR) for 
+the interest period or the London Interbank Offered Rate (LIBOR) plus an applicable interest margin per annum, as applicable. 
+Compounded SOFR is calculated using the SOFR Index published by the Federal Reserve Bank of New York in accordance 
+with the formula set forth in the terms of the notes. The Compounded SOFR for the interest period ending in December 2022 
+was 3.450%. The one-month and three-month LIBOR at December 31, 2022 was 4.392% and 4.767%, respectively. 
+(2) The debt obligations bore interest at floating rates, including floating rates associated with SOFR for the interest period, or 
+LIBOR plus an applicable interest margin per annum, as applicable. Floating rates associated with SOFR for the interest 
+period ending in December 2022 ranged from 3.807% to 4.372%. 
+Maturities of long-term debt (secured and unsecured) outstanding, including current maturities, excluding unamortized debt 
+issuance costs, at December 31, 2022 are as follows: 
+Years (dollars in millions) 
+2023 $ 9,279 
+2024 16,252 
+2025 8,706 
+2026 8,304 
+2027 6,962 
+Thereafter 99,925 
+During 2022, we received $17.8 billion of proceeds from long-term borrowings, which included $10.7 billion of proceeds from 
+asset-backed debt transactions. The net proceeds were primarily used for general corporate purposes including the repayment 
+of debt and the funding of certain renewable energy projects. We used $13.6 billion of cash to repay, redeem and repurchase 
+long-term borrowings and finance lease obligations, including $4.9 billion to prepay and repay asset-backed, long-term 
+borrowings. The net proceeds of approximately $1.0 billion from the green bond issued in 2022 are expected to be used to fund 
+certain renewable energy projects. 
+During 2021, we received $41.4 billion of proceeds from long-term borrowings, which included $8.4 billion of proceeds from 
+asset-backed debt transactions. The net proceeds were primarily used to finance the purchase of wireless licenses won in 
+connection with the FCC's auction for C-Band wireless spectrum, Auction 107, and fund certain renewable energy projects. We 
+ 77 Verizon 2022 Annual Report on Form 10-K
+
+[ParentChunk text]
