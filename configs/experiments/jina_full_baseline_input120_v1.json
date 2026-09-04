@@ -1,0 +1,13 @@
+{
+  "name": "jina_full_baseline_input120_v1",
+  "version": 1,
+  "retrieval": {"method": "experimental_independent_dense_bm25_rrf", "dense_top_k": 240, "bm25_top_k": 240, "rrf_top_k": 120, "rrf_rank_constant": 60, "filter": "(evidence_type == \"text_chunk\" or evidence_type == \"\") and chunk_level == 3"},
+  "reranker": {"model": "jina-reranker-v3", "endpoint": "https://api.jina.ai/v1/rerank", "input_k": 120, "output_k": 12, "interval_seconds": 60, "fallback": false},
+  "context": {"top_k": 12, "max_chars": 28000, "strategy": "rerank_order_raw_chunks_with_sources"},
+  "answer": {"profile": "clean_baseline", "model": "deepseek-v4-flash-ga-260731", "temperature": 0.1, "max_completion_tokens": 1024, "thinking": "disabled", "timeout_seconds": 60},
+  "judge": {"model": "deepseek-v4-pro-ga-260813", "auto_after_answers": true, "max_completion_tokens": 512, "timeout_seconds": 60},
+  "skills": [],
+  "planner": false,
+  "langsmith": false,
+  "environment": {"DENSE_TOP_K": 240, "BM25_TOP_K": 240, "RRF_TOP_K": 120, "JINA_INPUT_K": 120, "JINA_OUTPUT_K": 12}
+}

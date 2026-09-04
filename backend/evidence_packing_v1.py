@@ -69,6 +69,16 @@ def coverage_features(question: str, unit: EvidenceUnit | dict) -> set[str]:
     return features
 
 
+def query_relevance_score(question: str, unit: EvidenceUnit | dict) -> float:
+    """Return generic lexical query coverage for anchor selection."""
+    query_terms = _terms(question)
+    if not query_terms:
+        return 0.0
+    value = _unit_dict(unit)
+    text_terms = _terms(value.get("source_text"))
+    return len(query_terms & text_terms) / len(query_terms)
+
+
 def _feature_weight(feature: str) -> float:
     return _FEATURE_WEIGHTS.get(feature.split(":", 1)[0], 0.0)
 
@@ -196,8 +206,16 @@ def select_evidence_packing_v1(
     units: list[EvidenceUnit | dict],
     *,
     max_context_chars: int = 28000,
+    replacement_threshold: float = 1.0,
+    protected_unit_keys: set[tuple] | None = None,
+    max_replacements: int | None = None,
 ) -> tuple[str, list[dict], dict]:
     """Select units by score × marginal generic coverage / rendered length."""
+    if replacement_threshold < 1.0:
+        raise ValueError("replacement_threshold must be >= 1.0")
+    if max_replacements is not None and max_replacements < 0:
+        raise ValueError("max_replacements must be >= 0 or None")
+    protected_unit_keys = protected_unit_keys or set()
     candidates = [_unit_dict(unit) for unit in units]
     feature_cache = {_key(unit): coverage_features(question, unit) for unit in candidates}
     length_cache = {
@@ -235,6 +253,7 @@ def select_evidence_packing_v1(
             "selected": False,
             "selection_reason": None,
             "replaced_unit_rank": None,
+            "anchor_protected": key in protected_unit_keys,
         }
         if details["coverage_gain"] <= 0 or details["utility"] <= 0:
             trace["selection_reason"] = "zero_marginal_coverage_gain"
@@ -251,6 +270,11 @@ def select_evidence_packing_v1(
             trace_by_key[key] = trace
             continue
 
+        if max_replacements is not None and replacements >= max_replacements:
+            trace["selection_reason"] = "replacement_budget_exhausted"
+            trace_by_key[key] = trace
+            continue
+
         if objective_cache is None:
             objective_cache = _selection_objective(
                 question, selected,
@@ -259,9 +283,13 @@ def select_evidence_packing_v1(
                 similarity_cache=similarity_cache,
             )
         current_objective, contributions = objective_cache
-        lowest = min(selected, key=lambda item: (contributions[_key(item)], -_rank(item))) if selected else None
+        replaceable = [item for item in selected if _key(item) not in protected_unit_keys]
+        lowest = min(
+            replaceable,
+            key=lambda item: (contributions[_key(item)], -_rank(item)),
+        ) if replaceable else None
         if lowest is None:
-            trace["selection_reason"] = "budget_no_replacement_candidate"
+            trace["selection_reason"] = "budget_no_unprotected_replacement_candidate"
             trace_by_key[key] = trace
             continue
         if details["utility"] <= contributions[_key(lowest)] + 1e-12:
@@ -276,7 +304,13 @@ def select_evidence_packing_v1(
             length_cache=length_cache,
             similarity_cache=similarity_cache,
         )
-        if replacement_chars <= max_context_chars and replacement_objective > current_objective + 1e-12:
+        required_objective = current_objective * replacement_threshold
+        objective_passes = (
+            replacement_objective > current_objective + 1e-12
+            if replacement_threshold == 1.0 else
+            replacement_objective + 1e-12 >= required_objective
+        )
+        if replacement_chars <= max_context_chars and objective_passes:
             selected = replacement
             covered = set().union(*(feature_cache[_key(item)] for item in selected))
             objective_cache = None
@@ -317,5 +351,8 @@ def select_evidence_packing_v1(
         "context_chars": context_chars,
         "max_context_chars": max_context_chars,
         "replacement_count": replacements,
+        "replacement_threshold": replacement_threshold,
+        "max_replacements": max_replacements,
+        "protected_anchor_count": len(protected_unit_keys),
         "trace": traces,
     }
