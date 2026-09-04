@@ -1,0 +1,21 @@
+{
+  "name": "finance_reasoning_prompt_v1",
+  "version": 1,
+  "source_state": "reports/jina_full_baseline_input120_all100/state.json",
+  "dataset": "data/financebench_top40_100_langsmith_with_evidence.csv",
+  "sample_size": 3,
+  "random_seed": 20260904,
+  "prompt_modes": ["baseline", "finance_reasoning"],
+  "answer": {
+    "profile": "clean_baseline",
+    "model": "deepseek-v4-flash-ga-260731",
+    "temperature": 0.1,
+    "max_completion_tokens": 1024,
+    "thinking": "disabled",
+    "timeout_seconds": 60,
+    "max_retries": 0
+  },
+  "retrieval_calls": 0,
+  "reranker_calls": 0,
+  "judge_calls": 0
+}

@@ -13,6 +13,8 @@ from prompts import (
     CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT,
     CLEAN_BASELINE_ANSWER_USER_TEMPLATE,
     CLEAN_BASELINE_PROMPT_VERSION,
+    FINANCE_REASONING_ANSWER_SYSTEM_PROMPT,
+    FINANCE_REASONING_PROMPT_VERSION,
     PROMPT_VERSION,
     RAG_CORE_V2_PROMPT_VERSION,
     RAG_CORE_V3_PROMPT_VERSION,
@@ -20,6 +22,16 @@ from prompts import (
     SUMMARY_USER_TEMPLATE,
 )
 from runtime_profile import uses_clean_baseline_path, uses_rag_core_v2_path, uses_rag_core_v3_path
+
+
+ANSWER_PROMPT_MODES = {"baseline", "finance_reasoning"}
+
+
+def resolve_answer_prompt_mode(mode: str | None = None) -> str:
+    resolved = (mode or os.getenv("ANSWER_PROMPT_MODE", "baseline")).strip().lower()
+    if resolved not in ANSWER_PROMPT_MODES:
+        raise ValueError(f"Unsupported ANSWER_PROMPT_MODE: {resolved}")
+    return resolved
 
 
 def _create_model():
@@ -65,15 +77,21 @@ def build_answer_messages(
     history: list | None = None,
     task_policy: str = "",
     profile: str | None = None,
+    prompt_mode: str | None = None,
 ) -> list:
     clean_baseline = uses_clean_baseline_path(profile)
-    prompt_version = (
-        RAG_CORE_V3_PROMPT_VERSION if uses_rag_core_v3_path(profile)
-        else RAG_CORE_V2_PROMPT_VERSION if uses_rag_core_v2_path(profile)
-        else CLEAN_BASELINE_PROMPT_VERSION if clean_baseline
-        else PROMPT_VERSION
-    )
-    system_prompt = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT if clean_baseline else ANSWER_SYSTEM_PROMPT
+    mode = resolve_answer_prompt_mode(prompt_mode)
+    if mode == "finance_reasoning":
+        prompt_version = FINANCE_REASONING_PROMPT_VERSION
+        system_prompt = FINANCE_REASONING_ANSWER_SYSTEM_PROMPT
+    else:
+        prompt_version = (
+            RAG_CORE_V3_PROMPT_VERSION if uses_rag_core_v3_path(profile)
+            else RAG_CORE_V2_PROMPT_VERSION if uses_rag_core_v2_path(profile)
+            else CLEAN_BASELINE_PROMPT_VERSION if clean_baseline
+            else PROMPT_VERSION
+        )
+        system_prompt = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT if clean_baseline else ANSWER_SYSTEM_PROMPT
     messages = [SystemMessage(content=f"Prompt-Version: {prompt_version}\n\n{system_prompt}")]
     for message in (history or [])[-12:]:
         if getattr(message, "type", "") in {"human", "ai"}:
@@ -98,8 +116,9 @@ def generate_answer(
     history: list | None = None,
     task_policy: str = "",
     profile: str | None = None,
+    prompt_mode: str | None = None,
 ) -> tuple[str, dict]:
-    response = model.invoke(build_answer_messages(question, evidence, history, task_policy, profile))
+    response = model.invoke(build_answer_messages(question, evidence, history, task_policy, profile, prompt_mode))
     usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {}).get("token_usage") or {}
     return _content_text(getattr(response, "content", response)), dict(usage or {})
 
@@ -110,9 +129,10 @@ async def stream_answer(
     history: list | None = None,
     task_policy: str = "",
     profile: str | None = None,
+    prompt_mode: str | None = None,
 ) -> AsyncIterator[tuple[str, dict]]:
     usage = {}
-    async for chunk in model.astream(build_answer_messages(question, evidence, history, task_policy, profile)):
+    async for chunk in model.astream(build_answer_messages(question, evidence, history, task_policy, profile, prompt_mode)):
         text = _content_text(getattr(chunk, "content", chunk))
         chunk_usage = getattr(chunk, "usage_metadata", None)
         if chunk_usage:
