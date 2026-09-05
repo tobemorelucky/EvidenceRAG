@@ -1,0 +1,20 @@
+{
+  "name": "table_expansion_shadow_v1",
+  "version": 1,
+  "source_state": "reports/jina_full_baseline_input120_all100/state.json",
+  "audit_json": "reports/answer_failure_audit_v1.json",
+  "dataset": "data/financebench_top40_100_langsmith_with_evidence.csv",
+  "ENABLE_TABLE_EXPANSION": false,
+  "TABLE_EXPANSION_MAX_TABLES": 1,
+  "TABLE_EXPANSION_MAX_CHARS": 4000,
+  "TABLE_EXPANSION_MODE": "direct_table_id",
+  "TABLE_EXPANSION_ALLOWED_MODES": ["direct_table_id", "page_table_fallback"],
+  "CONTEXT_MAX_CHARS": 28000,
+  "external_calls": {
+    "retrieval": 0,
+    "jina": 0,
+    "llm": 0,
+    "judge": 0,
+    "langsmith": 0
+  }
+}

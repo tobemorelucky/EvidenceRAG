@@ -1,0 +1,19 @@
+{
+  "name": "finance_reasoning_prompt_v1_1",
+  "version": "1.1",
+  "source_state": "reports/jina_full_baseline_input120_all100/state.json",
+  "audit_json": "reports/answer_failure_audit_v1.json",
+  "prompt_modes": ["baseline", "finance_reasoning", "finance_reasoning_v1_1"],
+  "answer": {
+    "profile": "clean_baseline",
+    "model": "deepseek-v4-flash-ga-260731",
+    "temperature": 0.1,
+    "max_completion_tokens": 1024,
+    "thinking": "disabled",
+    "timeout_seconds": 60,
+    "max_retries": 0
+  },
+  "retrieval_calls": 0,
+  "reranker_calls": 0,
+  "judge_calls": 0
+}

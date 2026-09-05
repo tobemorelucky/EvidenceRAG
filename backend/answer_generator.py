@@ -15,6 +15,8 @@ from prompts import (
     CLEAN_BASELINE_PROMPT_VERSION,
     FINANCE_REASONING_ANSWER_SYSTEM_PROMPT,
     FINANCE_REASONING_PROMPT_VERSION,
+    FINANCE_REASONING_V1_1_ANSWER_SYSTEM_PROMPT,
+    FINANCE_REASONING_V1_1_PROMPT_VERSION,
     PROMPT_VERSION,
     RAG_CORE_V2_PROMPT_VERSION,
     RAG_CORE_V3_PROMPT_VERSION,
@@ -24,7 +26,7 @@ from prompts import (
 from runtime_profile import uses_clean_baseline_path, uses_rag_core_v2_path, uses_rag_core_v3_path
 
 
-ANSWER_PROMPT_MODES = {"baseline", "finance_reasoning"}
+ANSWER_PROMPT_MODES = {"baseline", "finance_reasoning", "finance_reasoning_v1_1"}
 
 
 def resolve_answer_prompt_mode(mode: str | None = None) -> str:
@@ -81,7 +83,10 @@ def build_answer_messages(
 ) -> list:
     clean_baseline = uses_clean_baseline_path(profile)
     mode = resolve_answer_prompt_mode(prompt_mode)
-    if mode == "finance_reasoning":
+    if mode == "finance_reasoning_v1_1":
+        prompt_version = FINANCE_REASONING_V1_1_PROMPT_VERSION
+        system_prompt = FINANCE_REASONING_V1_1_ANSWER_SYSTEM_PROMPT
+    elif mode == "finance_reasoning":
         prompt_version = FINANCE_REASONING_PROMPT_VERSION
         system_prompt = FINANCE_REASONING_ANSWER_SYSTEM_PROMPT
     else:
