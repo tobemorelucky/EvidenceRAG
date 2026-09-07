@@ -151,6 +151,54 @@ def build_baseline_evidence(question: str, documents: List[dict]) -> tuple[str, 
     }
 
 
+def build_ranked_chunk_evidence(
+    documents: List[dict],
+    *,
+    max_context_chars: int = 28000,
+    top_k: int = 12,
+) -> tuple[str, List[dict], dict]:
+    """Pack reranked raw chunks in rank order under one character budget."""
+    budget = max(1, int(max_context_chars))
+    limit = max(1, int(top_k))
+    remaining = budget
+    parts: List[str] = []
+    included: List[dict] = []
+    pages: List[dict] = []
+    original_chars = sum(len(str(doc.get("text") or doc.get("page_text") or "")) for doc in documents[:limit])
+    for document in documents[:limit]:
+        filename = str(document.get("filename") or "Unknown")
+        page = document.get("page_number", "N/A")
+        header = f"Source: {filename} | Page: {page}\n"
+        separator = 2 if parts else 0
+        room = remaining - separator - len(header)
+        if room <= 0:
+            break
+        source_text = str(document.get("text") or document.get("page_text") or "")
+        body = source_text[:room]
+        if not body:
+            continue
+        parts.append(header + body)
+        included.append({**document, "text": body})
+        pages.append({
+            "filename": filename,
+            "page_number": page,
+            "included_chars": len(body),
+            "truncated": len(body) < len(source_text),
+        })
+        remaining -= separator + len(header) + len(body)
+    evidence = "\n\n".join(parts)
+    return evidence, included, {
+        "answer_context_builder": "ranked_raw_chunks",
+        "answer_context_compressed": len(evidence) < original_chars,
+        "answer_context_original_chars": original_chars,
+        "answer_context_chars": len(evidence),
+        "answer_context_unit_count": len(included),
+        "answer_context_pages": pages,
+        "answer_context_budget": budget,
+        "answer_context_reduction_ratio": round(len(evidence) / max(1, original_chars), 6),
+    }
+
+
 def _required_aliases(task_spec: Dict[str, object]) -> List[str]:
     aliases: List[str] = []
     for field in task_spec.get("required_fields") or []:
@@ -424,6 +472,8 @@ def build_compact_evidence(
     documents: List[dict],
     task_spec: Dict[str, object],
     calculation: Dict[str, object] | None = None,
+    *,
+    max_context_chars_override: int | None = None,
 ) -> tuple[str, dict]:
     """Return compact cited evidence and trace metadata without mutating retrieval docs."""
     enabled = os.getenv("RAG_ANSWER_CONTEXT_COMPRESSION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -444,7 +494,11 @@ def build_compact_evidence(
         _parse_int("RAG_ANSWER_RANK_RESERVED_UNITS", 6, 0),
         max(0, max_units - 1),
     )
-    max_context_chars = _parse_int("RAG_ANSWER_MAX_CONTEXT_CHARS", 24000, 2000)
+    max_context_chars = (
+        max(2000, int(max_context_chars_override))
+        if max_context_chars_override is not None
+        else _parse_int("RAG_ANSWER_MAX_CONTEXT_CHARS", 24000, 2000)
+    )
     max_unit_chars = _parse_int("RAG_ANSWER_MAX_UNIT_CHARS", 2000, 400)
     protected_slots_enabled = os.getenv("RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED", "false").strip().lower() in {
         "1", "true", "yes", "on",

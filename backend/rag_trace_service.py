@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime
 from typing import Any
@@ -14,7 +15,10 @@ try:
 except ModuleNotFoundError:
     from backend.database import SessionLocal
 
-from backend.memory.persistent_memory_store import MemoryBase, MemoryConversation, _utcnow
+try:
+    from backend.memory.persistent_memory_store import MemoryBase, MemoryConversation, _utcnow
+except ModuleNotFoundError:
+    from memory.persistent_memory_store import MemoryBase, MemoryConversation, _utcnow
 
 
 class RagTraceRecord(MemoryBase):
@@ -61,8 +65,25 @@ def build_rag_trace_payload(
     understanding_usage: dict | None,
     answer_usage: dict | None,
     latency_ms: dict,
+    profile: str | None = None,
+    execution_mode: str | None = None,
+    answer_prompt_mode: str | None = None,
 ) -> dict:
     rag_trace = dict(rag_result.get("rag_trace") or {})
+    policy_payload = dict(policy)
+    policy_payload.update({
+        "profile": profile or rag_trace.get("profile") or os.getenv("RAG_PROFILE", ""),
+        "execution_mode": execution_mode or rag_trace.get("execution_mode") or "static",
+        "answer_prompt_mode": answer_prompt_mode or os.getenv("ANSWER_PROMPT_MODE", "baseline"),
+        "profile_config": rag_trace.get("profile_config"),
+        "query_rewrite_enabled": rag_trace.get("query_rewrite_enabled"),
+        "query_rewrite_executed": bool(
+            rag_trace.get("query_rewrite_executed")
+            if "query_rewrite_executed" in rag_trace
+            else policy.get("rewrite")
+        ),
+        "context_budget": rag_trace.get("context_budget"),
+    })
     evidence_items = [
         {
             "id": item.get("id"), "filename": item.get("filename"),
@@ -82,16 +103,22 @@ def build_rag_trace_payload(
         ]
     understanding_usage = dict(understanding_usage or {})
     answer_usage = dict(answer_usage or {})
+    query_rewrite_usage = dict(rag_trace.get("query_rewrite_usage") or {})
     token_usage = {
         "conversation_understanding": understanding_usage,
+        "query_rewrite": query_rewrite_usage,
         "answer": answer_usage,
-        "total_tokens": _as_int(understanding_usage.get("total_tokens")) + _as_int(answer_usage.get("total_tokens")),
+        "total_tokens": (
+            _as_int(understanding_usage.get("total_tokens"))
+            + _as_int(query_rewrite_usage.get("total_tokens"))
+            + _as_int(answer_usage.get("total_tokens"))
+        ),
     }
     return {
         "conversation_id": conversation_id,
         "user_query": user_query,
         "conversation_understanding": dict(decision),
-        "policy_decision": dict(policy),
+        "policy_decision": policy_payload,
         "standalone_query": str(decision.get("standalone_query") or ""),
         "retrieval_executed": bool(policy.get("retrieval")),
         "dense_count": _as_int(rag_trace.get("dense_candidate_count", rag_trace.get("initial_dense_candidates"))),
@@ -104,6 +131,13 @@ def build_rag_trace_payload(
             "provider": rag_trace.get("rerank_provider"),
             "candidate_k": rag_trace.get("candidate_k"),
             "final_top_k": rag_trace.get("final_top_k"),
+            "dense_top_k": rag_trace.get("dense_top_k") or rag_trace.get("dense_candidate_requested") or os.getenv("DENSE_TOP_K"),
+            "bm25_top_k": rag_trace.get("bm25_top_k") or rag_trace.get("bm25_candidate_requested") or os.getenv("BM25_TOP_K"),
+            "rrf_top_k": rag_trace.get("rrf_top_k") or os.getenv("RRF_TOP_K") or rag_trace.get("candidate_k"),
+            "input_k": rag_trace.get("jina_input_k") or rag_trace.get("remote_rerank_candidate_count") or os.getenv("JINA_INPUT_K") or rag_trace.get("candidate_k"),
+            "output_k": rag_trace.get("jina_output_k") or os.getenv("JINA_OUTPUT_K") or rag_trace.get("final_top_k"),
+            "context_budget": rag_trace.get("context_budget"),
+            "profile_config": rag_trace.get("profile_config"),
         },
         "evidence_items": evidence_items,
         "answer_model": answer_model,

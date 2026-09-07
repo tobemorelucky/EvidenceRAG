@@ -1,3 +1,5 @@
+import asyncio
+
 from backend.conversation_memory_v5 import ConversationMemoryV5Service, conversation_memory_v5_enabled
 from backend.conversation_understanding_v3 import ConversationDecisionV3
 from backend.memory.conversation_state import ConversationState
@@ -89,3 +91,39 @@ def test_v5_citation_followup_reuses_evidence_without_retrieval():
     assert not result["trace"]["retrieval_decision"]["called"]
     assert result["trace"]["evidence_reuse"]["previous_reused"]
     assert result["citations"] == [{"id": "e1"}]
+
+
+def test_v5_stream_chat_emits_lifecycle_and_unbuffered_content():
+    state = ConversationState("c1")
+    memory = FakeMemory(state)
+
+    async def fake_stream(*_args, **_kwargs):
+        yield "Revenue ", {}
+        yield "was 10.", {"total_tokens": 10}
+
+    service = ConversationMemoryV5Service(
+        memory,
+        TokenBudgetManager(MemoryBudget(100, 20, 5)),
+        understanding_fn=lambda *_: (
+            ConversationDecisionV3(True, True, False, False, "none", "Revenue FY2023", "answer"),
+            {"model_called": False},
+        ),
+        retrieval_fn=lambda *_args, **_kwargs: {
+            "evidence": "Revenue was 10.",
+            "citations": [{"id": "e1", "filename": "report.pdf", "page_number": 4}],
+            "rag_trace": {"rerank_enabled": True, "rerank_applied": True},
+        },
+        stream_answer_fn=fake_stream,
+        trace_service=FakeTraceService(),
+    )
+
+    async def collect():
+        return [event async for event in service.stream_chat("alice", "c1", "What was revenue?", profile="finance", execution_mode="auto")]
+
+    events = asyncio.run(collect())
+    stages = [event["stage"] for event in events if event["type"] == "status"]
+    assert stages == ["understanding", "retrieval", "rerank", "evidence_build", "answering"]
+    assert [event["content"] for event in events if event["type"] == "content"] == ["Revenue ", "was 10."]
+    assert events[-2]["type"] == "trace"
+    assert events[-1] == {"type": "done", "conversation_id": "c1", "usage": {"total_tokens": 10}}
+    assert [item[0] for item in memory.messages] == ["user", "assistant"]

@@ -1,8 +1,8 @@
-"""LLM query rewriting for the offline Query Rewrite Shadow v1 experiment.
+"""LLM query rewriting shared by the validated shadow and finance online profiles.
 
 The public helper always keeps the original question as the first retrieval
-query and limits the complete query set to three.  This module has no imports
-from the production retrieval pipeline.
+query and limits the complete query set to three.  It remains independent of
+retrieval implementation details so the caller controls all retrieval depths.
 """
 
 from __future__ import annotations

@@ -128,12 +128,41 @@ class PersistentMemoryStore:
                 .group_by(MemoryMessage.conversation_ref_id)
                 .all()
             )
+            first_user_message = (
+                db.query(
+                    MemoryMessage.conversation_ref_id.label("conversation_ref_id"),
+                    func.min(MemoryMessage.id).label("message_id"),
+                )
+                .filter(
+                    MemoryMessage.conversation_ref_id.in_([row.id for row in rows]),
+                    MemoryMessage.role == "user",
+                )
+                .group_by(MemoryMessage.conversation_ref_id)
+                .subquery()
+            )
+            titles = dict(
+                db.query(first_user_message.c.conversation_ref_id, MemoryMessage.content)
+                .join(MemoryMessage, MemoryMessage.id == first_user_message.c.message_id)
+                .all()
+            )
             return [
-                {**self._serialize_conversation(row), "message_count": int(counts.get(row.id, 0))}
+                {
+                    **self._serialize_conversation(row),
+                    "message_count": int(counts[row.id]),
+                    "title": self._conversation_title(titles.get(row.id, "")),
+                }
                 for row in rows
+                if counts.get(row.id, 0) > 0
             ]
         finally:
             db.close()
+
+    @staticmethod
+    def _conversation_title(content: str, limit: int = 28) -> str:
+        title = " ".join((content or "").split())
+        if not title:
+            return "未命名会话"
+        return title if len(title) <= limit else f"{title[:limit]}…"
 
     def append_message(
         self, user_id: str, conversation_id: str, role: str, content: str,

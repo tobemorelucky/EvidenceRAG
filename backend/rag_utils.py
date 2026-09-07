@@ -1986,6 +1986,7 @@ def _rerank_documents(
     *,
     remote_candidate_k: int | None = None,
     remote_max_chars: int | None = None,
+    allow_local_fallback: bool = True,
 ) -> Tuple[List[dict], Dict[str, Any]]:
     remote_candidate_k = max(1, remote_candidate_k or RERANK_REMOTE_CANDIDATE_K)
     remote_max_chars = max(256, remote_max_chars or RERANK_REMOTE_MAX_CHARS)
@@ -2128,7 +2129,7 @@ def _rerank_documents(
                     break
         _sync_rerank_trace(meta)
 
-    if _local_reranker.enabled:
+    if allow_local_fallback and _local_reranker.enabled:
         try:
             reranked = _local_reranker.rerank(query, docs_with_rank, top_k)
             if reranked:
@@ -3622,6 +3623,98 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "initial_retrieval_ms": round((time.perf_counter() - started_at) * 1000, 2),
     }
     return {"docs": fused_docs, "meta": meta}
+
+
+def retrieve_profile_candidates(
+    queries: List[str],
+    *,
+    dense_top_k: int,
+    bm25_top_k: int,
+    rrf_top_k: int,
+    rrf_k: int = 60,
+) -> Dict[str, Any]:
+    """Run the frozen final100 Dense/BM25/RRF shape with explicit depths.
+
+    This is configuration plumbing for the finance online profile.  It leaves
+    the existing retrieval entry points and their defaults unchanged.
+    """
+    normalized_queries = [str(query or "").strip() for query in queries if str(query or "").strip()]
+    if not normalized_queries:
+        raise ValueError("at least one retrieval query is required")
+    filter_expr = _build_text_chunk_filter_expr(f"chunk_level == {LEAF_RETRIEVE_LEVEL}")
+    routes: list[dict] = []
+    route_counts: list[dict] = []
+    errors: list[str] = []
+    started = time.perf_counter()
+    for query_index, query in enumerate(normalized_queries):
+        try:
+            dense_embedding = _embedding_service.get_embeddings([query])[0]
+            dense_docs = _milvus_manager.dense_retrieve(
+                dense_embedding=dense_embedding,
+                top_k=max(1, dense_top_k),
+                filter_expr=filter_expr,
+            )
+        except Exception as exc:
+            dense_docs = []
+            errors.append(f"q{query_index}_dense:{type(exc).__name__}:{exc}")
+        routes.append({
+            "label": f"q{query_index}_dense", "query": query, "weight": 1.0,
+            "category": "dense", "docs": dense_docs,
+        })
+        route_counts.append({"label": f"q{query_index}_dense", "query": query, "count": len(dense_docs)})
+        try:
+            bm25_docs = _milvus_manager.bm25_retrieve(
+                query_text=query,
+                top_k=max(1, bm25_top_k),
+                filter_expr=filter_expr,
+            )
+        except Exception as exc:
+            bm25_docs = []
+            errors.append(f"q{query_index}_bm25:{type(exc).__name__}:{exc}")
+        routes.append({
+            "label": f"q{query_index}_bm25", "query": query, "weight": 1.0,
+            "category": "bm25", "docs": bm25_docs,
+        })
+        route_counts.append({"label": f"q{query_index}_bm25", "query": query, "count": len(bm25_docs)})
+    fused = _rrf_fuse_retrieval_routes(routes, rrf_k=max(1, rrf_k))[: max(1, rrf_top_k)]
+    dense_count = sum(item["count"] for item in route_counts if item["label"].endswith("_dense"))
+    bm25_count = sum(item["count"] for item in route_counts if item["label"].endswith("_bm25"))
+    return {
+        "docs": fused,
+        "meta": {
+            "retrieval_mode": "finance_online_dense_bm25_rrf",
+            "candidate_count": len(fused),
+            "dense_candidate_count": dense_count,
+            "bm25_candidate_count": bm25_count,
+            "dense_candidate_requested": max(1, dense_top_k),
+            "bm25_candidate_requested": max(1, bm25_top_k),
+            "rrf_top_k": max(1, rrf_top_k),
+            "rrf_fused_candidate_count": len(fused),
+            "per_query_retrieval_counts": route_counts,
+            "retrieve_error": "; ".join(errors) or None,
+            "latency_breakdown": {
+                "initial_retrieval_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        },
+    }
+
+
+def rerank_profile_candidates(
+    query: str,
+    candidate_docs: List[dict],
+    *,
+    input_k: int,
+    output_k: int,
+) -> Dict[str, Any]:
+    """Apply the existing reranker once with explicit profile depths."""
+    docs, meta = _rerank_documents(
+        query=query,
+        docs=list(candidate_docs),
+        top_k=max(1, output_k),
+        remote_candidate_k=max(1, input_k),
+        allow_local_fallback=False,
+    )
+    return {"docs": docs, "meta": meta}
 
 
 def _fetch_neighbor_page_docs(filename: str, page_number: int, page_window: int) -> List[dict]:

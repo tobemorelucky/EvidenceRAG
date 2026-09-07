@@ -65,6 +65,7 @@ class ConversationTraceListResponse(BaseModel):
 
 class ConversationInfo(BaseModel):
     conversation_id: str
+    title: str = "未命名会话"
     created_at: str
     updated_at: str
     message_count: int = 0

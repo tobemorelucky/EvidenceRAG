@@ -204,7 +204,8 @@ async def chat_with_agent_stream(
         ):
             full_response += content
             usage = chunk_usage or usage
-            yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"
+            if content:
+                yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"
         _finalize_generated_answer(full_response, prepared)
 
     rag_trace = prepared["rag_trace"]

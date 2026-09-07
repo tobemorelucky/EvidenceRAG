@@ -1,0 +1,23 @@
+{
+  "name": "finance_online_v1",
+  "profile": "finance",
+  "query_rewrite": {
+    "enabled": true,
+    "max_rewrites": 2,
+    "original_retained": true
+  },
+  "retrieval": {
+    "dense_top_k": 240,
+    "bm25_top_k": 240,
+    "rrf_top_k": 120,
+    "rrf_k": 60
+  },
+  "rerank": {
+    "provider": "jina",
+    "input_k": 80,
+    "output_k": 12
+  },
+  "context": {
+    "max_chars": 28000
+  }
+}

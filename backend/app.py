@@ -1,14 +1,18 @@
-HF_HUB_OFFLINE=1
-TRANSFORMERS_OFFLINE=1
-HF_DATASETS_OFFLINE=1
+from pathlib import Path
+import os
 
-
-
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-import os
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env", override=False)
+
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
+HF_DATASETS_OFFLINE=1
 
 from runtime_profile import apply_runtime_profile, print_feature_summary
 
@@ -19,7 +23,6 @@ from database import init_db
 from conversation_memory_v5 import conversation_memory_v5_enabled
 from memory.persistent_memory_store import init_memory_db
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
 
@@ -44,6 +47,15 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.get("/config/frontend")
+    async def _frontend_config():
+        conversation_memory_enabled = conversation_memory_v5_enabled()
+        return {
+            "use_conversation_api": os.getenv("USE_CONVERSATION_API", "false").strip().lower()
+            in {"1", "true", "yes", "on"} and conversation_memory_enabled,
+            "conversation_memory_enabled": conversation_memory_enabled,
+        }
 
     # No-cache middleware for development
     @app.middleware("http")

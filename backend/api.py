@@ -44,18 +44,32 @@ from schemas import (
     SessionListResponse,
     SessionMessagesResponse,
 )
-from backend.schemas import (
-    ConversationChatRequest,
-    ConversationChatResponse,
-    ConversationCreateRequest,
-    ConversationCreateResponse,
-    ConversationDeleteResponse,
-    ConversationInfo,
-    ConversationListResponse,
-    ConversationMessageInfo,
-    ConversationMessagesResponse,
-    ConversationTraceListResponse,
-)
+try:
+    from schemas import (
+        ConversationChatRequest,
+        ConversationChatResponse,
+        ConversationCreateRequest,
+        ConversationCreateResponse,
+        ConversationDeleteResponse,
+        ConversationInfo,
+        ConversationListResponse,
+        ConversationMessageInfo,
+        ConversationMessagesResponse,
+        ConversationTraceListResponse,
+    )
+except ImportError:
+    from backend.schemas import (
+        ConversationChatRequest,
+        ConversationChatResponse,
+        ConversationCreateRequest,
+        ConversationCreateResponse,
+        ConversationDeleteResponse,
+        ConversationInfo,
+        ConversationListResponse,
+        ConversationMessageInfo,
+        ConversationMessagesResponse,
+        ConversationTraceListResponse,
+    )
 from table_config import get_table_aware_config
 from table_indexer import build_table_evidence_docs
 from table_store import TableStore
@@ -288,37 +302,19 @@ async def conversation_chat_stream(
     request: ConversationChatRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """Run the conversation pipeline once and expose its result as legacy-compatible SSE."""
+    """Stream conversation lifecycle and answer tokens as legacy-compatible SSE."""
     _require_conversation_memory_v5()
 
     async def event_generator():
         try:
-            result = await asyncio.to_thread(
-                conversation_memory_v5_service.chat,
+            async for event in conversation_memory_v5_service.stream_chat(
                 current_user.username,
                 request.conversation_id,
                 request.message,
                 profile=request.profile,
                 execution_mode=request.execution_mode,
-            )
-            answer = str(result.get("response") or "")
-            if answer:
-                yield f"data: {json.dumps({'type': 'content', 'content': answer}, ensure_ascii=False)}\n\n"
-            citations = list(result.get("citations") or [])
-            for citation in citations:
-                yield f"data: {json.dumps({'type': 'citation', 'citation': citation}, ensure_ascii=False)}\n\n"
-            trace_event = {
-                "type": "trace",
-                "rag_trace": result.get("trace") or {},
-                "citations": citations,
-            }
-            yield f"data: {json.dumps(trace_event, ensure_ascii=False)}\n\n"
-            done_event = {
-                "type": "done",
-                "conversation_id": result.get("conversation_id") or request.conversation_id,
-                "usage": result.get("usage") or {},
-            }
-            yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
+            ):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except KeyError:
             error = {"type": "error", "content": "会话不存在"}
             yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"

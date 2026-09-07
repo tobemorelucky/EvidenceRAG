@@ -37,8 +37,9 @@ from evidence_coverage import (
     structured_coverage_enabled,
 )
 from finance_policy import load_finance_policy
-from evidence_context import build_baseline_evidence, build_compact_evidence
+from evidence_context import build_baseline_evidence, build_compact_evidence, build_ranked_chunk_evidence
 from evidence_fusion_v3 import build_evidence_fusion_v3
+from finance_online_profile import finance_online_trace_fields, load_finance_online_profile
 from prompts import (
     CLEAN_BASELINE_PROMPT_VERSION,
     PROMPT_VERSION,
@@ -62,8 +63,10 @@ from rag_core_v3 import (
 from rag_utils import (
     finalize_retrieved_documents,
     get_finance_rag_config,
+    rerank_profile_candidates,
     retrieve_candidate_documents,
     retrieve_document_scoped_candidates,
+    retrieve_profile_candidates,
 )
 from table_store import TableStore
 
@@ -186,6 +189,75 @@ def _run_search(query: str) -> dict:
         return run_rag_graph(query)
     except Exception as exc:
         raise RetrievalServiceError(f"检索服务暂不可用：{exc}") from exc
+
+
+def _run_finance_online_search(question: str, profile_config: dict) -> dict:
+    """Execute the checked-in finance profile without mutating process env."""
+    rewrite_trace = {
+        "status": "fallback_original",
+        "queries": [question],
+        "generated_alternatives": [],
+        "usage": {},
+        "error": None,
+    }
+    try:
+        from query_rewriter import create_query_rewrite_model, rewrite_queries
+
+        rewrite_trace = {
+            **rewrite_queries(question, create_query_rewrite_model()),
+            "status": "ok",
+            "error": None,
+        }
+    except Exception as exc:
+        rewrite_trace["error"] = f"{type(exc).__name__}: {exc}"
+
+    rewrite_config = profile_config["query_rewrite"]
+    queries = list(rewrite_trace.get("queries") or [question])
+    queries = queries[: 1 + int(rewrite_config["max_rewrites"])]
+    if not queries or queries[0] != question:
+        queries = [question, *[query for query in queries if query != question]][: 1 + int(rewrite_config["max_rewrites"])]
+    retrieval_config = profile_config["retrieval"]
+    retrieved = retrieve_profile_candidates(
+        queries,
+        dense_top_k=retrieval_config["dense_top_k"],
+        bm25_top_k=retrieval_config["bm25_top_k"],
+        rrf_top_k=retrieval_config["rrf_top_k"],
+        rrf_k=retrieval_config["rrf_k"],
+    )
+    candidates = list(retrieved.get("docs") or [])
+    rerank_config = profile_config["rerank"]
+    reranked = rerank_profile_candidates(
+        question,
+        candidates,
+        input_k=rerank_config["input_k"],
+        output_k=rerank_config["output_k"],
+    )
+    final_docs = list(reranked.get("docs") or [])
+    retrieval_meta = dict(retrieved.get("meta") or {})
+    rerank_meta = dict(reranked.get("meta") or {})
+    trace = {
+        **retrieval_meta,
+        **rerank_meta,
+        **finance_online_trace_fields(profile_config),
+        "profile": "finance",
+        "retrieval_mode": "finance_online_v1",
+        "candidate_k": retrieval_config["rrf_top_k"],
+        "final_top_k": rerank_config["output_k"],
+        "query_rewrite_executed": rewrite_trace.get("status") == "ok",
+        "query_rewrite_status": rewrite_trace.get("status"),
+        "query_rewrite_error": rewrite_trace.get("error"),
+        "retrieval_queries": queries,
+        "query_rewrite_usage": dict(rewrite_trace.get("usage") or {}),
+        "initial_retrieved_chunks": candidates,
+        "final_retrieved_chunks": final_docs,
+        "final_context_chunk_count": len(final_docs),
+    }
+    return {
+        "docs": final_docs,
+        "context_docs": final_docs,
+        "initial_candidate_docs": candidates,
+        "rag_trace": trace,
+    }
 
 
 def _open_retrieved_pages(documents: list[dict], limit: int = 15) -> tuple[list[dict], dict]:
@@ -1120,7 +1192,12 @@ def prepare_rag_response(
         return _prepare_rag_core_v2_response(question, config, started)
     if uses_clean_baseline_path(config.profile):
         return _prepare_clean_baseline_response(question, config, started)
-    initial = _run_search(question)
+    finance_profile_config = load_finance_online_profile() if config.profile == "finance" else None
+    initial = (
+        _run_finance_online_search(question, finance_profile_config)
+        if finance_profile_config is not None
+        else _run_search(question)
+    )
     initial_docs = list(initial.get("docs") or [])
     initial_candidates = list(initial.get("initial_candidate_docs") or initial_docs)
     candidate_pool = list(initial_candidates)
@@ -1129,10 +1206,12 @@ def prepare_rag_response(
     low_evidence = len(initial_docs) < 2
 
     execution_mode = config.requested_mode
-    if execution_mode == "auto":
+    if execution_mode == "auto" and config.profile != "finance":
         execution_mode = "agentic" if complex_question or low_evidence else "static"
         if low_evidence:
             route_reason = "low_evidence_coverage"
+    elif execution_mode == "auto":
+        route_reason = "conversation_auto_finance_profile"
 
     final_docs = initial_docs
     trace = dict(initial.get("rag_trace") or {})
@@ -1197,7 +1276,15 @@ def prepare_rag_response(
         candidate_pool,
         final_docs,
     )
-    answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs)
+    if finance_profile_config:
+        answer_docs = final_docs
+        answer_page_open_trace = {
+            "answer_page_open_requested": 0,
+            "answer_page_opened": 0,
+            "answer_page_open_skipped": "finance_online_ranked_chunk_context",
+        }
+    else:
+        answer_docs, answer_page_open_trace = _open_retrieved_pages(final_docs)
     selected_page_coverage = (
         assess_stage_coverage(query_parse, answer_docs, stage="selected_page")
         if stage_aware_coverage_enabled() else {}
@@ -1313,6 +1400,7 @@ def prepare_rag_response(
             "finance_policy_load_ms": finance_policy["load_ms"],
             "agent_tool_calls": tool_calls,
             "agent_tool_call_count": len(tool_calls),
+            **(finance_online_trace_fields(finance_profile_config) if finance_profile_config else {}),
             **supplemental_trace,
             **evidence_frame_trace,
             **answer_page_open_trace,
@@ -1336,12 +1424,24 @@ def prepare_rag_response(
     latency = dict(trace.get("latency_breakdown") or {})
     latency["orchestration_latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
     trace["latency_breakdown"] = latency
-    evidence, answer_context_meta = build_compact_evidence(
-        question,
-        answer_docs,
-        query_parse,
-        calculation,
-    )
+    retrieval_queries = [str(item).strip() for item in (trace.get("retrieval_queries") or []) if str(item).strip()]
+    if finance_profile_config:
+        evidence, answer_docs, answer_context_meta = build_ranked_chunk_evidence(
+            answer_docs,
+            max_context_chars=finance_profile_config["context"]["max_chars"],
+            top_k=finance_profile_config["rerank"]["output_k"],
+        )
+        trace["evidence_selection_query_count"] = len(retrieval_queries)
+        trace["evidence_selection_used_rewrites"] = False
+    else:
+        evidence, answer_context_meta = build_compact_evidence(
+            question,
+            answer_docs,
+            query_parse,
+            calculation,
+        )
+        trace["evidence_selection_query_count"] = 1
+        trace["evidence_selection_used_rewrites"] = False
     if not evidence:
         evidence = _format_evidence(answer_docs)
         answer_context_meta = {

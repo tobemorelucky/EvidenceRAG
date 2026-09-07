@@ -144,6 +144,11 @@ async def stream_answer(
             usage = dict(chunk_usage)
         if text:
             yield text, usage
+    # Some OpenAI-compatible providers send usage on a final empty chunk.
+    # Surface it without buffering any answer tokens so SSE callers can retain
+    # accurate accounting while still forwarding text immediately.
+    if usage:
+        yield "", usage
 
 
 def summarize_messages(messages: list) -> str:

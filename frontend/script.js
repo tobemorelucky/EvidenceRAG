@@ -6,11 +6,12 @@ createApp({
             messages: [],
             userInput: '',
             isLoading: false,
-            activeNav: 'newChat',
+            activeNav: 'workspace',
             abortController: null,
             sessionId: 'session_' + Date.now(),
             sessions: [],
             showHistorySidebar: false,
+            autoFollowMessages: true,
             isComposing: false,
             documents: [],
             documentsLoading: false,
@@ -40,7 +41,9 @@ createApp({
             serviceStatus: 'ready',
             inspectorOpen: false,
             inspectedMessage: null,
-            selectedCitation: null
+            selectedCitation: null,
+            apiAdapter: null,
+            useConversationApi: false
         };
     },
     computed: {
@@ -85,6 +88,13 @@ createApp({
     },
     async mounted() {
         this.configureMarked();
+        this.apiAdapter = new window.EvidenceRagApiAdapter({
+            authFetch: (url, options) => this.authFetch(url, options)
+        });
+        this.useConversationApi = await this.apiAdapter.loadConfig();
+        if (this.useConversationApi) {
+            this.sessionId = '';
+        }
         if (this.token) {
             try {
                 await this.fetchMe();
@@ -121,7 +131,11 @@ createApp({
         },
 
         evidenceStatusLabel(status) {
-            return ({ sufficient: '证据充分', limited: '证据有限', insufficient: '证据不足' })[status] || '等待检索';
+            return ({
+                sufficient: '已找到相关证据',
+                limited: '相关证据有限',
+                insufficient: '未找到足够相关证据'
+            })[status] || '等待检索';
         },
 
         citationsFromTrace(trace) {
@@ -225,8 +239,8 @@ createApp({
                 this.authForm.password = '';
                 this.authForm.admin_code = '';
                 this.messages = [];
-                this.sessionId = 'session_' + Date.now();
-                this.activeNav = 'newChat';
+                this.activeNav = 'workspace';
+                this.sessionId = this.useConversationApi ? '' : 'session_' + Date.now();
             } catch (error) {
                 alert(error.message);
             } finally {
@@ -241,9 +255,17 @@ createApp({
             this.sessions = [];
             this.documents = [];
             this.selectedDocumentFilenames = [];
-            this.activeNav = 'newChat';
+            this.activeNav = 'workspace';
             this.showHistorySidebar = false;
+            this.sessionId = this.useConversationApi ? '' : 'session_' + Date.now();
             localStorage.removeItem('accessToken');
+        },
+
+        async ensureConversation() {
+            if (this.sessionId) return this.sessionId;
+            const created = await this.apiAdapter.createConversation();
+            this.sessionId = created.conversation_id;
+            return this.sessionId;
         },
 
         handleCompositionStart() {
@@ -275,6 +297,14 @@ createApp({
 
             const text = this.userInput.trim();
             if (!text || this.isLoading || this.isComposing) return;
+            this.autoFollowMessages = true;
+
+            try {
+                await this.ensureConversation();
+            } catch (error) {
+                alert('创建会话失败：' + error.message);
+                return;
+            }
 
             this.messages.push({
                 text: text,
@@ -301,16 +331,12 @@ createApp({
             this.abortController = new AbortController();
 
             try {
-                const response = await this.authFetch('/chat/stream', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        message: text,
-                        session_id: this.sessionId,
-                        profile: this.ragProfile,
-                        execution_mode: this.executionMode
-                    }),
-                    signal: this.abortController.signal,
+                const response = await this.apiAdapter.streamChat({
+                    message: text,
+                    conversationId: this.sessionId,
+                    profile: this.ragProfile,
+                    executionMode: this.executionMode,
+                    signal: this.abortController.signal
                 });
 
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -341,7 +367,10 @@ createApp({
                                     }
                                     this.messages[botMsgIdx].text += data.content;
                                 } else if (data.type === 'trace') {
-                                    this.messages[botMsgIdx].ragTrace = data.rag_trace;
+                                    this.messages[botMsgIdx].ragTrace = this.apiAdapter.normalizeTrace(
+                                        data.rag_trace,
+                                        data.citations || this.messages[botMsgIdx].citations
+                                    );
                                     this.messages[botMsgIdx].citations = data.citations || this.messages[botMsgIdx].citations;
                                     this.serviceStatus = 'ready';
                                 } else if (data.type === 'citation') {
@@ -353,7 +382,11 @@ createApp({
                                     if (!this.messages[botMsgIdx].ragSteps) {
                                         this.messages[botMsgIdx].ragSteps = [];
                                     }
-                                    this.messages[botMsgIdx].ragSteps.push(data.step || { label: data.label, detail: data.detail });
+                                    this.messages[botMsgIdx].ragSteps.push(data.step || {
+                                        stage: data.stage,
+                                        label: data.label,
+                                        detail: data.detail
+                                    });
                                 } else if (data.type === 'error') {
                                     this.messages[botMsgIdx].isThinking = false;
                                     this.messages[botMsgIdx].text += `\n\n检索或回答服务异常：${data.content}`;
@@ -366,6 +399,8 @@ createApp({
                     }
                     this.$nextTick(() => this.scrollToBottom());
                 }
+
+                await this.hydrateLatestConversationTrace(botMsgIdx);
 
             } catch (error) {
                 if (error.name === 'AbortError') {
@@ -400,19 +435,28 @@ createApp({
         },
 
         scrollToBottom() {
-            if (this.$refs.chatContainer) {
-                this.$refs.chatContainer.scrollTop = this.$refs.chatContainer.scrollHeight;
-            }
+            const container = this.$refs.chatContainer;
+            if (!container || !this.autoFollowMessages) return;
+            container.scrollTop = container.scrollHeight;
         },
 
-        handleNewChat() {
+        handleChatScroll() {
+            const container = this.$refs.chatContainer;
+            if (!container) return;
+            const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
+            this.autoFollowMessages = remaining <= 120;
+        },
+
+        async handleNewChat() {
             if (!this.isAuthenticated) return;
             this.messages = [];
-            this.sessionId = 'session_' + Date.now();
-            this.activeNav = 'newChat';
+            this.sessionId = this.useConversationApi ? '' : 'session_' + Date.now();
+            this.activeNav = 'workspace';
             this.showHistorySidebar = false;
             this.inspectedMessage = null;
             this.selectedCitation = null;
+            this.autoFollowMessages = true;
+            this.$nextTick(() => this.$refs.textarea?.focus());
         },
 
         handleClearChat() {
@@ -421,17 +465,19 @@ createApp({
             }
         },
 
+        handleWorkspace() {
+            if (!this.isAuthenticated) return;
+            this.activeNav = 'workspace';
+            this.showHistorySidebar = false;
+            this.$nextTick(() => this.scrollToBottom());
+        },
+
         async handleHistory() {
             if (!this.isAuthenticated) return;
             this.activeNav = 'history';
             this.showHistorySidebar = true;
             try {
-                const response = await this.authFetch('/sessions');
-                if (!response.ok) {
-                    throw new Error('加载历史记录失败');
-                }
-                const data = await response.json();
-                this.sessions = data.sessions;
+                this.sessions = await this.apiAdapter.listConversations();
             } catch (error) {
                 alert('加载历史记录失败：' + error.message);
             }
@@ -440,21 +486,19 @@ createApp({
         async loadSession(sessionId) {
             this.sessionId = sessionId;
             this.showHistorySidebar = false;
-            this.activeNav = 'newChat';
+            this.activeNav = 'workspace';
+            this.autoFollowMessages = true;
 
             try {
-                const response = await this.authFetch(`/sessions/${encodeURIComponent(sessionId)}`);
-                if (!response.ok) {
-                    throw new Error('加载会话消息失败');
-                }
-                const data = await response.json();
-                this.messages = data.messages.map(msg => ({
+                const messages = await this.apiAdapter.getMessages(sessionId);
+                this.messages = messages.map(msg => ({
                     text: msg.content,
                     isUser: msg.type === 'human',
-                    ragTrace: msg.rag_trace || null,
+                    ragTrace: this.apiAdapter.normalizeTrace(msg.rag_trace),
                     ragSteps: [],
                     citations: this.citationsFromTrace(msg.rag_trace)
                 }));
+                await this.hydrateConversationHistoryTraces();
 
                 this.$nextTick(() => {
                     this.scrollToBottom();
@@ -465,27 +509,53 @@ createApp({
             }
         },
 
+        async hydrateLatestConversationTrace(messageIndex) {
+            if (!this.useConversationApi) return;
+            try {
+                const traces = await this.apiAdapter.getTrace(this.sessionId);
+                const latest = traces[traces.length - 1];
+                const message = this.messages[messageIndex];
+                if (!latest || !message) return;
+                const traceCitations = this.apiAdapter.citationsFromTrace(latest);
+                if (!message.citations?.length && traceCitations.length) {
+                    message.citations = traceCitations;
+                }
+                message.ragTrace = this.apiAdapter.normalizeTrace(latest, message.citations);
+            } catch (error) {
+                console.warn('Conversation trace load failed:', error);
+            }
+        },
+
+        async hydrateConversationHistoryTraces() {
+            if (!this.useConversationApi) return;
+            try {
+                const traces = await this.apiAdapter.getTrace(this.sessionId);
+                const assistantMessages = this.messages.filter(message => !message.isUser);
+                traces.slice(-assistantMessages.length).forEach((trace, index) => {
+                    const message = assistantMessages[index];
+                    const citations = this.apiAdapter.citationsFromTrace(trace);
+                    message.citations = citations.length ? citations : message.citations;
+                    message.ragTrace = this.apiAdapter.normalizeTrace(trace, message.citations);
+                });
+            } catch (error) {
+                console.warn('Conversation history trace load failed:', error);
+            }
+        },
+
         async deleteSession(sessionId) {
             if (!confirm(`确定要删除会话 "${sessionId}" 吗？`)) {
                 return;
             }
 
             try {
-                const response = await this.authFetch(`/sessions/${encodeURIComponent(sessionId)}`, {
-                    method: 'DELETE'
-                });
-
-                const payload = await response.json().catch(() => ({}));
-                if (!response.ok) {
-                    throw new Error(payload.detail || '删除失败');
-                }
+                const payload = await this.apiAdapter.deleteConversation(sessionId);
 
                 this.sessions = this.sessions.filter(s => s.session_id !== sessionId);
 
                 if (this.sessionId === sessionId) {
                     this.messages = [];
-                    this.sessionId = 'session_' + Date.now();
-                    this.activeNav = 'newChat';
+                    this.sessionId = this.useConversationApi ? '' : 'session_' + Date.now();
+                    this.activeNav = 'workspace';
                 }
 
                 if (payload.message) {

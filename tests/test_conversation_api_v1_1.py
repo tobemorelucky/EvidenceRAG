@@ -42,6 +42,7 @@ class FakeConversationService:
         self.deleted = False
         self.items = [{
             "conversation_id": "db-conversation-1",
+            "title": "Revenue?",
             "created_at": "2026-09-07T00:00:00",
             "updated_at": "2026-09-07T00:00:00",
             "message_count": 2,
@@ -69,6 +70,17 @@ class FakeConversationService:
             "usage": {"total_tokens": 12},
             "trace": {"retrieval_decision": {"called": True}},
         }
+
+    async def stream_chat(self, user_id, conversation_id, message, **_kwargs):
+        result = self.chat(user_id, conversation_id, message)
+        yield {"type": "status", "stage": "understanding", "label": "正在分析问题...", "detail": ""}
+        yield {"type": "status", "stage": "retrieval", "label": "正在检索证据...", "detail": ""}
+        yield {"type": "content", "content": "Answer: "}
+        yield {"type": "content", "content": message}
+        for citation in result["citations"]:
+            yield {"type": "citation", "citation": citation}
+        yield {"type": "trace", "rag_trace": result["trace"], "citations": result["citations"]}
+        yield {"type": "done", "conversation_id": conversation_id, "usage": result["usage"]}
 
     def messages(self, user_id, conversation_id):
         assert (user_id, conversation_id) == ("alice", "db-conversation-1")
@@ -152,9 +164,14 @@ def test_conversation_stream_uses_legacy_compatible_sse_events(client):
         for line in response.text.splitlines()
         if line.startswith("data: ")
     ]
-    assert [event["type"] for event in events] == ["content", "citation", "trace", "done"]
-    assert events[2]["rag_trace"]["retrieval_decision"]["called"]
-    assert events[3]["conversation_id"] == "db-conversation-1"
+    assert [event["type"] for event in events] == [
+        "status", "status", "content", "content", "citation", "trace", "done",
+    ]
+    assert events[0]["stage"] == "understanding"
+    assert events[1]["stage"] == "retrieval"
+    assert "".join(event.get("content", "") for event in events if event["type"] == "content") == "Answer: Revenue?"
+    assert events[-2]["rag_trace"]["retrieval_decision"]["called"]
+    assert events[-1]["conversation_id"] == "db-conversation-1"
 
 
 def test_delete_removes_postgres_memory_trace_and_redis_cache():
@@ -203,8 +220,10 @@ def test_persistent_list_counts_messages_and_delete_is_user_scoped():
     store.append_message("alice", "alice-conversation", "user", "First")
     store.append_message("alice", "alice-conversation", "assistant", "Second")
     store.create_conversation("bob", "bob-conversation")
+    store.create_conversation("alice", "empty-conversation")
 
     rows = store.list_conversations("alice")
     assert len(rows) == 1 and rows[0]["message_count"] == 2
+    assert rows[0]["title"] == "First"
     assert not store.delete_conversation("alice", "bob-conversation")
     assert store.get_conversation("bob", "bob-conversation") is not None

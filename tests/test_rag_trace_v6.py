@@ -73,6 +73,20 @@ def test_05_payload_records_rerank_parameters():
     assert row["rerank_parameters"]["model"] == "jina" and row["rerank_parameters"]["final_top_k"] == 12
 
 
+def test_05b_payload_records_runtime_and_depth_parameters(monkeypatch):
+    monkeypatch.setenv("DENSE_TOP_K", "240")
+    monkeypatch.setenv("BM25_TOP_K", "240")
+    monkeypatch.setenv("RRF_TOP_K", "120")
+    monkeypatch.setenv("JINA_INPUT_K", "80")
+    monkeypatch.setenv("JINA_OUTPUT_K", "12")
+    row = build(profile="finance", execution_mode="auto", answer_prompt_mode="baseline")
+    assert row["policy_decision"]["profile"] == "finance"
+    assert row["policy_decision"]["execution_mode"] == "auto"
+    assert row["policy_decision"]["answer_prompt_mode"] == "baseline"
+    assert row["rerank_parameters"]["dense_top_k"] == "240"
+    assert row["rerank_parameters"]["input_k"] == "80"
+
+
 def test_06_payload_prefers_citation_evidence():
     row = build(citations=[{"id": "e1", "filename": "x.pdf", "page_number": 2, "text": "fact"}])
     assert row["evidence_items"][0]["filename"] == "x.pdf"

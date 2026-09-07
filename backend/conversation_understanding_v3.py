@@ -7,8 +7,12 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from backend.memory.context_builder import build_understanding_context
-from backend.memory.conversation_state import ConversationState
+try:
+    from backend.memory.context_builder import build_understanding_context
+    from backend.memory.conversation_state import ConversationState
+except ModuleNotFoundError:
+    from memory.context_builder import build_understanding_context
+    from memory.conversation_state import ConversationState
 
 
 SCHEMA_KEYS = {
