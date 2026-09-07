@@ -18,9 +18,11 @@ def test_fifty_human_scenarios_cover_all_required_categories():
 
 def test_standalone_quality_requires_terms_and_resolved_reference():
     good = standalone_quality("Compare Acme revenue in FY2023", ["Acme", "revenue", "FY2023"], True)
-    unresolved = standalone_quality("How did it compare for Acme revenue FY2023?", ["Acme", "revenue", "FY2023"], True)
+    locally_resolved = standalone_quality("How did it compare for Acme revenue FY2023?", ["Acme", "revenue", "FY2023"], True)
+    unresolved = standalone_quality("How did it compare for Acme revenue?", ["Acme", "revenue", "FY2023"], True)
     missing = standalone_quality("Compare Acme revenue", ["Acme", "revenue", "FY2023"], True)
     assert good["quality_pass"] is True
+    assert locally_resolved["quality_pass"] is True
     assert unresolved["quality_pass"] is False
     assert missing["quality_pass"] is False
 

@@ -1,0 +1,10 @@
+{
+  "new_01":[false,false,"none"],"new_02":[false,false,"none"],"new_03":[false,false,"none"],"new_04":[false,false,"none"],"new_05":[false,false,"none"],"new_06":[false,false,"none"],"new_07":[false,false,"none"],
+  "pronoun_01":[true,true,"last exchange"],"pronoun_02":[true,true,"last exchange"],"pronoun_03":[true,true,"last exchange"],"pronoun_04":[true,true,"last exchange"],"pronoun_05":[true,true,"last exchange"],"pronoun_06":[true,true,"last exchange"],"pronoun_07":[true,true,"last exchange"],
+  "condition_01":[true,true,"last exchange"],"condition_02":[true,true,"last exchange"],"condition_03":[true,true,"last exchange"],"condition_04":[true,true,"last exchange"],"condition_05":[true,true,"last exchange"],"condition_06":[true,true,"last exchange"],
+  "challenge_01":[true,true,"last exchange"],"challenge_02":[true,true,"last exchange"],"challenge_03":[true,true,"last exchange"],"challenge_04":[true,true,"last exchange"],"challenge_05":[true,true,"last exchange"],"challenge_06":[true,true,"last exchange"],
+  "citation_01":[true,true,"last exchange"],"citation_02":[true,true,"last exchange"],"citation_03":[true,true,"last exchange"],"citation_04":[true,true,"last exchange"],"citation_05":[true,true,"last exchange"],"citation_06":[true,true,"last exchange"],
+  "supplement_01":[true,true,"last exchange"],"supplement_02":[true,true,"last exchange"],"supplement_03":[true,true,"last exchange"],"supplement_04":[true,true,"last exchange"],"supplement_05":[true,true,"last exchange"],"supplement_06":[true,true,"last exchange"],
+  "chat_01":[false,false,"none"],"chat_02":[true,true,"last exchange"],"chat_03":[true,true,"last exchange"],"chat_04":[true,true,"last exchange"],"chat_05":[false,false,"none"],"chat_06":[false,false,"none"],
+  "summary_01":[true,true,"full conversation"],"summary_02":[true,true,"full conversation"],"summary_03":[true,true,"full conversation"],"summary_04":[true,true,"full conversation"],"summary_05":[true,true,"full conversation"],"summary_06":[true,true,"full conversation"]
+}

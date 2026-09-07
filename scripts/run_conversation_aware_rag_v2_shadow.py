@@ -41,14 +41,19 @@ def atomic_jsonl(path: Path, records: list[dict]) -> None:
 
 
 def normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9%$]+", " ", str(text or "").casefold()).strip()
+    value = str(text or "").casefold()
+    value = re.sub(r"\bfiscal\s+year\s*(\d{4})\b", r"fy\1", value)
+    value = re.sub(r"\bfy\s*(\d{4})\b", r"fy\1", value)
+    value = re.sub(r"\b(?:re[ -]?)?verif(?:y|ied|ication)\b|\brecheck(?:ed|ing)?\b", "check", value)
+    return re.sub(r"[^a-z0-9%$]+", " ", value).strip()
 
 
 def standalone_quality(query: str, required_terms: list[str], need_rewrite: bool) -> dict:
     normalized = normalize(query)
     matched = [term for term in required_terms if normalize(term) in normalized]
     retention = len(matched) / len(required_terms) if required_terms else 1.0
-    unresolved = bool(need_rewrite and re.search(r"\b(?:it|its|that|this|they|them|those|former|latter)\b", normalized))
+    reference_token = bool(re.search(r"\b(?:it|its|that|this|they|them|those|former|latter)\b", normalized))
+    unresolved = bool(need_rewrite and retention < 1.0 and reference_token)
     nonempty = bool(normalized)
     return {
         "required_terms": required_terms, "matched_terms": matched,

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from agent import chat_with_agent, chat_with_agent_stream, storage
 from auth import authenticate_user, create_access_token, get_current_user, get_db, get_password_hash, require_admin, resolve_role
+from conversation_memory_v5 import conversation_memory_v5_enabled, conversation_memory_v5_service
 from document_loader import DocumentLoader
 from document_page_store import DocumentPageStore
 from embedding import embedding_service
@@ -41,6 +43,18 @@ from schemas import (
     SessionInfo,
     SessionListResponse,
     SessionMessagesResponse,
+)
+from backend.schemas import (
+    ConversationChatRequest,
+    ConversationChatResponse,
+    ConversationCreateRequest,
+    ConversationCreateResponse,
+    ConversationDeleteResponse,
+    ConversationInfo,
+    ConversationListResponse,
+    ConversationMessageInfo,
+    ConversationMessagesResponse,
+    ConversationTraceListResponse,
 )
 from table_config import get_table_aware_config
 from table_indexer import build_table_evidence_docs
@@ -212,6 +226,182 @@ async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_c
             raise HTTPException(status_code=code, detail=message)
         logger.exception("chat request failed")
         raise HTTPException(status_code=500, detail="回答生成服务暂不可用，请稍后重试")
+
+
+def _require_conversation_memory_v5() -> None:
+    if not conversation_memory_v5_enabled():
+        raise HTTPException(status_code=404, detail="Conversation-aware RAG v5 is disabled")
+
+
+@router.get("/conversation", response_model=ConversationListResponse)
+async def list_conversations(current_user: User = Depends(get_current_user)):
+    _require_conversation_memory_v5()
+    try:
+        conversations = [
+            ConversationInfo(**item)
+            for item in conversation_memory_v5_service.list_conversations(current_user.username)
+        ]
+        return ConversationListResponse(conversations=conversations)
+    except Exception as exc:
+        logger.exception("conversation v1.1 list failed")
+        raise HTTPException(status_code=500, detail="会话列表服务暂不可用") from exc
+
+
+@router.post("/conversation/create", response_model=ConversationCreateResponse)
+async def create_conversation(
+    request: ConversationCreateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    _require_conversation_memory_v5()
+    try:
+        return ConversationCreateResponse(**conversation_memory_v5_service.create(current_user.username, request.metadata))
+    except Exception as exc:
+        logger.exception("conversation v5 create failed")
+        raise HTTPException(status_code=500, detail="会话存储服务暂不可用") from exc
+
+
+@router.post("/conversation/chat", response_model=ConversationChatResponse)
+async def conversation_chat(
+    request: ConversationChatRequest,
+    current_user: User = Depends(get_current_user),
+):
+    _require_conversation_memory_v5()
+    if not request.message.strip() or not request.conversation_id.strip():
+        raise HTTPException(status_code=400, detail="conversation_id 和 message 不能为空")
+    try:
+        return ConversationChatResponse(**conversation_memory_v5_service.chat(
+            current_user.username,
+            request.conversation_id,
+            request.message,
+            profile=request.profile,
+            execution_mode=request.execution_mode,
+        ))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    except Exception as exc:
+        logger.exception("conversation v5 chat failed")
+        raise HTTPException(status_code=500, detail="多轮回答服务暂不可用") from exc
+
+
+@router.post("/conversation/chat/stream")
+async def conversation_chat_stream(
+    request: ConversationChatRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Run the conversation pipeline once and expose its result as legacy-compatible SSE."""
+    _require_conversation_memory_v5()
+
+    async def event_generator():
+        try:
+            result = await asyncio.to_thread(
+                conversation_memory_v5_service.chat,
+                current_user.username,
+                request.conversation_id,
+                request.message,
+                profile=request.profile,
+                execution_mode=request.execution_mode,
+            )
+            answer = str(result.get("response") or "")
+            if answer:
+                yield f"data: {json.dumps({'type': 'content', 'content': answer}, ensure_ascii=False)}\n\n"
+            citations = list(result.get("citations") or [])
+            for citation in citations:
+                yield f"data: {json.dumps({'type': 'citation', 'citation': citation}, ensure_ascii=False)}\n\n"
+            trace_event = {
+                "type": "trace",
+                "rag_trace": result.get("trace") or {},
+                "citations": citations,
+            }
+            yield f"data: {json.dumps(trace_event, ensure_ascii=False)}\n\n"
+            done_event = {
+                "type": "done",
+                "conversation_id": result.get("conversation_id") or request.conversation_id,
+                "usage": result.get("usage") or {},
+            }
+            yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
+        except KeyError:
+            error = {"type": "error", "content": "会话不存在"}
+            yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+        except Exception:
+            logger.exception("conversation v1.1 streaming chat failed")
+            error = {"type": "error", "content": "多轮回答服务暂不可用"}
+            yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+
+    if not request.message.strip() or not request.conversation_id.strip():
+        raise HTTPException(status_code=400, detail="conversation_id 和 message 不能为空")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/conversation/{conversation_id}/trace", response_model=ConversationTraceListResponse)
+async def conversation_trace(
+    conversation_id: str,
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+):
+    _require_conversation_memory_v5()
+    try:
+        traces = conversation_memory_v5_service.traces(
+            current_user.username, conversation_id, limit=max(1, min(limit, 500)),
+        )
+        return ConversationTraceListResponse(conversation_id=conversation_id, traces=traces)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    except Exception as exc:
+        logger.exception("conversation v6 trace query failed")
+        raise HTTPException(status_code=500, detail="Trace 查询服务暂不可用") from exc
+
+
+@router.get("/conversation/{conversation_id}/messages", response_model=ConversationMessagesResponse)
+async def conversation_messages(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    _require_conversation_memory_v5()
+    try:
+        messages = [
+            ConversationMessageInfo(**item)
+            for item in conversation_memory_v5_service.messages(current_user.username, conversation_id)
+        ]
+        return ConversationMessagesResponse(conversation_id=conversation_id, messages=messages)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    except Exception as exc:
+        logger.exception("conversation v1.1 message query failed")
+        raise HTTPException(status_code=500, detail="会话消息服务暂不可用") from exc
+
+
+@router.delete("/conversation/{conversation_id}", response_model=ConversationDeleteResponse)
+async def delete_conversation(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    _require_conversation_memory_v5()
+    try:
+        deleted, deletion_trace = conversation_memory_v5_service.delete(
+            current_user.username, conversation_id,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return ConversationDeleteResponse(
+            conversation_id=conversation_id,
+            message="成功删除会话",
+            deletion_trace=deletion_trace,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("conversation v1.1 delete failed")
+        raise HTTPException(status_code=500, detail="会话删除服务暂不可用") from exc
 
 
 @router.post("/chat/stream")

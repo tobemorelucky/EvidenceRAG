@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 
@@ -31,6 +31,68 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = "default_session"
     profile: Optional[str] = None
     execution_mode: Optional[str] = None
+
+
+class ConversationCreateRequest(BaseModel):
+    metadata: dict = Field(default_factory=dict)
+
+
+class ConversationCreateResponse(BaseModel):
+    conversation_id: str
+    created_at: str
+    memory_trace: dict
+
+
+class ConversationChatRequest(BaseModel):
+    conversation_id: str
+    message: str
+    profile: Optional[str] = None
+    execution_mode: Optional[str] = None
+
+
+class ConversationChatResponse(BaseModel):
+    conversation_id: str
+    response: str
+    citations: List[dict] = Field(default_factory=list)
+    usage: dict = Field(default_factory=dict)
+    trace: dict
+
+
+class ConversationTraceListResponse(BaseModel):
+    conversation_id: str
+    traces: List[dict] = Field(default_factory=list)
+
+
+class ConversationInfo(BaseModel):
+    conversation_id: str
+    created_at: str
+    updated_at: str
+    message_count: int = 0
+    metadata: dict = Field(default_factory=dict)
+
+
+class ConversationListResponse(BaseModel):
+    conversations: List[ConversationInfo] = Field(default_factory=list)
+
+
+class ConversationMessageInfo(BaseModel):
+    id: int
+    role: str
+    content: str
+    evidence_refs: List[str] = Field(default_factory=list)
+    trace: Optional[dict] = None
+    created_at: str
+
+
+class ConversationMessagesResponse(BaseModel):
+    conversation_id: str
+    messages: List[ConversationMessageInfo] = Field(default_factory=list)
+
+
+class ConversationDeleteResponse(BaseModel):
+    conversation_id: str
+    message: str
+    deletion_trace: dict = Field(default_factory=dict)
 
 
 class DebugRetrievalRequest(BaseModel):

@@ -16,6 +16,8 @@ apply_runtime_profile()
 
 import api as api_module
 from database import init_db
+from conversation_memory_v5 import conversation_memory_v5_enabled
+from memory.persistent_memory_store import init_memory_db
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -32,6 +34,8 @@ def create_app() -> FastAPI:
     async def _startup_init_db():
         print_feature_summary()
         init_db()
+        if conversation_memory_v5_enabled():
+            init_memory_db()
 
     app.add_middleware(
         CORSMiddleware,
