@@ -20,6 +20,8 @@ from prompts import (
     FINANCE_REASONING_V1_1_PROMPT_VERSION,
     FINANCE_TERMINOLOGY_ALIGNMENT_V1_ANSWER_SYSTEM_PROMPT,
     FINANCE_TERMINOLOGY_ALIGNMENT_V1_PROMPT_VERSION,
+    FINANCE_EVIDENCE_FOCUS_V1_ANSWER_SYSTEM_PROMPT,
+    FINANCE_EVIDENCE_FOCUS_V1_PROMPT_VERSION,
     PROMPT_VERSION,
     RAG_CORE_V2_PROMPT_VERSION,
     RAG_CORE_V3_PROMPT_VERSION,
@@ -28,6 +30,7 @@ from prompts import (
 )
 from runtime_profile import uses_clean_baseline_path, uses_rag_core_v2_path, uses_rag_core_v3_path
 from finance_online_profile import load_finance_online_profile
+from evidence_focus_semantic_router_v2 import route_evidence_focus_semantic
 
 
 ANSWER_PROMPT_MODES = {
@@ -36,7 +39,9 @@ ANSWER_PROMPT_MODES = {
     "finance_reasoning",
     "finance_reasoning_v1_1",
     "finance_terminology_alignment_v1",
+    "finance_evidence_focus_v1",
 }
+EVIDENCE_FOCUS_ROUTER_VERSION = "evidence_focus_semantic_router_v2"
 
 
 def resolve_answer_prompt_mode(mode: str | None = None) -> str:
@@ -44,6 +49,48 @@ def resolve_answer_prompt_mode(mode: str | None = None) -> str:
     if resolved not in ANSWER_PROMPT_MODES:
         raise ValueError(f"Unsupported ANSWER_PROMPT_MODE: {resolved}")
     return resolved
+
+
+def finance_evidence_focus_router_enabled() -> bool:
+    return os.getenv("FINANCE_EVIDENCE_FOCUS_ROUTER_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def resolve_answer_prompt_route(
+    question: str,
+    profile: str | None = None,
+    prompt_mode: str | None = None,
+) -> dict:
+    """Resolve the effective prompt without changing retrieval or evidence."""
+    requested = resolve_answer_prompt_mode(prompt_mode)
+    finance = str(profile or "").strip().lower() == "finance"
+    enabled = finance_evidence_focus_router_enabled()
+    trace = {
+        "prompt_router_enabled": enabled,
+        "prompt_router_applied": False,
+        "selected_prompt": requested,
+        "router_reason": [],
+        "router_version": EVIDENCE_FOCUS_ROUTER_VERSION,
+    }
+    if requested != "baseline":
+        trace["selected_prompt"] = requested
+        trace["router_reason"] = ["explicit_prompt_mode"]
+        return trace
+    if not finance:
+        trace["router_reason"] = ["profile_not_finance"] if enabled else ["router_disabled"]
+        return trace
+    if not enabled:
+        trace["selected_prompt"] = "clean_baseline_v1"
+        trace["router_reason"] = ["router_disabled"]
+        return trace
+    decision = route_evidence_focus_semantic(question)
+    trace["prompt_router_applied"] = True
+    trace["selected_prompt"] = (
+        "finance_evidence_focus_v1" if decision["use_evidence_focus"] else "clean_baseline_v1"
+    )
+    trace["router_reason"] = list(decision["reasons"] or ["ordinary_lookup"])
+    return trace
 
 
 def _create_model():
@@ -125,12 +172,15 @@ def build_answer_messages(
     prompt_mode: str | None = None,
 ) -> list:
     clean_baseline = uses_clean_baseline_path(profile)
-    mode = resolve_answer_prompt_mode(prompt_mode)
+    mode = resolve_answer_prompt_route(question, profile, prompt_mode)["selected_prompt"]
     finance_clean_baseline = str(profile or "").strip().lower() == "finance" and mode in {
         "baseline", "clean_baseline_v1",
     }
     explicit_clean_baseline = mode == "clean_baseline_v1"
-    if mode == "finance_terminology_alignment_v1":
+    if mode == "finance_evidence_focus_v1":
+        prompt_version = FINANCE_EVIDENCE_FOCUS_V1_PROMPT_VERSION
+        system_prompt = FINANCE_EVIDENCE_FOCUS_V1_ANSWER_SYSTEM_PROMPT
+    elif mode == "finance_terminology_alignment_v1":
         prompt_version = FINANCE_TERMINOLOGY_ALIGNMENT_V1_PROMPT_VERSION
         system_prompt = FINANCE_TERMINOLOGY_ALIGNMENT_V1_ANSWER_SYSTEM_PROMPT
     elif mode == "finance_reasoning_v1_1":
@@ -155,7 +205,12 @@ def build_answer_messages(
     for message in (history or [])[-12:]:
         if getattr(message, "type", "") in {"human", "ai"}:
             messages.append(message)
-    if clean_baseline or finance_clean_baseline or explicit_clean_baseline or mode == "finance_terminology_alignment_v1":
+    if (
+        clean_baseline
+        or finance_clean_baseline
+        or explicit_clean_baseline
+        or mode in {"finance_terminology_alignment_v1", "finance_evidence_focus_v1"}
+    ):
         content = CLEAN_BASELINE_ANSWER_USER_TEMPLATE.format(question=question, evidence=evidence)
     elif task_policy:
         content = ANSWER_USER_WITH_POLICY_TEMPLATE.format(

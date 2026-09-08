@@ -39,6 +39,7 @@ CLEAN_BASELINE_OVERRIDES: Mapping[str, str] = {
     "AUTO_MERGE_ENABLED": "false",
     "TABLE_AWARE_RETRIEVAL": "off",
     "RAG_EVIDENCE_GROUPING_ENABLED": "false",
+    "FINANCE_EVIDENCE_FOCUS_ROUTER_ENABLED": "false",
     "FINANCE_POLICY_ENABLED": "false",
     "EVIDENCE_FRAME_ENABLED": "false",
     "STRUCTURED_EXECUTOR_ENABLED": "false",
@@ -140,6 +141,7 @@ RETRIEVAL_DOCUMENT_LOCAL_OVERRIDES: Mapping[str, str] = {
 
 
 FEATURE_LABELS: tuple[tuple[str, str], ...] = (
+    ("Evidence Focus Prompt Router", "FINANCE_EVIDENCE_FOCUS_ROUTER_ENABLED"),
     ("Finance Policy", "FINANCE_POLICY_ENABLED"),
     ("Structured Coverage", "STRUCTURED_COVERAGE_ENABLED"),
     ("Structured Coverage Advisory", "STRUCTURED_COVERAGE_ADVISORY_ENABLED"),

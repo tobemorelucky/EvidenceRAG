@@ -12,7 +12,7 @@ import time
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from answer_generator import generate_answer, stream_answer, summarize_messages
+from answer_generator import generate_answer, resolve_answer_prompt_route, stream_answer, summarize_messages
 from calculation_service import validate_numeric_display, validate_or_repair_structured_answer
 from conversation_service import storage
 from rag_orchestrator import RetrievalServiceError, prepare_rag_response
@@ -81,6 +81,8 @@ def chat_with_agent(
     messages.append(HumanMessage(content=user_text))
 
     prepared = prepare_rag_response(user_text, profile=profile, mode=execution_mode)
+    prompt_route = resolve_answer_prompt_route(user_text, prepared.get("profile"), "baseline")
+    prepared["rag_trace"].update(prompt_route)
     if prepared.get("skill_applied"):
         response_content, usage = str(prepared.get("skill_answer") or ""), {}
     elif prepared["evidence_status"] == "insufficient":
@@ -92,6 +94,7 @@ def chat_with_agent(
             history,
             prepared.get("task_policy", ""),
             prepared.get("profile"),
+            prompt_mode=prompt_route["selected_prompt"],
         )
         response_content = _finalize_generated_answer(response_content, prepared)
 
@@ -148,6 +151,8 @@ async def chat_with_agent_stream(
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
         prepared = await prepare_task
+        prompt_route = resolve_answer_prompt_route(user_text, prepared.get("profile"), "baseline")
+        prepared["rag_trace"].update(prompt_route)
         while not status_queue.empty():
             step = status_queue.get_nowait()
             event = {
@@ -189,6 +194,7 @@ async def chat_with_agent_stream(
             history,
             prepared.get("task_policy", ""),
             prepared.get("profile"),
+            prompt_mode=prompt_route["selected_prompt"],
         ):
             generated += content
             usage = chunk_usage or usage
@@ -201,6 +207,7 @@ async def chat_with_agent_stream(
             history,
             prepared.get("task_policy", ""),
             prepared.get("profile"),
+            prompt_mode=prompt_route["selected_prompt"],
         ):
             full_response += content
             usage = chunk_usage or usage

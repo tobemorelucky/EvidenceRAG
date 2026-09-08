@@ -5,12 +5,16 @@ createApp({
         return {
             messages: [],
             userInput: '',
-            isLoading: false,
             activeNav: 'workspace',
-            abortController: null,
             sessionId: 'session_' + Date.now(),
             sessions: [],
+            conversationMessageCache: {},
+            conversationDraftCache: {},
+            activeStreams: {},
+            sessionNavigationVersion: 0,
             showHistorySidebar: false,
+            sessionsLoading: false,
+            historyError: '',
             autoFollowMessages: true,
             isComposing: false,
             documents: [],
@@ -42,6 +46,13 @@ createApp({
             inspectorOpen: false,
             inspectedMessage: null,
             selectedCitation: null,
+            deleteConversationDialog: {
+                open: false,
+                sessionId: '',
+                title: '',
+                loading: false,
+                error: ''
+            },
             apiAdapter: null,
             useConversationApi: false
         };
@@ -49,6 +60,9 @@ createApp({
     computed: {
         isAuthenticated() {
             return !!this.token && !!this.currentUser;
+        },
+        isLoading() {
+            return !!(this.sessionId && this.activeStreams[this.sessionId]);
         },
         isAdmin() {
             return this.currentUser?.role === 'admin';
@@ -73,17 +87,33 @@ createApp({
         activeSteps() {
             return this.activeAssistantMessage?.ragSteps || [];
         },
-        debugTrace() {
+        advancedTrace() {
             const trace = this.activeTrace || {};
+            const understanding = trace.conversation_understanding || trace.understanding || {};
+            const policy = trace.policy_decision || {};
+            const rewritten = trace.standalone_query || trace.query_rewrite?.standalone_query || trace.rewritten_query;
+            const retrievalCount = trace.rrf_fused_candidate_count ?? trace.retrieval_counts?.rrf;
+            const reranked = trace.rerank_applied ?? trace.rerank_parameters?.applied;
             return {
-                candidate_k: trace.candidate_k ?? '—',
-                final_top_k: trace.final_top_k ?? '—',
-                rrf_candidates: trace.rrf_fused_candidate_count ?? '—',
-                rerank_applied: trace.rerank_applied ?? false,
-                tool_calls: trace.agent_tool_call_count ?? 0,
-                route_reason: trace.route_reason || '—',
-                latency_ms: trace.latency_breakdown?.total_latency_ms ?? trace.latency_breakdown?.total_retrieval_ms ?? '—'
+                queryUnderstanding: understanding.summary || understanding.response_mode || policy.reason || '未提供查询理解摘要',
+                queryRewrite: rewritten || (trace.query_rewrite_enabled === false ? '本次未进行查询改写' : '未记录查询改写结果'),
+                retrieval: retrievalCount == null ? '未记录候选数量' : `共获得 ${retrievalCount} 个候选证据片段`,
+                rerank: reranked === true ? '已对候选证据进行相关性重排序' : (reranked === false ? '本次未进行重排序' : '未记录重排序状态'),
+                evidence: this.activeCitations.length ? `最终引用 ${this.activeCitations.length} 处文件证据` : '本次回答暂无可展示的引用来源'
             };
+        },
+        debugTraceRows() {
+            const trace = this.activeTrace || {};
+            return [
+                { label: '候选证据上限', value: trace.candidate_k ?? '—' },
+                { label: '最终证据上限', value: trace.final_top_k ?? '—' },
+                { label: '融合候选数量', value: trace.rrf_fused_candidate_count ?? '—' },
+                { label: '已执行重排序', value: trace.rerank_applied === true ? '是' : '否' },
+                { label: '工具调用次数', value: trace.agent_tool_call_count ?? 0 },
+                { label: '路径选择原因', value: trace.route_reason || '—' },
+                { label: '总耗时（毫秒）', value: trace.latency_breakdown?.total_latency_ms ?? trace.latency_breakdown?.total_retrieval_ms ?? '—' },
+                { label: '运行记录编号', value: trace.trace_id || '—' }
+            ];
         }
     },
     async mounted() {
@@ -137,6 +167,19 @@ createApp({
                 limited: '相关证据有限',
                 insufficient: '未找到足够相关证据'
             })[status] || '等待检索';
+        },
+
+        localizeStage(step) {
+            const stage = String(step?.stage || '').toLowerCase();
+            const labels = {
+                understanding: '正在理解问题',
+                query_rewrite: '正在整理检索问题',
+                retrieval: '正在检索相关证据',
+                rerank: '正在筛选高相关证据',
+                evidence_build: '正在整理引用依据',
+                answering: '正在生成回答'
+            };
+            return labels[stage] || step?.label || '正在处理';
         },
 
         citationsFromTrace(trace) {
@@ -250,10 +293,14 @@ createApp({
         },
 
         handleLogout() {
+            Object.values(this.activeStreams).forEach(stream => stream?.controller?.abort());
             this.token = '';
             this.currentUser = null;
             this.messages = [];
             this.sessions = [];
+            this.conversationMessageCache = {};
+            this.conversationDraftCache = {};
+            this.activeStreams = {};
             this.documents = [];
             this.selectedDocumentFilenames = [];
             this.activeNav = 'workspace';
@@ -285,8 +332,9 @@ createApp({
         },
 
         handleStop() {
-            if (this.abortController) {
-                this.abortController.abort();
+            const stream = this.activeStreams[this.sessionId];
+            if (stream?.controller) {
+                stream.controller.abort();
             }
         },
 
@@ -307,7 +355,11 @@ createApp({
                 return;
             }
 
-            this.messages.push({
+            const requestSessionId = this.sessionId;
+            const conversationMessages = this.messages;
+            this.conversationMessageCache[requestSessionId] = conversationMessages;
+
+            conversationMessages.push({
                 text: text,
                 isUser: true
             });
@@ -318,8 +370,7 @@ createApp({
                 this.scrollToBottom();
             });
 
-            this.isLoading = true;
-            this.messages.push({
+            conversationMessages.push({
                 text: '',
                 isUser: false,
                 isThinking: true,
@@ -327,17 +378,20 @@ createApp({
                 ragSteps: [],
                 citations: []
             });
-            const botMsgIdx = this.messages.length - 1;
-
-            this.abortController = new AbortController();
+            const botMsgIdx = conversationMessages.length - 1;
+            const controller = new AbortController();
+            this.activeStreams = {
+                ...this.activeStreams,
+                [requestSessionId]: { controller }
+            };
 
             try {
                 const response = await this.apiAdapter.streamChat({
                     message: text,
-                    conversationId: this.sessionId,
+                    conversationId: requestSessionId,
                     profile: this.ragProfile,
                     executionMode: this.executionMode,
-                    signal: this.abortController.signal
+                    signal: controller.signal
                 });
 
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -363,34 +417,34 @@ createApp({
                             try {
                                 const data = JSON.parse(dataStr);
                                 if (data.type === 'content') {
-                                    if (this.messages[botMsgIdx].isThinking) {
-                                        this.messages[botMsgIdx].isThinking = false;
+                                    if (conversationMessages[botMsgIdx].isThinking) {
+                                        conversationMessages[botMsgIdx].isThinking = false;
                                     }
-                                    this.messages[botMsgIdx].text += data.content;
+                                    conversationMessages[botMsgIdx].text += data.content;
                                 } else if (data.type === 'trace') {
-                                    this.messages[botMsgIdx].ragTrace = this.apiAdapter.normalizeTrace(
+                                    conversationMessages[botMsgIdx].ragTrace = this.apiAdapter.normalizeTrace(
                                         data.rag_trace,
-                                        data.citations || this.messages[botMsgIdx].citations
+                                        data.citations || conversationMessages[botMsgIdx].citations
                                     );
-                                    this.messages[botMsgIdx].citations = data.citations || this.messages[botMsgIdx].citations;
+                                    conversationMessages[botMsgIdx].citations = data.citations || conversationMessages[botMsgIdx].citations;
                                     this.serviceStatus = 'ready';
                                 } else if (data.type === 'citation') {
                                     const citation = data.citation;
-                                    if (citation && !this.messages[botMsgIdx].citations.some(item => item.id === citation.id)) {
-                                        this.messages[botMsgIdx].citations.push(citation);
+                                    if (citation && !conversationMessages[botMsgIdx].citations.some(item => item.id === citation.id)) {
+                                        conversationMessages[botMsgIdx].citations.push(citation);
                                     }
                                 } else if (data.type === 'status' || data.type === 'rag_step') {
-                                    if (!this.messages[botMsgIdx].ragSteps) {
-                                        this.messages[botMsgIdx].ragSteps = [];
+                                    if (!conversationMessages[botMsgIdx].ragSteps) {
+                                        conversationMessages[botMsgIdx].ragSteps = [];
                                     }
-                                    this.messages[botMsgIdx].ragSteps.push(data.step || {
+                                    conversationMessages[botMsgIdx].ragSteps.push(data.step || {
                                         stage: data.stage,
                                         label: data.label,
                                         detail: data.detail
                                     });
                                 } else if (data.type === 'error') {
-                                    this.messages[botMsgIdx].isThinking = false;
-                                    this.messages[botMsgIdx].text += `\n\n检索或回答服务异常：${data.content}`;
+                                    conversationMessages[botMsgIdx].isThinking = false;
+                                    conversationMessages[botMsgIdx].text += `\n\n检索或回答服务异常：${data.content}`;
                                     this.serviceStatus = '异常';
                                 }
                             } catch (e) {
@@ -398,28 +452,33 @@ createApp({
                             }
                         }
                     }
-                    this.$nextTick(() => this.scrollToBottom());
+                    if (this.sessionId === requestSessionId) {
+                        this.$nextTick(() => this.scrollToBottom());
+                    }
                 }
 
-                await this.hydrateLatestConversationTrace(botMsgIdx);
+                await this.hydrateLatestConversationTrace(botMsgIdx, requestSessionId, conversationMessages);
 
             } catch (error) {
                 if (error.name === 'AbortError') {
-                    this.messages[botMsgIdx].isThinking = false;
-                    if (!this.messages[botMsgIdx].text) {
-                        this.messages[botMsgIdx].text = '(已终止回答)';
+                    conversationMessages[botMsgIdx].isThinking = false;
+                    if (!conversationMessages[botMsgIdx].text) {
+                        conversationMessages[botMsgIdx].text = '(已终止回答)';
                     } else {
-                        this.messages[botMsgIdx].text += '\n\n_(回答已被终止)_';
+                        conversationMessages[botMsgIdx].text += '\n\n_(回答已被终止)_';
                     }
                 } else {
-                    this.messages[botMsgIdx].isThinking = false;
-                    this.messages[botMsgIdx].text = `回答生成服务暂不可用：${error.message}`;
+                    conversationMessages[botMsgIdx].isThinking = false;
+                    conversationMessages[botMsgIdx].text = `回答生成服务暂不可用：${error.message}`;
                     this.serviceStatus = '异常';
                 }
             } finally {
-                this.isLoading = false;
-                this.abortController = null;
-                this.$nextTick(() => this.scrollToBottom());
+                const nextStreams = { ...this.activeStreams };
+                delete nextStreams[requestSessionId];
+                this.activeStreams = nextStreams;
+                if (this.sessionId === requestSessionId) {
+                    this.$nextTick(() => this.scrollToBottom());
+                }
             }
         },
 
@@ -450,7 +509,9 @@ createApp({
 
         async handleNewChat() {
             if (!this.isAuthenticated) return;
+            this.cacheActiveConversation();
             this.messages = [];
+            this.userInput = '';
             this.sessionId = this.useConversationApi ? '' : 'session_' + Date.now();
             this.activeNav = 'workspace';
             this.showHistorySidebar = false;
@@ -477,45 +538,92 @@ createApp({
             if (!this.isAuthenticated) return;
             this.activeNav = 'history';
             this.showHistorySidebar = true;
+            this.historyError = '';
+            await this.$nextTick();
+            await this.loadHistorySessions();
+        },
+
+        closeHistory() {
+            this.showHistorySidebar = false;
+            this.activeNav = 'workspace';
+        },
+
+        async loadHistorySessions() {
+            if (!this.apiAdapter || this.sessionsLoading) return;
+            this.sessionsLoading = true;
+            this.historyError = '';
             try {
                 this.sessions = await this.apiAdapter.listConversations();
             } catch (error) {
-                alert('加载历史记录失败：' + error.message);
+                this.historyError = '加载历史记录失败：' + error.message;
+            } finally {
+                this.sessionsLoading = false;
             }
         },
 
         async loadSession(sessionId) {
+            if (sessionId === this.sessionId) {
+                this.showHistorySidebar = false;
+                this.activeNav = 'workspace';
+                this.$nextTick(() => this.scrollToBottom());
+                return;
+            }
+            this.cacheActiveConversation();
+            const navigationVersion = ++this.sessionNavigationVersion;
             this.sessionId = sessionId;
             this.showHistorySidebar = false;
             this.activeNav = 'workspace';
             this.autoFollowMessages = true;
 
+            const cachedMessages = this.conversationMessageCache[sessionId];
+            this.userInput = this.conversationDraftCache[sessionId] || '';
+            if (cachedMessages) {
+                this.messages = cachedMessages;
+            } else {
+                this.messages = [];
+            }
+
+            if (this.activeStreams[sessionId]) {
+                this.$nextTick(() => this.scrollToBottom());
+                return;
+            }
+
             try {
                 const messages = await this.apiAdapter.getMessages(sessionId);
-                this.messages = messages.map(msg => ({
+                if (navigationVersion !== this.sessionNavigationVersion || this.sessionId !== sessionId) return;
+                const normalizedMessages = messages.map(msg => ({
                     text: msg.content,
                     isUser: msg.type === 'human',
                     ragTrace: this.apiAdapter.normalizeTrace(msg.rag_trace),
                     ragSteps: [],
                     citations: this.citationsFromTrace(msg.rag_trace)
                 }));
-                await this.hydrateConversationHistoryTraces();
+                this.messages = normalizedMessages;
+                this.conversationMessageCache[sessionId] = normalizedMessages;
+                await this.hydrateConversationHistoryTraces(sessionId, normalizedMessages);
 
                 this.$nextTick(() => {
                     this.scrollToBottom();
                 });
             } catch (error) {
+                if (navigationVersion !== this.sessionNavigationVersion || this.sessionId !== sessionId) return;
                 alert('加载会话失败：' + error.message);
-                this.messages = [];
+                if (!cachedMessages) this.messages = [];
             }
         },
 
-        async hydrateLatestConversationTrace(messageIndex) {
+        cacheActiveConversation() {
+            if (!this.sessionId) return;
+            this.conversationMessageCache[this.sessionId] = this.messages;
+            this.conversationDraftCache[this.sessionId] = this.userInput;
+        },
+
+        async hydrateLatestConversationTrace(messageIndex, sessionId = this.sessionId, targetMessages = this.messages) {
             if (!this.useConversationApi) return;
             try {
-                const traces = await this.apiAdapter.getTrace(this.sessionId);
+                const traces = await this.apiAdapter.getTrace(sessionId);
                 const latest = traces[traces.length - 1];
-                const message = this.messages[messageIndex];
+                const message = targetMessages[messageIndex];
                 if (!latest || !message) return;
                 const traceCitations = this.apiAdapter.citationsFromTrace(latest);
                 if (!message.citations?.length && traceCitations.length) {
@@ -527,11 +635,11 @@ createApp({
             }
         },
 
-        async hydrateConversationHistoryTraces() {
+        async hydrateConversationHistoryTraces(sessionId = this.sessionId, targetMessages = this.messages) {
             if (!this.useConversationApi) return;
             try {
-                const traces = await this.apiAdapter.getTrace(this.sessionId);
-                const assistantMessages = this.messages.filter(message => !message.isUser);
+                const traces = await this.apiAdapter.getTrace(sessionId);
+                const assistantMessages = targetMessages.filter(message => !message.isUser);
                 traces.slice(-assistantMessages.length).forEach((trace, index) => {
                     const message = assistantMessages[index];
                     const citations = this.apiAdapter.citationsFromTrace(trace);
@@ -543,13 +651,39 @@ createApp({
             }
         },
 
-        async deleteSession(sessionId) {
-            if (!confirm(`确定要删除会话 "${sessionId}" 吗？`)) {
+        requestDeleteSession(session) {
+            if (!session?.session_id) return;
+            if (this.activeStreams[session.session_id]) {
+                alert('当前会话正在生成回答，请先停止生成再删除。');
                 return;
             }
+            this.deleteConversationDialog = {
+                open: true,
+                sessionId: session.session_id,
+                title: session.title || '未命名会话',
+                loading: false,
+                error: ''
+            };
+        },
 
+        cancelDeleteSession() {
+            if (this.deleteConversationDialog.loading) return;
+            this.deleteConversationDialog = {
+                open: false,
+                sessionId: '',
+                title: '',
+                loading: false,
+                error: ''
+            };
+        },
+
+        async confirmDeleteSession() {
+            const sessionId = this.deleteConversationDialog.sessionId;
+            if (!sessionId || this.deleteConversationDialog.loading) return;
+            this.deleteConversationDialog.loading = true;
+            this.deleteConversationDialog.error = '';
             try {
-                const payload = await this.apiAdapter.deleteConversation(sessionId);
+                await this.apiAdapter.deleteConversation(sessionId);
 
                 this.sessions = this.sessions.filter(s => s.session_id !== sessionId);
 
@@ -558,12 +692,13 @@ createApp({
                     this.sessionId = this.useConversationApi ? '' : 'session_' + Date.now();
                     this.activeNav = 'workspace';
                 }
-
-                if (payload.message) {
-                    alert(payload.message);
-                }
+                delete this.conversationMessageCache[sessionId];
+                delete this.conversationDraftCache[sessionId];
+                this.deleteConversationDialog.loading = false;
+                this.cancelDeleteSession();
             } catch (error) {
-                alert('删除会话失败：' + error.message);
+                this.deleteConversationDialog.loading = false;
+                this.deleteConversationDialog.error = '删除失败：' + error.message;
             }
         },
 
@@ -910,6 +1045,8 @@ createApp({
                 { key: 'bm25', label: '更新稀疏索引', percent: 0, status: 'pending', message: '' },
                 { key: 'milvus', label: '删除向量数据', percent: 0, status: 'pending', message: '' },
                 { key: 'parent_store', label: '删除父级分块', percent: 0, status: 'pending', message: '' },
+                { key: 'page_store', label: '删除页面正文', percent: 0, status: 'pending', message: '' },
+                { key: 'table_store', label: '删除表格记录', percent: 0, status: 'pending', message: '' },
             ];
         },
 

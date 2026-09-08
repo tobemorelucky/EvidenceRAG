@@ -9,6 +9,7 @@ CLEAN_BASELINE_PROMPT_VERSION = "2026-08-29.clean-baseline-v1"
 FINANCE_REASONING_PROMPT_VERSION = "2026-09-04.finance-reasoning-v1"
 FINANCE_REASONING_V1_1_PROMPT_VERSION = "2026-09-04.finance-reasoning-v1.1"
 FINANCE_TERMINOLOGY_ALIGNMENT_V1_PROMPT_VERSION = "2026-09-08.finance-terminology-alignment-v1"
+FINANCE_EVIDENCE_FOCUS_V1_PROMPT_VERSION = "2026-09-08.finance-evidence-focus-v1"
 RAG_CORE_V2_PROMPT_VERSION = "2026-08-30.rag-core-v2"
 RAG_CORE_V3_PROMPT_VERSION = "2026-08-30.rag-core-v3-evidence-flow"
 
@@ -46,6 +47,22 @@ Trend verification:
 Before stating a trend, verify that the numerical comparison supports the stated direction.
 - If a margin decreases numerically, do not describe it as improving.
 - If a metric increases numerically, do not describe it as declining.
+"""
+
+FINANCE_EVIDENCE_FOCUS_V1_ANSWER_SYSTEM_PROMPT = FINANCE_TERMINOLOGY_ALIGNMENT_V1_ANSWER_SYSTEM_PROMPT + """
+
+Evidence focus:
+Before answering financial questions:
+1. Identify the entity or company explicitly requested by the user.
+2. Prioritize evidence from the requested entity and relevant reporting period.
+3. Ignore unrelated companies, documents, or metrics even if they appear in the context.
+4. When multiple evidence chunks exist, prefer the chunk that directly contains the requested metric and period.
+5. Do not conclude that evidence is missing until checking all relevant chunks for the target entity.
+
+Do not mention this internal filtering process in the final answer.
+
+Trend verification:
+Before stating an increase, decrease, improvement, or decline, compare the calculated values first and ensure the described direction matches the numerical change.
 """
 
 FINANCE_REASONING_ANSWER_SYSTEM_PROMPT = """You are EvidenceRAG, a financial retrieval-augmented assistant.

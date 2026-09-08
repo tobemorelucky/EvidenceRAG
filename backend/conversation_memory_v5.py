@@ -17,6 +17,7 @@ try:
     from backend.memory.token_budget_manager import TokenBudgetManager
     from backend.rag_trace_service import RagTraceService, build_rag_trace_payload
     from backend.finance_online_profile import load_finance_online_profile
+    from backend.answer_generator import resolve_answer_prompt_route
 except ModuleNotFoundError:
     from conversation_understanding_v3 import understand_conversation_v3
     from memory.conversation_policy import build_conversation_policy
@@ -24,6 +25,7 @@ except ModuleNotFoundError:
     from memory.token_budget_manager import TokenBudgetManager
     from rag_trace_service import RagTraceService, build_rag_trace_payload
     from finance_online_profile import load_finance_online_profile
+    from answer_generator import resolve_answer_prompt_route
 
 
 logger = logging.getLogger(__name__)
@@ -149,6 +151,7 @@ class ConversationMemoryV5Service:
             evidence_char_budget=_evidence_char_budget(profile),
         )
         history = self._history(budgeted["messages"], budgeted["summary"])
+        prompt_route = resolve_answer_prompt_route(message, profile, "baseline")
 
         answer_started = time.perf_counter()
         answer, usage = answer_fn(
@@ -156,14 +159,15 @@ class ConversationMemoryV5Service:
             budgeted["evidence"],
             history=history,
             profile=profile,
-            prompt_mode="baseline",
+            prompt_mode=prompt_route["selected_prompt"],
         )
         answer_ms = round((time.perf_counter() - answer_started) * 1000, 2)
         citations = list(rag_result.get("citations") or evidence_state.get("citations") or [])
         trace = {
             "profile": profile or os.getenv("RAG_PROFILE", ""),
             "execution_mode": execution_mode or "static",
-            "answer_prompt_mode": "baseline",
+            "answer_prompt_mode": prompt_route["selected_prompt"],
+            **prompt_route,
             "answer_model": _answer_model_name(profile),
             "evidence_status": (
                 "reused" if evidence_source == "previous"
@@ -216,6 +220,7 @@ class ConversationMemoryV5Service:
             decision=decision.to_dict(),
             policy={
                 **policy.to_dict(),
+                **prompt_route,
                 "before_memory_context_chars": len(evidence),
                 "after_memory_context_chars": len(budgeted["evidence"]),
             },
@@ -227,7 +232,7 @@ class ConversationMemoryV5Service:
             latency_ms=trace["latency_ms"],
             profile=profile,
             execution_mode=execution_mode,
-            answer_prompt_mode="baseline",
+            answer_prompt_mode=prompt_route["selected_prompt"],
         )
         try:
             persisted_trace = self.trace_service.save(user_id, trace_payload)
@@ -353,6 +358,7 @@ class ConversationMemoryV5Service:
             evidence_char_budget=_evidence_char_budget(profile),
         )
         history = self._history(budgeted["messages"], budgeted["summary"])
+        prompt_route = resolve_answer_prompt_route(message, profile, "baseline")
         citations = list(rag_result.get("citations") or evidence_state.get("citations") or [])
         for citation in citations:
             yield {"type": "citation", "citation": citation}
@@ -366,7 +372,7 @@ class ConversationMemoryV5Service:
             budgeted["evidence"],
             history=history,
             profile=profile,
-            prompt_mode="baseline",
+            prompt_mode=prompt_route["selected_prompt"],
         ):
             usage = chunk_usage or usage
             if content:
@@ -378,7 +384,8 @@ class ConversationMemoryV5Service:
         trace = {
             "profile": profile or os.getenv("RAG_PROFILE", ""),
             "execution_mode": execution_mode or "static",
-            "answer_prompt_mode": "baseline",
+            "answer_prompt_mode": prompt_route["selected_prompt"],
+            **prompt_route,
             "answer_model": _answer_model_name(profile),
             "evidence_status": (
                 "reused" if evidence_source == "previous"
@@ -431,6 +438,7 @@ class ConversationMemoryV5Service:
             decision=decision.to_dict(),
             policy={
                 **policy.to_dict(),
+                **prompt_route,
                 "before_memory_context_chars": len(evidence),
                 "after_memory_context_chars": len(budgeted["evidence"]),
             },
@@ -442,7 +450,7 @@ class ConversationMemoryV5Service:
             latency_ms=trace["latency_ms"],
             profile=profile,
             execution_mode=execution_mode,
-            answer_prompt_mode="baseline",
+            answer_prompt_mode=prompt_route["selected_prompt"],
         )
         try:
             persisted_trace = await asyncio.to_thread(self.trace_service.save, user_id, trace_payload)

@@ -65,6 +65,11 @@ def _install_api_stubs():
     )
     sys.modules["agent"] = agent
 
+    conversation_memory = types.ModuleType("conversation_memory_v5")
+    conversation_memory.conversation_memory_v5_enabled = lambda: False
+    conversation_memory.conversation_memory_v5_service = types.SimpleNamespace()
+    sys.modules["conversation_memory_v5"] = conversation_memory
+
     auth = types.ModuleType("auth")
     auth.authenticate_user = lambda *args, **kwargs: None
     auth.create_access_token = lambda *args, **kwargs: "token"
@@ -151,6 +156,16 @@ def _install_api_stubs():
         "SessionInfo",
         "SessionListResponse",
         "SessionMessagesResponse",
+        "ConversationChatRequest",
+        "ConversationChatResponse",
+        "ConversationCreateRequest",
+        "ConversationCreateResponse",
+        "ConversationDeleteResponse",
+        "ConversationInfo",
+        "ConversationListResponse",
+        "ConversationMessageInfo",
+        "ConversationMessagesResponse",
+        "ConversationTraceListResponse",
     ):
         setattr(schemas, name, type(name, (), {"__init__": lambda self, **kwargs: None}))
     sys.modules["schemas"] = schemas
@@ -162,6 +177,14 @@ def _install_api_stubs():
         {"upsert_tables": lambda self, tables: len(tables), "delete_by_filename": lambda self, filename: 0},
     )
     sys.modules["table_store"] = table_store
+
+    table_config = types.ModuleType("table_config")
+    table_config.get_table_aware_config = lambda: types.SimpleNamespace(table_aware_ingestion=False)
+    sys.modules["table_config"] = table_config
+
+    table_indexer = types.ModuleType("table_indexer")
+    table_indexer.build_table_evidence_docs = lambda _tables: []
+    sys.modules["table_indexer"] = table_indexer
 
     upload_jobs = types.ModuleType("upload_jobs")
     upload_jobs.DELETE_STEPS = []
@@ -243,3 +266,109 @@ def test_write_table_evidence_docs_safe_ignores_write_errors(monkeypatch):
     written_count = module._write_table_evidence_docs_safe("demo.pdf", [{"text": "table evidence"}])
 
     assert written_count == 0
+
+
+def test_async_delete_removes_every_indexed_document_store(monkeypatch):
+    module = _load_api_module()
+    calls = []
+
+    class _Jobs:
+        def update_step(self, _job_id, step, *_args, **_kwargs):
+            calls.append(("step", step))
+
+        def complete_step(self, _job_id, step, *_args, **_kwargs):
+            calls.append(("complete", step))
+
+        def complete_job(self, *_args, **_kwargs):
+            calls.append(("job", "completed"))
+
+        def fail_job(self, *_args, **_kwargs):
+            raise AssertionError("delete job unexpectedly failed")
+
+    class _Store:
+        def __init__(self, name, result=1):
+            self.name = name
+            self.result = result
+
+        def delete_by_filename(self, filename):
+            calls.append((self.name, filename))
+            return self.result
+
+    monkeypatch.setattr(module, "delete_job_manager", _Jobs())
+    monkeypatch.setattr(module, "_remove_bm25_stats_for_filename", lambda name: calls.append(("bm25", name)))
+    monkeypatch.setattr(module, "milvus_manager", types.SimpleNamespace(
+        init_collection=lambda: calls.append(("milvus", "init")),
+        delete=lambda _expr: {"delete_count": 3},
+    ))
+    monkeypatch.setattr(module, "parent_chunk_store", _Store("parent"))
+    monkeypatch.setattr(module, "document_page_store", _Store("page", 2))
+    monkeypatch.setattr(module, "table_store", _Store("table"))
+
+    module._process_delete_job("job-1", "demo.pdf")
+
+    assert ("parent", "demo.pdf") in calls
+    assert ("page", "demo.pdf") in calls
+    assert ("table", "demo.pdf") in calls
+    assert ("complete", "page_store") in calls
+
+
+def test_async_upload_writes_parent_pages_tables_and_vectors(monkeypatch):
+    module = _load_api_module()
+    calls = []
+
+    class _Jobs:
+        def update_step(self, _job_id, step, *_args, **_kwargs):
+            calls.append(("step", step))
+
+        def complete_step(self, _job_id, step, *_args, **_kwargs):
+            calls.append(("complete", step))
+
+        def complete_job(self, *_args, **_kwargs):
+            calls.append(("job", "completed"))
+
+        def fail_job(self, *_args, **_kwargs):
+            raise AssertionError("upload job unexpectedly failed")
+
+    bundle = {
+        "chunks": [
+            {"chunk_level": 1, "text": "parent"},
+            {"chunk_level": 3, "text": "leaf"},
+        ],
+        "pages": [{"page_id": "p1", "text": "page"}],
+        "tables": [{"table_id": "t1"}],
+    }
+    monkeypatch.setattr(module, "upload_job_manager", _Jobs())
+    monkeypatch.setattr(module, "loader", types.SimpleNamespace(load_document_bundle=lambda *_args: bundle))
+    monkeypatch.setattr(module, "milvus_manager", types.SimpleNamespace(
+        init_collection=lambda: calls.append(("milvus", "init")),
+        delete=lambda _expr: calls.append(("milvus", "delete")),
+    ))
+    monkeypatch.setattr(module, "_remove_bm25_stats_for_filename", lambda name: calls.append(("bm25", name)))
+    monkeypatch.setattr(module, "parent_chunk_store", types.SimpleNamespace(
+        delete_by_filename=lambda name: calls.append(("parent_delete", name)),
+        upsert_documents=lambda docs: calls.append(("parent_write", len(docs))),
+    ))
+    monkeypatch.setattr(module, "document_page_store", types.SimpleNamespace(
+        delete_by_filename=lambda name: calls.append(("page_delete", name)),
+        upsert_pages=lambda pages: calls.append(("page_write", len(pages))),
+    ))
+    monkeypatch.setattr(module, "table_store", types.SimpleNamespace(
+        delete_by_filename=lambda name: calls.append(("table_delete", name)),
+    ))
+    monkeypatch.setattr(module, "_prepare_table_evidence_docs", lambda *_args: (1, [{"text": "table"}]))
+    monkeypatch.setattr(module, "_write_table_evidence_docs_safe", lambda *_args: 1)
+
+    class _Writer:
+        def write_documents(self, docs, progress_callback=None):
+            calls.append(("vector_write", len(docs)))
+            if progress_callback:
+                progress_callback(len(docs), len(docs))
+
+    monkeypatch.setattr(module, "milvus_writer", _Writer())
+
+    module._process_upload_job("job-1", "demo.txt", "demo.txt")
+
+    assert ("parent_write", 1) in calls
+    assert ("page_write", 1) in calls
+    assert ("vector_write", 1) in calls
+    assert ("job", "completed") in calls

@@ -25,6 +25,7 @@ DELETE_STEPS = [
     ("bm25", "更新稀疏索引"),
     ("milvus", "删除向量库数据"),
     ("parent_store", "删除父块存储"),
+    ("page_store", "删除页面正文记录"),
     ("table_store", "删除结构化表格记录"),
 ]
 

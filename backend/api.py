@@ -597,13 +597,21 @@ def _process_delete_job(job_id: str, filename: str) -> None:
         parent_chunk_store.delete_by_filename(filename)
         delete_job_manager.complete_step(job_id, "parent_store", "父级分块已删除")
 
+        failed_step = "page_store"
+        delete_job_manager.update_step(job_id, "page_store", 20, "running", "正在删除 PostgreSQL 页面正文")
+        deleted_pages = document_page_store.delete_by_filename(filename)
+        delete_job_manager.complete_step(job_id, "page_store", f"页面正文记录已删除：{deleted_pages or 0} 条")
+
         failed_step = "table_store"
         delete_job_manager.update_step(job_id, "table_store", 20, "running", "正在删除结构化表格记录")
         deleted_tables = table_store.delete_by_filename(filename)
         delete_job_manager.complete_step(job_id, "table_store", f"结构化表格记录已删除：{deleted_tables} 条")
 
         # 完成摘要会由前端保留 3 秒，再自动从文档列表移除。
-        delete_job_manager.complete_job(job_id, f"已删除 {filename}，向量数据 {deleted_count} 条")
+        delete_job_manager.complete_job(
+            job_id,
+            f"已删除 {filename}，向量数据 {deleted_count} 条，页面记录 {deleted_pages or 0} 条",
+        )
     except Exception as e:
         delete_job_manager.fail_job(job_id, failed_step, str(e))
 

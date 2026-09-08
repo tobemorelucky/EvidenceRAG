@@ -92,6 +92,13 @@ def build_rag_trace_payload(
         "answer_thinking": rag_trace.get("answer_thinking"),
         "answer_max_tokens": rag_trace.get("answer_max_tokens"),
     })
+    for key in (
+        "prompt_router_enabled", "prompt_router_applied", "selected_prompt",
+        "router_reason", "router_version",
+    ):
+        value = policy.get(key, rag_trace.get(key))
+        if value is not None:
+            policy_payload[key] = value
     evidence_items = [
         {
             "id": item.get("id"), "filename": item.get("filename"),
@@ -219,11 +226,12 @@ class RagTraceService:
 
     @staticmethod
     def _serialize(row: RagTraceRecord) -> dict:
-        return {
+        policy = dict(row.policy_decision or {})
+        result = {
             "trace_id": row.trace_id, "conversation_id": row.conversation_id,
             "user_query": row.user_query,
             "conversation_understanding": dict(row.conversation_understanding or {}),
-            "policy_decision": dict(row.policy_decision or {}),
+            "policy_decision": policy,
             "standalone_query": row.standalone_query,
             "retrieval_executed": row.retrieval_executed,
             "retrieval_counts": {"dense": row.dense_count, "bm25": row.bm25_count, "rrf": row.rrf_count},
@@ -234,6 +242,13 @@ class RagTraceService:
             "latency_ms": dict(row.latency_ms or {}),
             "created_at": row.created_at.isoformat(),
         }
+        for key in (
+            "prompt_router_enabled", "prompt_router_applied", "selected_prompt",
+            "router_reason", "router_version",
+        ):
+            if key in policy:
+                result[key] = policy[key]
+        return result
 
 
 rag_trace_service = RagTraceService()
