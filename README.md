@@ -1,152 +1,182 @@
 # EvidenceRAG
 
-EvidenceRAG 是一个面向专业知识库的 RAG 工作台，强调答案可检索、可引用、可验证和可审计。当前重点场景是 FinanceBench 金融报告问答，同时保留 `general` profile。
+EvidenceRAG 是一个面向金融财报的可追溯 RAG 系统。它通过混合检索、重排序和证据引用回答问题，并提供会话管理、文档索引和检索轨迹查看能力。
 
-## 核心能力
+## 当前能力
 
-- 页面优先的 Dense + Milvus BM25 混合检索与 RRF 融合
-- 可选 rerank；失败时保留融合排序，不把服务异常伪装成空结果
-- `static`、受限 `agentic` 与自适应 `auto` 三种执行模式
-- 文件/页码引用、证据状态、路由原因、trace ID、使用量和延迟信息
-- PostgreSQL 会话与页面数据、Redis 缓存、Milvus 向量和稀疏索引
-- Vue 3 三栏工作台、证据检查器、批量文档上传与索引管理
+- BGE-M3 Dense 检索 + Milvus 原生 BM25 + RRF 融合
+- Jina Reranker 重排序，回答引用到真实文件和页码
+- DeepSeek-V4-Flash 生成答案，支持金融计算和跨期比较
+- Vue 3 单页工作台，支持流式回答、历史会话和证据检查器
+- 管理员可上传、索引、查看和删除知识库文档
+- PostgreSQL 持久化，Redis 缓存，Milvus 向量与稀疏索引
+- 完整本地测试、FinanceBench 离线评测及独立 shadow 实验
 
-## 架构
+## 默认金融链路
 
-后端职责分为：
+`finance` profile 使用 [`configs/production/finance_online_v2.json`](configs/production/finance_online_v2.json)：
 
-- `conversation_service.py`：会话持久化与缓存
-- `rag_orchestrator.py`：profile、执行模式、受限检索循环与 trace
-- `answer_generator.py`：只依据证据生成回答
-- `prompts.py`：版本化回答、路由、Agent、计算和摘要提示词
-- `agent_tools.py`：受限 `find`、`open_page` 与 Decimal 算术能力
+```text
+问题
+  → Query Rewrite（保留原问题，最多 2 个改写）
+  → Dense Top 240 + BM25 Top 240
+  → RRF Top 120
+  → Jina 输入 Top 80、输出 Top 12
+  → 28,000 字符证据上下文
+  → DeepSeek-V4-Flash 回答
+  → 文件与页码引用、运行 Trace
+```
 
-金融默认使用 `auto`。单一事实问题走静态通道；跨年份、比较、排名、计算或低证据覆盖问题进入受限深度模式。深度模式默认最多 3 轮检索和 5 次工具调用，连续两轮没有新证据后停止，不使用互联网或模型记忆补全。
+`auto` 模式只负责多轮对话理解与是否需要重新检索，不会覆盖金融 profile 的检索参数。Agent、Planner、结构化执行器和多数研究性模块默认关闭。
 
-## 环境与启动
+## 环境要求
 
-推荐使用项目约定的 conda 环境：
+- Windows / PowerShell
+- Python 3.12
+- Conda 环境 `rag`
+- Docker Desktop
+- 支持 CUDA 的 NVIDIA GPU（推荐，用于 BGE-M3 embedding）
+
+安装依赖：
 
 ```powershell
 conda activate rag
+python -m pip install -e .
+```
+
+## 配置
+
+复制环境变量模板：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+至少配置以下项目，不要把真实密钥提交到 Git：
+
+```dotenv
+ARK_API_KEY=your_ark_key
+BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+MODEL=deepseek-v4-flash-ga-260731
+
+RERANK_API_KEY=your_jina_key
+RERANK_BINDING_HOST=https://api.jina.ai/v1/rerank
+RERANK_MODEL=jina-reranker-v3
+
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DEVICE=cuda
+RAG_PROFILE=finance
+RAG_EXECUTION_MODE=auto
+```
+
+可选功能：
+
+```dotenv
+# 多轮 Conversation API；两个开关必须同时开启
+ENABLE_CONVERSATION_MEMORY=true
+USE_CONVERSATION_API=true
+
+# 对计算、比例、比较和趋势问题选择 Evidence Focus prompt
+FINANCE_EVIDENCE_FOCUS_ROUTER_ENABLED=true
+
+# 生产环境必须修改
+JWT_SECRET_KEY=replace-with-a-random-secret
+ADMIN_INVITE_CODE=replace-with-an-admin-invite-code
+```
+
+项目没有硬编码默认账号。首次打开页面时注册普通用户；注册管理员需要 `.env` 中的 `ADMIN_INVITE_CODE`。
+
+## 启动
+
+启动 PostgreSQL、Redis、Milvus、MinIO 和 Attu：
+
+```powershell
 docker compose up -d
+docker compose ps
+```
+
+启动后端和前端静态页面：
+
+```powershell
+conda activate rag
 python backend/app.py
 ```
 
-浏览器访问 `http://127.0.0.1:8000`，OpenAPI 文档位于 `http://127.0.0.1:8000/docs`。
+访问：
 
-复制 `.env.example` 为 `.env`，至少配置模型、embedding 与数据库连接信息。关键运行参数：
+- 工作台：<http://127.0.0.1:8000>
+- OpenAPI：<http://127.0.0.1:8000/docs>
+- Attu：<http://127.0.0.1:8084>
 
-```dotenv
-RAG_PROFILE=finance
-RAG_EXECUTION_MODE=auto
-FINANCE_POLICY_ENABLED=false
-RAG_AGENT_MAX_ROUNDS=3
-RAG_AGENT_MAX_TOOL_CALLS=5
-MILVUS_SPARSE_MODE=milvus_bm25
-FINANCE_RAG_CANDIDATE_K=40
-FINANCE_RAG_FINAL_TOP_K=5
-ANSWER_TEMPERATURE=0.1
-```
+如果端口 `8000` 被占用，请先关闭旧的 Python/Uvicorn 进程，或在 `.env` 中设置其他 `PORT`。
 
-项目固定 `transformers>=4.49,<5`，以避免本地 BGE-M3 与 Transformers 5 的兼容问题。新金融集合使用 Milvus analyzer/BM25，不再依赖应用侧可变词表文件。
+## 金融数据索引
 
-### Financial Task Policy Layer
+FinanceBench 数据位于 [`data/financebench_top40_100_langsmith_with_evidence.csv`](data/financebench_top40_100_langsmith_with_evidence.csv)，对应 PDF 位于 `data/documents/`。
 
-金融任务策略层可在回答生成前，根据已有的 `task_type` 加载 `calculation`、`comparison`、`lookup`、`selection` 或 `judgment` 通用处理规范。策略来自 `configs/finance_policies/`，只描述证据处理步骤，不包含具体公司、指标、数据集答案，也不作为事实来源。
-
-- 默认 `FINANCE_POLICY_ENABLED=false`，关闭时继续使用原有 v14 回答模板。当前 dev20 A/B 未证明 Policy 能提高准确率，因此正式 holdout 仍建议保持关闭；该功能保留为实验开关。
-- 开启后仅增加一次带缓存的本地配置读取；不会新增 LLM 调用、检索、重排或 Agent 循环。
-- trace 会记录 `task_type`、`policy`、策略字符数、估算 token、缓存命中和本地加载耗时。
-- 本地 FinanceBench 评测使用 `--finance-policy` 开启，使用 `--no-finance-policy` 或省略参数关闭，便于执行同样本 A/B。
-
-示例：
-
-```powershell
-conda run --no-capture-output -n rag python -u scripts/run_financebench_local_experiment.py --split dev --limit 10 --finance-policy --experiment-prefix evidencerag-finance-policy-smoke
-```
-
-FinanceBench 评测默认使用本地 CSV、JSONL 和独立 Judge，不访问 LangSmith。`.env` 中的 `FINANCEBENCH_EVALUATION_BACKEND=local`、`LANGSMITH_TRACING=false` 会同时关闭实验上传和应用 tracing。本地入口为 `scripts/run_financebench_local_experiment.py`，完成后会自动调用 `scripts/judge_financebench_local_answers.py`。旧 LangSmith 入口仅作为以后恢复服务时的兼容代码保留。
-
-### 显式公式求解 Skill
-
-`clean_baseline_formula_skill` 是建立在冻结 `clean_baseline` 上的独立实验 profile。它只在问题明确出现 `defined as`、`define ... as`、`calculated as` 或 `formula is` 且表达式可安全解析时触发；不内置 quick ratio、ROA 等标准指标公式。技能最多进行 4 次确定性操作数检索，严格校验公司、期间、报表类型、币种、scale、scope 和唯一性，再使用受限 Decimal AST 计算。成功时直接返回带引用的确定性答案；失败时原 Evidence、clean prompt 和普通回答路径不变。
-
-自动识别并运行显式公式固定回归集：
-
-```powershell
-conda run --no-capture-output -n rag python -u scripts/run_financebench_explicit_formula_skill.py
-```
-
-显式指定 `--split all` 可运行完整 100 题。该 profile 不启用 Formula Advisory、Query Planner、Agent、EvidenceFrame 或标准金融公式库。实现与实验结论见 [`docs/explicit_formula_skill_v1.md`](docs/explicit_formula_skill_v1.md)。
-
-## 重建 40 份金融文档索引
-
-测试集为 [`data/financebench_top40_100_langsmith_with_evidence.csv`](data/financebench_top40_100_langsmith_with_evidence.csv)，其中恰好引用 40 份 PDF。先执行只读校验：
+先只读检查待重建内容：
 
 ```powershell
 conda run -n rag python scripts/rebuild_financebench_index.py
 ```
 
-确认输出的集合与 40 个文件正确后执行重建：
+确认后重建 40 份金融文档索引：
 
 ```powershell
-conda run -n rag python scripts/rebuild_financebench_index.py --execute
+conda run --no-capture-output -n rag python scripts/rebuild_financebench_index.py --execute
 ```
 
-`--execute` 会替换当前 `MILVUS_COLLECTION`，并清理 PostgreSQL 中的派生页面、父块与表格记录；不会删除 `data/documents` 中的 PDF，也不会改写历史会话。单文件导入失败时会补偿清理该文件已经写入的索引。
+`--execute` 会替换金融索引和相关派生数据，但不会删除原始 PDF 或历史会话。
 
-## API 兼容
+## 常用接口
 
-原有 `/chat`、`/chat/stream`、会话与文档管理路径保持不变。`ChatRequest` 可选传入：
-
-```json
-{
-  "message": "比较 3M 2021 与 2022 年净销售额，并计算变化率。",
-  "session_id": "finance-review",
-  "profile": "finance",
-  "execution_mode": "auto"
-}
-```
-
-同步响应新增 `execution_mode`、`route_reason`、`citations`、`evidence_status`、`calculation`、`trace_id` 和 `usage`。流式接口统一输出 `status`、`content`、`citation`、`trace`、`error`、`done`；前端仍兼容旧 `rag_step` 事件。
-
-管理员可调用 `/debug/retrieval` 查看文档、页面、chunk 命中、RRF/rerank 信息、延迟与失败原因。普通界面只展示运行阶段摘要，不展示模型思维链。
+| 功能 | 接口 |
+| --- | --- |
+| 注册 / 登录 | `POST /auth/register`、`POST /auth/login` |
+| 兼容问答 | `POST /chat`、`POST /chat/stream` |
+| 多轮会话 | `POST /conversation/create`、`POST /conversation/chat/stream` |
+| 会话历史 | `GET /conversation`、`GET /conversation/{id}/messages` |
+| 检索轨迹 | `GET /conversation/{id}/trace` |
+| 文档管理 | `GET /documents`、`POST /documents/upload/async`、`DELETE /documents/delete/async/{filename}` |
+| 检索诊断 | `POST /debug/retrieval` |
 
 ## 测试与评测
 
-运行仓库测试：
+运行测试：
 
 ```powershell
-conda run -n rag python -m pytest tests -q
+conda run --no-capture-output -n rag python -m pytest tests -q
+node --test tests/frontend_api_adapter.test.js
 ```
 
-当前 FinanceBench 100 题已经被多次查看，统一作为 `fixed_seen_regression`，历史 20/80 划分只用于与 v14/v7 按 ID 对齐，不再称为未见 holdout，也不以分数上涨直接证明泛化能力。新功能应先通过结构化单元测试和 Oracle 诊断，再运行完整 100 题。
+最终 FinanceBench 100 题脚本按阶段运行，支持断点恢复：
 
-结构化金融链路默认关闭，可分别回退：
-
-```dotenv
-EVIDENCE_FRAME_ENABLED=false
-STRUCTURED_EXECUTOR_ENABLED=false
-STRUCTURED_COVERAGE_ENABLED=false
-FRAME_ALIGNMENT_ENABLED=false
-STRUCTURED_COVERAGE_ADVISORY_ENABLED=true
-STRUCTURED_TASK_EXECUTOR_ENABLED=false
-ANSWER_CONSISTENCY_VALIDATOR_ENABLED=false
-RAG_PROTECTED_EVIDENCE_SLOTS_ENABLED=false
-STAGE_AWARE_COVERAGE_ENABLED=false
-PROTECTED_PAGE_SLOTS_ENABLED=false
-NUMERIC_DISPLAY_VALIDATOR_ENABLED=false
-ANSWER_REQUIRED_FACETS_ENABLED=false
-EXPLICIT_FORMULA_ADVISORY_ENABLED=false
-SUPPLEMENTAL_FIND_ENABLED=false
+```powershell
+conda run --no-capture-output -n rag python scripts/run_final_financebench100.py --stage recall
+conda run --no-capture-output -n rag python scripts/run_final_financebench100.py --stage rerank
+conda run --no-capture-output -n rag python scripts/run_final_financebench100.py --stage answer
+conda run --no-capture-output -n rag python scripts/run_final_financebench100.py --stage judge
+conda run --no-capture-output -n rag python scripts/run_final_financebench100.py --stage report
 ```
 
-启用后流程仍保留现有 Dense/BM25、RRF、Jina 和页面选择。结构化 coverage 默认只作 advisory；高置信 executor 结果可由本地一致性校验器验证，protected slots 只重分配现有页面/压缩预算。显式公式 advisory 只读取问题明确给出的公式和操作数，不改变检索改写或 executor；一次性补搜仅在目标文档已确定且真实 QuerySpec requirement 缺失时触发。正式运行及 v14/Oracle 对比命令见 [`docs/financebench_fixed_regression_protocol.md`](docs/financebench_fixed_regression_protocol.md)。
+最终结果和逐题报告位于 `reports/final100/`。LangSmith 当前默认关闭，评测结果保存在本地。
 
-## 数据与迁移说明
+## 目录
 
-- Docker volume 路径保持 `volumes/postgres`、`volumes/redis`、`volumes/milvus` 不变。
-- 容器名和默认 Redis key 前缀已改为 `evidencerag-*` / `evidencerag`；Redis 仅发生缓存冷启动。
-- 不自动删除或改写用户历史消息。
-- 不默认启用多 Agent、GraphRAG、RL 或 SFT；这些方向应在检索基线和高质量工具轨迹稳定后再单独评估。
+```text
+backend/                 API、检索、回答、会话与存储
+frontend/                Vue 3 工作台
+configs/production/      当前线上金融配置
+configs/experiments/     可复现实验配置
+data/                    FinanceBench 数据和原始文档
+scripts/                 索引、评测、审计和报告工具
+tests/                   后端与前端兼容测试
+docs/                    架构、实验和审计文档
+reports/                 本地实验结果（通常不提交）
+```
+
+## 安全说明
+
+- 回答仅供信息检索与分析，不构成投资建议。
+- 重要结论应通过回答中的文件和页码回查原始财报。
+- `.env`、API Key、数据库密码和本地模型缓存不应提交到仓库。
