@@ -1859,16 +1859,26 @@ def _rerank_candidate_hash(doc: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _build_rerank_cache_key(query: str, model: str, docs: List[dict], top_n: int) -> str:
+def _build_rerank_cache_key(
+    query: str,
+    model: str,
+    docs: List[dict],
+    top_n: int,
+    *,
+    input_k: int,
+    input_max_chars: int,
+) -> str:
     identity = {
-        "version": 1,
+        "version": 2,
         "query": str(query or "").strip(),
-        "model": str(model or "").strip(),
-        "top_n": int(top_n),
+        "jina_model": str(model or "").strip(),
+        "jina_input_k": int(input_k),
+        "jina_output_k": int(top_n),
+        "jina_input_max_chars": int(input_max_chars),
         "candidate_hashes": [_rerank_candidate_hash(doc) for doc in docs],
     }
     encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return f"rerank:v1:{hashlib.sha256(encoded).hexdigest()}"
+    return f"rerank:v2:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _validate_remote_rerank_results(payload: Any, candidate_count: int, expected_count: int) -> List[dict]:
@@ -1904,6 +1914,8 @@ def _sync_rerank_trace(meta: Dict[str, Any]) -> None:
         "fallback_used": bool(meta.get("rerank_fallback_used")),
         "fallback_reason": str(meta.get("rerank_fallback_reason") or ""),
         "rerank_cache_hit": bool(meta.get("rerank_cache_hit")),
+        "status": str(meta.get("rerank_status") or ""),
+        "input_max_chars": int(meta.get("jina_input_max_chars") or 0),
     }
 
 
@@ -1989,7 +2001,7 @@ def _rerank_documents(
     allow_local_fallback: bool = True,
 ) -> Tuple[List[dict], Dict[str, Any]]:
     remote_candidate_k = max(1, remote_candidate_k or RERANK_REMOTE_CANDIDATE_K)
-    remote_max_chars = max(256, remote_max_chars or RERANK_REMOTE_MAX_CHARS)
+    remote_max_chars = RERANK_REMOTE_MAX_CHARS if remote_max_chars is None else max(0, int(remote_max_chars))
     docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
     meta: Dict[str, Any] = {
         "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
@@ -2009,12 +2021,17 @@ def _rerank_documents(
         "rerank_fallback_used": False,
         "rerank_fallback_reason": "",
         "rerank_provider": "none",
+        "rerank_status": "pending" if bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST) else "failed",
+        "jina_input_max_chars": remote_max_chars,
         "local_rerank_enabled": _local_reranker.enabled,
         "local_rerank_applied": False,
         "local_rerank_error": None,
     }
     _sync_rerank_trace(meta)
     if not docs_with_rank:
+        meta["rerank_status"] = "failed"
+        meta["rerank_error"] = "no_rerank_candidates"
+        _sync_rerank_trace(meta)
         return docs_with_rank[:top_k], meta
     if meta["rerank_enabled"]:
         anchor_docs = []
@@ -2052,7 +2069,12 @@ def _rerank_documents(
             or doc.get("matched_required_fields")
             or doc.get("selection_scope_anchor")
         )
-        remote_texts = [str(doc.get("text", "") or "")[:remote_max_chars] for doc in remote_docs]
+        remote_texts = [
+            str(doc.get("text", "") or "")
+            if remote_max_chars == 0
+            else str(doc.get("text", "") or "")[:remote_max_chars]
+            for doc in remote_docs
+        ]
         meta["remote_rerank_candidate_count"] = len(remote_docs)
         meta["remote_rerank_input_chars"] = sum(len(text) for text in remote_texts)
         payload = {
@@ -2064,7 +2086,14 @@ def _rerank_documents(
         }
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {RERANK_API_KEY}"}
         expected_count = int(payload["top_n"])
-        cache_key = _build_rerank_cache_key(query, str(RERANK_MODEL), remote_docs, expected_count)
+        cache_key = _build_rerank_cache_key(
+            query,
+            str(RERANK_MODEL),
+            remote_docs,
+            expected_count,
+            input_k=len(remote_docs),
+            input_max_chars=remote_max_chars,
+        )
         cached_items = cache.get_json(cache_key) if RERANK_CACHE_ENABLED else None
         if cached_items is not None:
             try:
@@ -2077,6 +2106,7 @@ def _rerank_documents(
                 meta["remote_success"] = True
                 meta["rerank_applied"] = True
                 meta["rerank_provider"] = "remote_cache"
+                meta["rerank_status"] = "success"
                 _sync_rerank_trace(meta)
                 return _remote_rerank_from_items(remote_docs, items, top_k), meta
             except (KeyError, ValueError, TypeError) as exc:
@@ -2117,6 +2147,7 @@ def _rerank_documents(
                 meta["remote_success"] = True
                 meta["rerank_applied"] = True
                 meta["rerank_provider"] = "remote"
+                meta["rerank_status"] = "success"
                 meta["rerank_error"] = None
                 _sync_rerank_trace(meta)
                 return _remote_rerank_from_items(remote_docs, items, top_k), meta
@@ -2138,6 +2169,7 @@ def _rerank_documents(
                 meta["rerank_model"] = str(_local_reranker.model_path)
                 meta["rerank_endpoint"] = "local_cross_encoder"
                 meta["rerank_provider"] = "local_fallback" if meta["rerank_error"] else "local"
+                meta["rerank_status"] = "degraded"
                 if meta["rerank_error"]:
                     meta["rerank_fallback_used"] = True
                     meta["rerank_fallback_reason"] = str(meta["rerank_error"])
@@ -2146,6 +2178,7 @@ def _rerank_documents(
             meta["local_rerank_error"] = "empty_rerank_results"
         except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError) as exc:
             meta["local_rerank_error"] = str(exc)
+    meta["rerank_status"] = "failed"
     _sync_rerank_trace(meta)
     return docs_with_rank[:top_k], meta
 
@@ -3705,6 +3738,7 @@ def rerank_profile_candidates(
     *,
     input_k: int,
     output_k: int,
+    input_max_chars: int = 0,
 ) -> Dict[str, Any]:
     """Apply the existing reranker once with explicit profile depths."""
     docs, meta = _rerank_documents(
@@ -3712,6 +3746,7 @@ def rerank_profile_candidates(
         docs=list(candidate_docs),
         top_k=max(1, output_k),
         remote_candidate_k=max(1, input_k),
+        remote_max_chars=max(0, int(input_max_chars)),
         allow_local_fallback=False,
     )
     return {"docs": docs, "meta": meta}

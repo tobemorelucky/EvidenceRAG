@@ -28,8 +28,13 @@ FINANCEBENCH_REFERENCE = {
     "rrf_top_k": 120,
     "jina_input_k": 80,
     "jina_output_k": 12,
+    "jina_input_max_chars": 0,
     "max_context_chars": 28000,
     "answer_prompt_mode": "baseline",
+    "answer_prompt_name": "clean_baseline_v1",
+    "answer_temperature": 0.1,
+    "answer_thinking": "disabled",
+    "answer_max_tokens": 1024,
 }
 
 
@@ -95,11 +100,17 @@ def analyze_trace(trace: dict) -> dict:
             "model": rerank.get("model"),
             "input_k": _number(rerank.get("input_k") or rerank.get("candidate_k")),
             "output_k": _number(rerank.get("output_k") or rerank.get("final_top_k")),
+            "input_max_chars": _number(rerank.get("input_max_chars")),
+            "status": rerank.get("status"),
         },
         "context_budget": _number(policy.get("context_budget") or rerank.get("context_budget")),
+        "before_memory_context_chars": _number(policy.get("before_memory_context_chars")),
+        "after_memory_context_chars": _number(policy.get("after_memory_context_chars")),
         "final_evidence_pages": pages,
         "answer_model": trace.get("answer_model"),
         "answer_prompt_mode": policy.get("answer_prompt_mode") or "unknown (legacy trace)",
+        "answer_prompt_name": policy.get("answer_prompt_name") or "unknown (legacy trace)",
+        "answer_config": dict(policy.get("answer_config") or {}),
         "token_usage": trace.get("token_usage") or {},
         "latency_ms": trace.get("latency_ms") or {},
         "financebench_reference": FINANCEBENCH_REFERENCE,
@@ -107,9 +118,9 @@ def analyze_trace(trace: dict) -> dict:
     differences = []
     if profile != "finance":
         differences.append("线上 trace 未能确认 finance profile。")
-    if result["profile_config"] != "finance_online_v1":
+    if result["profile_config"] != "finance_online_v2":
         differences.append(
-            f"profile_config={result['profile_config'] or 'unknown'}，目标为 finance_online_v1。"
+            f"profile_config={result['profile_config'] or 'unknown'}，目标为 finance_online_v2。"
         )
     if not result["query_rewrite_executed"]:
         differences.append("线上未执行 Query Rewrite；最终 FinanceBench 链路会保留原查询并生成 rewrite。")
@@ -125,10 +136,24 @@ def analyze_trace(trace: dict) -> dict:
         differences.append(
             f"线上 Jina 深度为 {result['jina']['input_k']}→{result['jina']['output_k']}，FinanceBench 为 80→12。"
         )
+    if result["jina"]["input_max_chars"] != 0:
+        differences.append(
+            f"Jina input_max_chars={result['jina']['input_max_chars']}，目标为0（完整chunk）。"
+        )
     if result["context_budget"] != 28000:
         differences.append(
             f"context_budget={result['context_budget'] if result['context_budget'] is not None else 'unknown'}，目标为 28000。"
         )
+    if result["retrieval_executed"] and result["after_memory_context_chars"] != result["before_memory_context_chars"]:
+        differences.append("当前检索证据在Memory阶段被裁剪。")
+    if result["answer_prompt_name"] != "clean_baseline_v1":
+        differences.append(
+            f"answer_prompt_name={result['answer_prompt_name']}，目标为 clean_baseline_v1。"
+        )
+    expected_answer = {"temperature": 0.1, "thinking": "disabled", "max_tokens": 1024}
+    for key, expected in expected_answer.items():
+        if result["answer_config"].get(key) != expected:
+            differences.append(f"answer_config.{key}={result['answer_config'].get(key)}，目标为 {expected}。")
     result["pipeline_differences"] = differences
     result["matches_financebench_pipeline"] = not differences
     return result
@@ -157,8 +182,11 @@ def render_markdown(result: dict) -> str:
         f"- Retrieval TopK: `{json.dumps(result['retrieval_depth'], ensure_ascii=False)}`",
         f"- Jina: `{json.dumps(result['jina'], ensure_ascii=False)}`",
         f"- Context budget: `{result.get('context_budget')}` chars",
+        f"- Memory evidence chars: `{result.get('before_memory_context_chars')}` → `{result.get('after_memory_context_chars')}`",
         f"- Answer model: `{result.get('answer_model') or 'unknown'}`",
         f"- Answer prompt mode: `{result['answer_prompt_mode']}`",
+        f"- Answer prompt name: `{result['answer_prompt_name']}`",
+        f"- Answer config: `{json.dumps(result['answer_config'], ensure_ascii=False)}`",
         f"- Token: `{json.dumps(result['token_usage'], ensure_ascii=False)}`",
         f"- Latency ms: `{json.dumps(result['latency_ms'], ensure_ascii=False)}`",
         "",

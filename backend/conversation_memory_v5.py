@@ -16,15 +16,29 @@ try:
     from backend.memory.memory_update import MemoryUpdateService
     from backend.memory.token_budget_manager import TokenBudgetManager
     from backend.rag_trace_service import RagTraceService, build_rag_trace_payload
+    from backend.finance_online_profile import load_finance_online_profile
 except ModuleNotFoundError:
     from conversation_understanding_v3 import understand_conversation_v3
     from memory.conversation_policy import build_conversation_policy
     from memory.memory_update import MemoryUpdateService
     from memory.token_budget_manager import TokenBudgetManager
     from rag_trace_service import RagTraceService, build_rag_trace_payload
+    from finance_online_profile import load_finance_online_profile
 
 
 logger = logging.getLogger(__name__)
+
+
+def _evidence_char_budget(profile: str | None) -> int | None:
+    if str(profile or "").strip().lower() != "finance":
+        return None
+    return int(load_finance_online_profile()["context"]["max_chars"])
+
+
+def _answer_model_name(profile: str | None) -> str:
+    if str(profile or "").strip().lower() == "finance":
+        return str(load_finance_online_profile()["answer"]["model"])
+    return os.getenv("MODEL", "")
 
 
 def conversation_memory_v5_enabled() -> bool:
@@ -132,6 +146,7 @@ class ConversationMemoryV5Service:
             messages,
             summary=str((latest_summary or {}).get("summary") or ""),
             evidence=evidence,
+            evidence_char_budget=_evidence_char_budget(profile),
         )
         history = self._history(budgeted["messages"], budgeted["summary"])
 
@@ -149,7 +164,11 @@ class ConversationMemoryV5Service:
             "profile": profile or os.getenv("RAG_PROFILE", ""),
             "execution_mode": execution_mode or "static",
             "answer_prompt_mode": "baseline",
-            "evidence_status": "sufficient" if citations else "limited",
+            "answer_model": _answer_model_name(profile),
+            "evidence_status": (
+                "reused" if evidence_source == "previous"
+                else ("sufficient" if citations else "limited")
+            ),
             "conversation_understanding": decision.to_dict(),
             "conversation_understanding_trace": understanding_trace,
             "policy_decision": policy.to_dict(),
@@ -166,6 +185,8 @@ class ConversationMemoryV5Service:
                 "final_chars": len(budgeted["evidence"]),
                 "truncated": budgeted["evidence_truncated"],
             },
+            "before_memory_context_chars": len(evidence),
+            "after_memory_context_chars": len(budgeted["evidence"]),
             "memory": {"state": state_trace, "evidence_cache": evidence_cache_trace},
             "latency_ms": {
                 "understanding": understanding_ms,
@@ -178,7 +199,9 @@ class ConversationMemoryV5Service:
             key: (rag_result.get("rag_trace") or {}).get(key)
             for key in (
                 "profile_config", "query_rewrite_enabled", "dense_top_k", "bm25_top_k",
-                "rrf_top_k", "jina_input_k", "jina_output_k", "context_budget",
+                "rrf_top_k", "jina_input_k", "jina_output_k", "jina_input_max_chars", "context_budget",
+                "answer_prompt_name", "retrieval_config", "jina_config", "prompt_config", "answer_config",
+                "answer_temperature", "answer_thinking", "answer_max_tokens", "rerank_status",
             )
             if (rag_result.get("rag_trace") or {}).get(key) is not None
         }
@@ -191,10 +214,14 @@ class ConversationMemoryV5Service:
             conversation_id=conversation_id,
             user_query=message,
             decision=decision.to_dict(),
-            policy=policy.to_dict(),
+            policy={
+                **policy.to_dict(),
+                "before_memory_context_chars": len(evidence),
+                "after_memory_context_chars": len(budgeted["evidence"]),
+            },
             rag_result=trace_source_result,
             citations=citations,
-            answer_model=os.getenv("MODEL", ""),
+            answer_model=_answer_model_name(profile),
             understanding_usage=dict(understanding_trace.get("usage") or {}),
             answer_usage=usage,
             latency_ms=trace["latency_ms"],
@@ -228,10 +255,13 @@ class ConversationMemoryV5Service:
             user_id, conversation_id, "assistant", answer,
             evidence_refs=evidence_refs, trace=trace,
         )
+        active_rag_trace = rag_result.get("rag_trace") or (
+            evidence_state.get("rag_trace") if policy.reuse_previous_evidence else None
+        )
         self.memory.save_evidence_state(
             user_id,
             conversation_id,
-            {"evidence": budgeted["evidence"], "citations": citations, "rag_trace": rag_result.get("rag_trace")},
+            {"evidence": budgeted["evidence"], "citations": citations, "rag_trace": active_rag_trace},
         )
         return {
             "conversation_id": conversation_id,
@@ -320,6 +350,7 @@ class ConversationMemoryV5Service:
             messages,
             summary=str((latest_summary or {}).get("summary") or ""),
             evidence=evidence,
+            evidence_char_budget=_evidence_char_budget(profile),
         )
         history = self._history(budgeted["messages"], budgeted["summary"])
         citations = list(rag_result.get("citations") or evidence_state.get("citations") or [])
@@ -348,7 +379,11 @@ class ConversationMemoryV5Service:
             "profile": profile or os.getenv("RAG_PROFILE", ""),
             "execution_mode": execution_mode or "static",
             "answer_prompt_mode": "baseline",
-            "evidence_status": "sufficient" if citations else "limited",
+            "answer_model": _answer_model_name(profile),
+            "evidence_status": (
+                "reused" if evidence_source == "previous"
+                else ("sufficient" if citations else "limited")
+            ),
             "conversation_understanding": decision.to_dict(),
             "conversation_understanding_trace": understanding_trace,
             "policy_decision": policy.to_dict(),
@@ -365,6 +400,8 @@ class ConversationMemoryV5Service:
                 "final_chars": len(budgeted["evidence"]),
                 "truncated": budgeted["evidence_truncated"],
             },
+            "before_memory_context_chars": len(evidence),
+            "after_memory_context_chars": len(budgeted["evidence"]),
             "memory": {"state": state_trace, "evidence_cache": evidence_cache_trace},
             "latency_ms": {
                 "understanding": understanding_ms,
@@ -377,7 +414,9 @@ class ConversationMemoryV5Service:
             key: (rag_result.get("rag_trace") or {}).get(key)
             for key in (
                 "profile_config", "query_rewrite_enabled", "dense_top_k", "bm25_top_k",
-                "rrf_top_k", "jina_input_k", "jina_output_k", "context_budget",
+                "rrf_top_k", "jina_input_k", "jina_output_k", "jina_input_max_chars", "context_budget",
+                "answer_prompt_name", "retrieval_config", "jina_config", "prompt_config", "answer_config",
+                "answer_temperature", "answer_thinking", "answer_max_tokens", "rerank_status",
             )
             if (rag_result.get("rag_trace") or {}).get(key) is not None
         }
@@ -390,10 +429,14 @@ class ConversationMemoryV5Service:
             conversation_id=conversation_id,
             user_query=message,
             decision=decision.to_dict(),
-            policy=policy.to_dict(),
+            policy={
+                **policy.to_dict(),
+                "before_memory_context_chars": len(evidence),
+                "after_memory_context_chars": len(budgeted["evidence"]),
+            },
             rag_result=trace_source_result,
             citations=citations,
-            answer_model=os.getenv("MODEL", ""),
+            answer_model=_answer_model_name(profile),
             understanding_usage=dict(understanding_trace.get("usage") or {}),
             answer_usage=usage,
             latency_ms=trace["latency_ms"],
@@ -419,11 +462,14 @@ class ConversationMemoryV5Service:
             evidence_refs=evidence_refs,
             trace=trace,
         )
+        active_rag_trace = rag_result.get("rag_trace") or (
+            evidence_state.get("rag_trace") if policy.reuse_previous_evidence else None
+        )
         await asyncio.to_thread(
             self.memory.save_evidence_state,
             user_id,
             conversation_id,
-            {"evidence": budgeted["evidence"], "citations": citations, "rag_trace": rag_result.get("rag_trace")},
+            {"evidence": budgeted["evidence"], "citations": citations, "rag_trace": active_rag_trace},
         )
         yield {"type": "trace", "rag_trace": trace, "citations": citations}
         yield {

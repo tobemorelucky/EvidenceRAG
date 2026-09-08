@@ -46,6 +46,38 @@ def test_comparison_period_change_is_a_condition_modification():
     assert policy.retrieval and policy.rewrite and not policy.reuse_previous_evidence
 
 
+def test_condition_change_with_citation_request_still_retrieves():
+    observed = decision(
+        need_retrieval=True,
+        depends_on_history=True,
+        query_resolution_needed=True,
+        standalone_query="Calculate Adobe FY2017 operating cash flow ratio and cite the filing pages",
+    )
+    policy = build_conversation_policy(
+        "把财年改为 FY2017，仍使用同一公式重新计算，并引用文件和页码。",
+        observed,
+        has_previous_evidence=True,
+    )
+    assert policy.retrieval and policy.rewrite and not policy.reuse_previous_evidence
+    assert policy.response_mode == "answer_with_modified_conditions"
+
+
+def test_resolved_metric_change_with_citation_request_retrieves():
+    observed = decision(
+        need_retrieval=True,
+        depends_on_history=True,
+        query_resolution_needed=True,
+        standalone_query="Calculate Adobe FY2021 and FY2022 operating margins and cite the filing pages",
+    )
+    policy = build_conversation_policy(
+        "Now calculate operating margin for FY2021 and FY2022 and cite the source pages.",
+        observed,
+        has_previous_evidence=True,
+    )
+    assert policy.retrieval and policy.rewrite and not policy.reuse_previous_evidence
+    assert policy.policy_reason == "resolved_followup_requires_fresh_retrieval"
+
+
 def test_independent_question_retrieves_even_if_model_need_retrieval_is_false():
     observed = decision(depends_on_history=False, query_resolution_needed=False, required_memory_scope="none", need_retrieval=False, standalone_query="New finance question")
     policy = build_conversation_policy("What was revenue in FY2023?", observed, has_previous_evidence=True)

@@ -199,3 +199,17 @@ def test_20_token_budget_preserves_recent_messages_and_bounds_context():
     )
     assert result["messages"][-1]["content"] == "newest"
     assert result["estimated_tokens"] <= 20 and result["evidence_truncated"]
+
+
+def test_21_explicit_evidence_budget_is_independent_of_history_and_summary():
+    manager = TokenBudgetManager(MemoryBudget(max_tokens=20, message_tokens=8, summary_tokens=2))
+    evidence = "e" * 100
+    result = manager.build_context(
+        [{"role": "user", "content": "history" * 20}],
+        summary="summary" * 20,
+        evidence=evidence,
+        evidence_char_budget=100,
+    )
+    assert result["evidence"] == evidence
+    assert result["evidence_char_budget"] == 100
+    assert not result["evidence_truncated"]

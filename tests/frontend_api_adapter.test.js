@@ -103,3 +103,18 @@ test('observability trace maps to the existing evidence inspector model', () => 
     assert.equal(trace.final_top_k, 12);
     assert.equal(adapter.citationsFromTrace(trace)[0].filename, 'report.pdf');
 });
+
+test('reused conversation evidence is not labeled as a fresh retrieval', () => {
+    const adapter = new EvidenceRagApiAdapter({
+        authFetch: async () => response({}),
+        fetchImpl: async () => response({ use_conversation_api: true })
+    });
+    const trace = adapter.normalizeTrace({
+        trace_id: 'trace-reused',
+        retrieval_executed: false,
+        retrieval_counts: { rrf: 0 },
+        policy_decision: { reuse_previous_evidence: true },
+        evidence_items: [{ id: 'e1', filename: 'report.pdf', page_number: 4 }]
+    });
+    assert.equal(trace.evidence_status, 'reused');
+});

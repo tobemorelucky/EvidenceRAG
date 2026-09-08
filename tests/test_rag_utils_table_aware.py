@@ -178,6 +178,30 @@ def test_remote_rerank_retries_invalid_response_then_succeeds(monkeypatch):
     assert meta["rerank_trace"]["fallback_used"] is False
 
 
+def test_finance_rerank_zero_max_chars_sends_complete_chunk(monkeypatch):
+    module = _install_rag_utils_stubs()
+    _configure_remote_rerank(module, monkeypatch)
+    long_text = "prefix-" + ("x" * 2400) + "-required-tail"
+    captured = {}
+
+    def respond(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return _RerankResponse(payload={"results": [{"index": 0, "relevance_score": 0.9}]})
+
+    monkeypatch.setattr(module.requests, "post", respond)
+    _, meta = module._rerank_documents(
+        "question",
+        [{"chunk_id": "a", "filename": "report.pdf", "page_number": 1, "text": long_text}],
+        top_k=1,
+        remote_candidate_k=1,
+        remote_max_chars=0,
+        allow_local_fallback=False,
+    )
+    assert captured["documents"] == [long_text]
+    assert meta["jina_input_max_chars"] == 0
+    assert meta["rerank_status"] == "success"
+
+
 def test_remote_rerank_falls_back_locally_only_after_two_failures(monkeypatch):
     module = _install_rag_utils_stubs()
     _configure_remote_rerank(module, monkeypatch)
@@ -247,9 +271,23 @@ def test_remote_rerank_cache_uses_ordered_candidate_identity(monkeypatch):
     assert meta["rerank_provider"] == "remote_cache"
     assert meta["rerank_cache_hit"] is True
     assert meta["remote_attempt_count"] == 0
-    assert module._build_rerank_cache_key("question", "model", docs, 2) != module._build_rerank_cache_key(
-        "question", "model", list(reversed(docs)), 2
+    assert module._build_rerank_cache_key(
+        "question", "model", docs, 2, input_k=2, input_max_chars=0,
+    ) != module._build_rerank_cache_key(
+        "question", "model", list(reversed(docs)), 2, input_k=2, input_max_chars=0,
     )
+
+
+def test_remote_rerank_cache_separates_full_and_truncated_inputs(monkeypatch):
+    module = _install_rag_utils_stubs()
+    docs = _rerank_docs()
+    full = module._build_rerank_cache_key(
+        "question", "model", docs, 2, input_k=2, input_max_chars=0,
+    )
+    truncated = module._build_rerank_cache_key(
+        "question", "model", docs, 2, input_k=2, input_max_chars=1600,
+    )
+    assert full != truncated
 
 
 def test_table_aware_retrieval_off_does_not_call_evidence_search(monkeypatch):

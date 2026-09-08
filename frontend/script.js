@@ -133,6 +133,7 @@ createApp({
         evidenceStatusLabel(status) {
             return ({
                 sufficient: '已找到相关证据',
+                reused: '已复用历史证据',
                 limited: '相关证据有限',
                 insufficient: '未找到足够相关证据'
             })[status] || '等待检索';

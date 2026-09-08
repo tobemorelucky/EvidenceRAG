@@ -38,6 +38,11 @@ _NON_RAG = re.compile(
     r"^(thanks|thank you|hello|hi|stop|cancel|好的|谢谢|你好|停止|取消)[.!。！ ]*$",
     re.IGNORECASE,
 )
+_RESOLVED_RETRIEVAL_CUE = re.compile(
+    r"\b(?:fy\s*\d{2,4}|q[1-4]\s*(?:fy\s*)?\d{2,4}|(?:19|20)\d{2}|what about\b)\b|"
+    r"(?:财年|年度|季度|那.{0,40}(?:呢|怎么样))",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -81,12 +86,26 @@ def build_conversation_policy(
     citation = bool(_CITATION.search(text))
     calculation_explanation = bool(_CALCULATION_EXPLANATION.search(text))
     condition_modification = bool(_CONDITION_MODIFICATION.search(text))
+    resolved_retrieval = bool(
+        decision.depends_on_history
+        and decision.query_resolution_needed
+        and decision.need_retrieval
+        and _RESOLVED_RETRIEVAL_CUE.search(text)
+    )
     independent = not decision.depends_on_history
     non_rag = not decision.need_rag and bool(_NON_RAG.search(text))
 
     if challenge:
         retrieval, rewrite, reuse = True, decision.query_resolution_needed, has_previous_evidence
         mode, reason = "verify", "challenge_requires_fresh_verification"
+    elif condition_modification or resolved_retrieval:
+        retrieval, rewrite, reuse = True, True, False
+        mode = "answer_with_modified_conditions"
+        reason = (
+            "condition_modification_requires_resolved_retrieval"
+            if condition_modification
+            else "resolved_followup_requires_fresh_retrieval"
+        )
     elif calculation_explanation:
         reuse = has_previous_evidence
         retrieval, rewrite = not reuse, not reuse and decision.query_resolution_needed
@@ -95,9 +114,6 @@ def build_conversation_policy(
         reuse = has_previous_evidence
         retrieval, rewrite = not reuse, not reuse and decision.query_resolution_needed
         mode, reason = "explain_citations", "citation_followup_reuses_previous_evidence" if reuse else "citation_followup_missing_previous_evidence"
-    elif condition_modification:
-        retrieval, rewrite, reuse = True, True, False
-        mode, reason = "answer_with_modified_conditions", "condition_modification_requires_resolved_retrieval"
     elif independent and not non_rag:
         retrieval, rewrite, reuse = True, False, False
         mode, reason = "answer_with_evidence", "independent_question_requires_retrieval"

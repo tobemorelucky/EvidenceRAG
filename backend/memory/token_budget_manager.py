@@ -53,15 +53,28 @@ class TokenBudgetManager:
             used += cost
         return list(reversed(selected))
 
-    def build_context(self, messages: list[dict], *, summary: str = "", evidence: str = "") -> dict:
+    def build_context(
+        self,
+        messages: list[dict],
+        *,
+        summary: str = "",
+        evidence: str = "",
+        evidence_char_budget: int | None = None,
+    ) -> dict:
         recent = self.select_recent_messages(messages)
         clipped_summary = self._clip(summary, self.budget.summary_tokens)
         fixed_tokens = sum(self.estimate_tokens(item.get("content", "")) for item in recent)
         fixed_tokens += self.estimate_tokens(clipped_summary)
-        evidence_tokens = max(0, self.budget.max_tokens - fixed_tokens)
-        clipped_evidence = self._clip(evidence, evidence_tokens)
+        if evidence_char_budget is None:
+            evidence_tokens = max(0, self.budget.max_tokens - fixed_tokens)
+            clipped_evidence = self._clip(evidence, evidence_tokens)
+        else:
+            evidence_chars = max(0, int(evidence_char_budget))
+            clipped_evidence = str(evidence or "")[:evidence_chars]
+            evidence_tokens = self.estimate_tokens(clipped_evidence)
         return {
             "messages": recent, "summary": clipped_summary, "evidence": clipped_evidence,
             "estimated_tokens": fixed_tokens + self.estimate_tokens(clipped_evidence),
             "evidence_truncated": len(clipped_evidence) < len(str(evidence or "")),
+            "evidence_char_budget": evidence_char_budget,
         }

@@ -83,6 +83,14 @@ def build_rag_trace_payload(
             else policy.get("rewrite")
         ),
         "context_budget": rag_trace.get("context_budget"),
+        "answer_prompt_name": rag_trace.get("answer_prompt_name"),
+        "retrieval_config": dict(rag_trace.get("retrieval_config") or {}),
+        "jina_config": dict(rag_trace.get("jina_config") or {}),
+        "prompt_config": dict(rag_trace.get("prompt_config") or {}),
+        "answer_config": dict(rag_trace.get("answer_config") or {}),
+        "answer_temperature": rag_trace.get("answer_temperature"),
+        "answer_thinking": rag_trace.get("answer_thinking"),
+        "answer_max_tokens": rag_trace.get("answer_max_tokens"),
     })
     evidence_items = [
         {
@@ -138,6 +146,8 @@ def build_rag_trace_payload(
             "output_k": rag_trace.get("jina_output_k") or os.getenv("JINA_OUTPUT_K") or rag_trace.get("final_top_k"),
             "context_budget": rag_trace.get("context_budget"),
             "profile_config": rag_trace.get("profile_config"),
+            "status": rag_trace.get("rerank_status"),
+            "input_max_chars": rag_trace.get("jina_input_max_chars"),
         },
         "evidence_items": evidence_items,
         "answer_model": answer_model,

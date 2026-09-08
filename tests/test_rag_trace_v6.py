@@ -87,6 +87,32 @@ def test_05b_payload_records_runtime_and_depth_parameters(monkeypatch):
     assert row["rerank_parameters"]["input_k"] == "80"
 
 
+def test_05c_payload_records_finance_v2_configuration_and_memory_budget_trace():
+    row = build(
+        policy={
+            "retrieval": True,
+            "before_memory_context_chars": 28000,
+            "after_memory_context_chars": 28000,
+        },
+        rag_result={"rag_trace": {
+            "profile_config": "finance_online_v2",
+            "answer_prompt_name": "clean_baseline_v1",
+            "retrieval_config": {"dense_top_k": 240, "bm25_top_k": 240, "rrf_top_k": 120},
+            "jina_config": {"input_k": 80, "output_k": 12, "input_max_chars": 0},
+            "prompt_config": {"name": "clean_baseline_v1"},
+            "answer_config": {"temperature": 0.1, "thinking": "disabled", "max_tokens": 1024},
+            "rerank_status": "success",
+            "jina_input_max_chars": 0,
+        }},
+    )
+    policy = row["policy_decision"]
+    assert policy["profile_config"] == "finance_online_v2"
+    assert policy["answer_prompt_name"] == "clean_baseline_v1"
+    assert policy["before_memory_context_chars"] == policy["after_memory_context_chars"] == 28000
+    assert row["rerank_parameters"]["status"] == "success"
+    assert row["rerank_parameters"]["input_max_chars"] == 0
+
+
 def test_06_payload_prefers_citation_evidence():
     row = build(citations=[{"id": "e1", "filename": "x.pdf", "page_number": 2, "text": "fact"}])
     assert row["evidence_items"][0]["filename"] == "x.pdf"

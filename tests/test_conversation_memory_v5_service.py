@@ -75,7 +75,11 @@ def test_v5_citation_followup_reuses_evidence_without_retrieval():
     state = ConversationState("c1")
     state.append("user", "What was revenue?")
     state.append("assistant", "Revenue was 10.")
-    memory = FakeMemory(state, {"evidence": "Source: report.pdf | Page: 4\nRevenue was 10.", "citations": [{"id": "e1"}]})
+    memory = FakeMemory(state, {
+        "evidence": "Source: report.pdf | Page: 4\nRevenue was 10.",
+        "citations": [{"id": "e1"}],
+        "rag_trace": {"trace_id": "original-retrieval"},
+    })
     service = ConversationMemoryV5Service(
         memory,
         TokenBudgetManager(MemoryBudget(100, 20, 5)),
@@ -90,7 +94,9 @@ def test_v5_citation_followup_reuses_evidence_without_retrieval():
     result = service.chat("alice", "c1", "Which source page supports that?")
     assert not result["trace"]["retrieval_decision"]["called"]
     assert result["trace"]["evidence_reuse"]["previous_reused"]
+    assert result["trace"]["evidence_status"] == "reused"
     assert result["citations"] == [{"id": "e1"}]
+    assert memory.evidence["rag_trace"] == {"trace_id": "original-retrieval"}
 
 
 def test_v5_stream_chat_emits_lifecycle_and_unbuffered_content():
@@ -127,3 +133,35 @@ def test_v5_stream_chat_emits_lifecycle_and_unbuffered_content():
     assert events[-2]["type"] == "trace"
     assert events[-1] == {"type": "done", "conversation_id": "c1", "usage": {"total_tokens": 10}}
     assert [item[0] for item in memory.messages] == ["user", "assistant"]
+
+
+def test_finance_fresh_evidence_budget_is_not_reduced_by_history():
+    state = ConversationState("c1")
+    state.append("user", "old question " * 100)
+    state.append("assistant", "old answer " * 100)
+    memory = FakeMemory(state)
+    captured = {}
+    evidence = "e" * 28000
+    service = ConversationMemoryV5Service(
+        memory,
+        TokenBudgetManager(MemoryBudget(100, 20, 5)),
+        understanding_fn=lambda *_: (
+            ConversationDecisionV3(True, True, False, False, "none", "new query", "answer"),
+            {"model_called": False},
+        ),
+        retrieval_fn=lambda *_args, **_kwargs: {
+            "evidence": evidence,
+            "citations": [{"id": "e1"}],
+            "rag_trace": {"context_budget": 28000},
+        },
+        answer_fn=lambda question, supplied_evidence, **kwargs: (
+            captured.setdefault("evidence", supplied_evidence) or "answer",
+            {},
+        ),
+        trace_service=FakeTraceService(),
+    )
+    result = service.chat("alice", "c1", "new question", profile="finance", execution_mode="auto")
+    assert captured["evidence"] == evidence
+    assert result["trace"]["before_memory_context_chars"] == 28000
+    assert result["trace"]["after_memory_context_chars"] == 28000
+    assert result["trace"]["answer_model"] == "deepseek-v4-flash-ga-260731"

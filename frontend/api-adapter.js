@@ -96,10 +96,13 @@
 
         normalizeTrace(trace, citations = []) {
             if (!trace) return null;
+            const reusedEvidence = trace.evidence_reuse?.source === 'previous'
+                || (trace.policy_decision?.reuse_previous_evidence && trace.retrieval_executed === false);
             if (!trace.retrieval_counts) {
                 return {
                     ...trace,
                     trace_id: trace.trace_id || trace.observability?.trace_id,
+                    evidence_status: reusedEvidence ? 'reused' : trace.evidence_status,
                     latency_breakdown: trace.latency_breakdown || {
                         total_latency_ms: trace.latency_ms?.total
                     }
@@ -113,7 +116,9 @@
                 final_top_k: trace.rerank_parameters?.final_top_k,
                 rerank_applied: trace.rerank_parameters?.applied,
                 final_evidence_pack_used: trace.evidence_items || [],
-                evidence_status: citations.length || trace.evidence_items?.length ? 'sufficient' : 'limited',
+                evidence_status: reusedEvidence
+                    ? 'reused'
+                    : (citations.length || trace.evidence_items?.length ? 'sufficient' : 'limited'),
                 latency_breakdown: {
                     total_latency_ms: trace.latency_ms?.total
                 }

@@ -84,6 +84,14 @@ class RetrievalServiceError(RuntimeError):
     pass
 
 
+class FinanceRerankServiceError(RetrievalServiceError):
+    """Finance profile rerank failure with the retained RRF trace attached."""
+
+    def __init__(self, message: str, rag_trace: dict):
+        super().__init__(message)
+        self.rag_trace = rag_trace
+
+
 @dataclass(frozen=True)
 class ExecutionConfig:
     profile: str
@@ -231,6 +239,7 @@ def _run_finance_online_search(question: str, profile_config: dict) -> dict:
         candidates,
         input_k=rerank_config["input_k"],
         output_k=rerank_config["output_k"],
+        input_max_chars=rerank_config["input_max_chars"],
     )
     final_docs = list(reranked.get("docs") or [])
     retrieval_meta = dict(retrieved.get("meta") or {})
@@ -240,7 +249,7 @@ def _run_finance_online_search(question: str, profile_config: dict) -> dict:
         **rerank_meta,
         **finance_online_trace_fields(profile_config),
         "profile": "finance",
-        "retrieval_mode": "finance_online_v1",
+        "retrieval_mode": "finance_online_v2",
         "candidate_k": retrieval_config["rrf_top_k"],
         "final_top_k": rerank_config["output_k"],
         "query_rewrite_executed": rewrite_trace.get("status") == "ok",
@@ -252,6 +261,21 @@ def _run_finance_online_search(question: str, profile_config: dict) -> dict:
         "final_retrieved_chunks": final_docs,
         "final_context_chunk_count": len(final_docs),
     }
+    rerank_status = str(rerank_meta.get("rerank_status") or (
+        "success" if rerank_meta.get("rerank_applied") else "failed"
+    ))
+    trace["rerank_status"] = rerank_status
+    if rerank_status != "success":
+        trace.update({
+            "answer_blocked": True,
+            "rrf_fallback_retained": True,
+            "final_retrieved_chunks": candidates[: rerank_config["output_k"]],
+            "final_context_chunk_count": 0,
+        })
+        raise FinanceRerankServiceError(
+            "Jina 重排服务失败，finance baseline 已停止回答，未使用 RRF 降级结果。",
+            trace,
+        )
     return {
         "docs": final_docs,
         "context_docs": final_docs,
@@ -1215,6 +1239,9 @@ def prepare_rag_response(
 
     final_docs = initial_docs
     trace = dict(initial.get("rag_trace") or {})
+    if finance_profile_config and execution_mode == "agentic":
+        trace["profile_warning"] = "finance_agentic_is_experimental_and_not_final100_aligned"
+        trace["profile_warnings"] = [trace["profile_warning"]]
     tool_calls = [{"tool": "search", "query": question, "new_evidence": len(initial_docs)}]
 
     if execution_mode == "agentic":
@@ -1361,7 +1388,7 @@ def prepare_rag_response(
                 answer_docs,
                 stage="selected_page_after_supplemental",
             )
-    calculation = build_calculation_result(
+    calculation = None if finance_profile_config else build_calculation_result(
         query_parse,
         evidence_coverage,
         answer_docs,
@@ -1390,7 +1417,7 @@ def prepare_rag_response(
             "structured_authoritative": bool((calculation or {}).get("authoritative")),
             "calculation": calculation,
             "trace_id": str(uuid.uuid4()),
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": CLEAN_BASELINE_PROMPT_VERSION if finance_profile_config else PROMPT_VERSION,
             "task_type": finance_policy["task_type"],
             "finance_policy_enabled": finance_policy["enabled"],
             "policy": finance_policy["policy_file"],
@@ -1433,6 +1460,7 @@ def prepare_rag_response(
         )
         trace["evidence_selection_query_count"] = len(retrieval_queries)
         trace["evidence_selection_used_rewrites"] = False
+        citations = build_citations(answer_docs)
     else:
         evidence, answer_context_meta = build_compact_evidence(
             question,
@@ -1483,11 +1511,11 @@ def prepare_rag_response(
         "evidence_flow_stage": evidence_flow_stage,
     })
     trace.update(answer_context_meta)
-    answer_directives = build_answer_directives(question, query_parse)
+    answer_directives = [] if finance_profile_config else build_answer_directives(question, query_parse)
     if answer_directives:
         directive_text = "\n".join(f"- {directive}" for directive in answer_directives)
         evidence = f"Question-specific answer contract (instructions, not evidence):\n{directive_text}\n\n---\n\n{evidence}"
-    calculation_evidence = format_calculation_evidence(calculation)
+    calculation_evidence = "" if finance_profile_config else format_calculation_evidence(calculation)
     if calculation_evidence:
         evidence = f"{evidence}\n\n---\n\n{calculation_evidence}"
     trace["answer_prompt_evidence_chars"] = len(evidence)
@@ -1495,7 +1523,7 @@ def prepare_rag_response(
     trace["answer_prompt_total_chars"] = len(evidence) + finance_policy["chars"]
     return {
         "evidence": evidence,
-        "task_policy": finance_policy["text"],
+        "task_policy": "" if finance_profile_config else finance_policy["text"],
         "docs": final_docs,
         "rag_trace": trace,
         "profile": config.profile,

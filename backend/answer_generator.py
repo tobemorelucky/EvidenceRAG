@@ -1,6 +1,7 @@
 """Evidence-grounded answer generation."""
 
 import os
+from functools import lru_cache
 from typing import AsyncIterator
 
 from langchain.chat_models import init_chat_model
@@ -24,6 +25,7 @@ from prompts import (
     SUMMARY_USER_TEMPLATE,
 )
 from runtime_profile import uses_clean_baseline_path, uses_rag_core_v2_path, uses_rag_core_v3_path
+from finance_online_profile import load_finance_online_profile
 
 
 ANSWER_PROMPT_MODES = {"baseline", "finance_reasoning", "finance_reasoning_v1_1"}
@@ -59,6 +61,39 @@ def _create_model():
 model = _create_model()
 
 
+@lru_cache(maxsize=1)
+def _finance_baseline_model():
+    config = load_finance_online_profile()["answer"]
+    return init_chat_model(
+        model=config["model"],
+        model_provider="openai",
+        api_key=os.getenv("ARK_API_KEY"),
+        base_url=os.getenv("BASE_URL"),
+        temperature=config["temperature"],
+        stream_usage=True,
+        timeout=float(os.getenv("ANSWER_TIMEOUT_SECONDS", "60")),
+        max_retries=int(os.getenv("ANSWER_MAX_RETRIES", "2")),
+        max_completion_tokens=config["max_tokens"],
+        extra_body={"thinking": {"type": config["thinking"]}},
+    )
+
+
+def finance_answer_config_trace() -> dict:
+    config = load_finance_online_profile()
+    return {
+        "answer_prompt_name": config["prompt"]["name"],
+        "prompt_config": dict(config["prompt"]),
+        "answer_config": dict(config["answer"]),
+        "answer_temperature": config["answer"]["temperature"],
+        "answer_thinking": config["answer"]["thinking"],
+        "answer_max_tokens": config["answer"]["max_tokens"],
+    }
+
+
+def _answer_model(profile: str | None):
+    return _finance_baseline_model() if str(profile or "").strip().lower() == "finance" else model
+
+
 def _content_text(content) -> str:
     if isinstance(content, str):
         return content
@@ -83,6 +118,7 @@ def build_answer_messages(
 ) -> list:
     clean_baseline = uses_clean_baseline_path(profile)
     mode = resolve_answer_prompt_mode(prompt_mode)
+    finance_clean_baseline = str(profile or "").strip().lower() == "finance" and mode == "baseline"
     if mode == "finance_reasoning_v1_1":
         prompt_version = FINANCE_REASONING_V1_1_PROMPT_VERSION
         system_prompt = FINANCE_REASONING_V1_1_ANSWER_SYSTEM_PROMPT
@@ -93,15 +129,15 @@ def build_answer_messages(
         prompt_version = (
             RAG_CORE_V3_PROMPT_VERSION if uses_rag_core_v3_path(profile)
             else RAG_CORE_V2_PROMPT_VERSION if uses_rag_core_v2_path(profile)
-            else CLEAN_BASELINE_PROMPT_VERSION if clean_baseline
+            else CLEAN_BASELINE_PROMPT_VERSION if clean_baseline or finance_clean_baseline
             else PROMPT_VERSION
         )
-        system_prompt = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT if clean_baseline else ANSWER_SYSTEM_PROMPT
+        system_prompt = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT if clean_baseline or finance_clean_baseline else ANSWER_SYSTEM_PROMPT
     messages = [SystemMessage(content=f"Prompt-Version: {prompt_version}\n\n{system_prompt}")]
     for message in (history or [])[-12:]:
         if getattr(message, "type", "") in {"human", "ai"}:
             messages.append(message)
-    if clean_baseline:
+    if clean_baseline or finance_clean_baseline:
         content = CLEAN_BASELINE_ANSWER_USER_TEMPLATE.format(question=question, evidence=evidence)
     elif task_policy:
         content = ANSWER_USER_WITH_POLICY_TEMPLATE.format(
@@ -123,7 +159,7 @@ def generate_answer(
     profile: str | None = None,
     prompt_mode: str | None = None,
 ) -> tuple[str, dict]:
-    response = model.invoke(build_answer_messages(question, evidence, history, task_policy, profile, prompt_mode))
+    response = _answer_model(profile).invoke(build_answer_messages(question, evidence, history, task_policy, profile, prompt_mode))
     usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {}).get("token_usage") or {}
     return _content_text(getattr(response, "content", response)), dict(usage or {})
 
@@ -137,7 +173,7 @@ async def stream_answer(
     prompt_mode: str | None = None,
 ) -> AsyncIterator[tuple[str, dict]]:
     usage = {}
-    async for chunk in model.astream(build_answer_messages(question, evidence, history, task_policy, profile, prompt_mode)):
+    async for chunk in _answer_model(profile).astream(build_answer_messages(question, evidence, history, task_policy, profile, prompt_mode)):
         text = _content_text(getattr(chunk, "content", chunk))
         chunk_usage = getattr(chunk, "usage_metadata", None)
         if chunk_usage:
