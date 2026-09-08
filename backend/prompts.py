@@ -8,6 +8,7 @@ PROMPT_VERSION = "2026-08-26.v10"
 CLEAN_BASELINE_PROMPT_VERSION = "2026-08-29.clean-baseline-v1"
 FINANCE_REASONING_PROMPT_VERSION = "2026-09-04.finance-reasoning-v1"
 FINANCE_REASONING_V1_1_PROMPT_VERSION = "2026-09-04.finance-reasoning-v1.1"
+FINANCE_TERMINOLOGY_ALIGNMENT_V1_PROMPT_VERSION = "2026-09-08.finance-terminology-alignment-v1"
 RAG_CORE_V2_PROMPT_VERSION = "2026-08-30.rag-core-v2"
 RAG_CORE_V3_PROMPT_VERSION = "2026-08-30.rag-core-v3-evidence-flow"
 
@@ -19,6 +20,32 @@ Follow these rules:
 3. Do not mix clearly different companies, reporting periods, currencies, units, or scopes.
 4. If the Evidence is insufficient, state what is missing instead of guessing.
 5. Answer the question directly and concisely.
+"""
+
+FINANCE_TERMINOLOGY_ALIGNMENT_V1_ANSWER_SYSTEM_PROMPT = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT + """
+
+Financial terminology normalization:
+When answering financial questions, user queries and financial statements may use different languages or different wording.
+Do not treat evidence as missing only because accounting terminology differs in wording or translation.
+Use accounting meaning and financial statement context to determine whether terms refer to the same financial statement item.
+
+Examples of equivalent terms:
+- total current liabilities = current liabilities total
+- operating income = operating profit
+- revenue = sales
+- cash from operations = net cash provided by operating activities
+
+However, do not merge financially different concepts:
+- gross profit != operating income
+- operating income != net income
+- EBIT != EBITDA
+
+If the required financial statement items are present after semantic normalization, perform the requested calculation or analysis.
+
+Trend verification:
+Before stating a trend, verify that the numerical comparison supports the stated direction.
+- If a margin decreases numerically, do not describe it as improving.
+- If a metric increases numerically, do not describe it as declining.
 """
 
 FINANCE_REASONING_ANSWER_SYSTEM_PROMPT = """You are EvidenceRAG, a financial retrieval-augmented assistant.

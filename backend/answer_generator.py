@@ -18,6 +18,8 @@ from prompts import (
     FINANCE_REASONING_PROMPT_VERSION,
     FINANCE_REASONING_V1_1_ANSWER_SYSTEM_PROMPT,
     FINANCE_REASONING_V1_1_PROMPT_VERSION,
+    FINANCE_TERMINOLOGY_ALIGNMENT_V1_ANSWER_SYSTEM_PROMPT,
+    FINANCE_TERMINOLOGY_ALIGNMENT_V1_PROMPT_VERSION,
     PROMPT_VERSION,
     RAG_CORE_V2_PROMPT_VERSION,
     RAG_CORE_V3_PROMPT_VERSION,
@@ -28,7 +30,13 @@ from runtime_profile import uses_clean_baseline_path, uses_rag_core_v2_path, use
 from finance_online_profile import load_finance_online_profile
 
 
-ANSWER_PROMPT_MODES = {"baseline", "finance_reasoning", "finance_reasoning_v1_1"}
+ANSWER_PROMPT_MODES = {
+    "baseline",
+    "clean_baseline_v1",
+    "finance_reasoning",
+    "finance_reasoning_v1_1",
+    "finance_terminology_alignment_v1",
+}
 
 
 def resolve_answer_prompt_mode(mode: str | None = None) -> str:
@@ -118,8 +126,14 @@ def build_answer_messages(
 ) -> list:
     clean_baseline = uses_clean_baseline_path(profile)
     mode = resolve_answer_prompt_mode(prompt_mode)
-    finance_clean_baseline = str(profile or "").strip().lower() == "finance" and mode == "baseline"
-    if mode == "finance_reasoning_v1_1":
+    finance_clean_baseline = str(profile or "").strip().lower() == "finance" and mode in {
+        "baseline", "clean_baseline_v1",
+    }
+    explicit_clean_baseline = mode == "clean_baseline_v1"
+    if mode == "finance_terminology_alignment_v1":
+        prompt_version = FINANCE_TERMINOLOGY_ALIGNMENT_V1_PROMPT_VERSION
+        system_prompt = FINANCE_TERMINOLOGY_ALIGNMENT_V1_ANSWER_SYSTEM_PROMPT
+    elif mode == "finance_reasoning_v1_1":
         prompt_version = FINANCE_REASONING_V1_1_PROMPT_VERSION
         system_prompt = FINANCE_REASONING_V1_1_ANSWER_SYSTEM_PROMPT
     elif mode == "finance_reasoning":
@@ -129,15 +143,19 @@ def build_answer_messages(
         prompt_version = (
             RAG_CORE_V3_PROMPT_VERSION if uses_rag_core_v3_path(profile)
             else RAG_CORE_V2_PROMPT_VERSION if uses_rag_core_v2_path(profile)
-            else CLEAN_BASELINE_PROMPT_VERSION if clean_baseline or finance_clean_baseline
+            else CLEAN_BASELINE_PROMPT_VERSION if clean_baseline or finance_clean_baseline or explicit_clean_baseline
             else PROMPT_VERSION
         )
-        system_prompt = CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT if clean_baseline or finance_clean_baseline else ANSWER_SYSTEM_PROMPT
+        system_prompt = (
+            CLEAN_BASELINE_ANSWER_SYSTEM_PROMPT
+            if clean_baseline or finance_clean_baseline or explicit_clean_baseline
+            else ANSWER_SYSTEM_PROMPT
+        )
     messages = [SystemMessage(content=f"Prompt-Version: {prompt_version}\n\n{system_prompt}")]
     for message in (history or [])[-12:]:
         if getattr(message, "type", "") in {"human", "ai"}:
             messages.append(message)
-    if clean_baseline or finance_clean_baseline:
+    if clean_baseline or finance_clean_baseline or explicit_clean_baseline or mode == "finance_terminology_alignment_v1":
         content = CLEAN_BASELINE_ANSWER_USER_TEMPLATE.format(question=question, evidence=evidence)
     elif task_policy:
         content = ANSWER_USER_WITH_POLICY_TEMPLATE.format(
