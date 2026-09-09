@@ -438,7 +438,7 @@ def _is_supported_document(filename: str) -> bool:
         file_lower.endswith(".pdf")
         or file_lower.endswith((".docx", ".doc"))
         or file_lower.endswith((".xlsx", ".xls"))
-        or file_lower.endswith((".txt", ".md", ".csv"))
+        or file_lower.endswith((".txt", ".md", ".csv", ".pptx"))
     )
 
 
@@ -672,7 +672,7 @@ async def upload_document_async(
     if not filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
     if not _is_supported_document(filename):
-        raise HTTPException(status_code=400, detail="仅支持 PDF、Word、Excel、TXT、Markdown 和 CSV 文档")
+        raise HTTPException(status_code=400, detail="仅支持 PDF、Word、Excel、PowerPoint、TXT、Markdown 和 CSV 文档")
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     job = upload_job_manager.create_job(filename)
@@ -788,16 +788,10 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
     """上传文档并进行 embedding（管理员）"""
     try:
         filename = file.filename or ""
-        file_lower = filename.lower()
         if not filename:
             raise HTTPException(status_code=400, detail="文件名不能为空")
-        if not (
-            file_lower.endswith(".pdf")
-            or file_lower.endswith((".docx", ".doc"))
-            or file_lower.endswith((".xlsx", ".xls"))
-            or file_lower.endswith((".txt", ".md", ".csv"))
-        ):
-            raise HTTPException(status_code=400, detail="仅支持 PDF、Word、Excel、TXT、Markdown 和 CSV 文档")
+        if not _is_supported_document(filename):
+            raise HTTPException(status_code=400, detail="仅支持 PDF、Word、Excel、PowerPoint、TXT、Markdown 和 CSV 文档")
 
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         milvus_manager.init_collection()

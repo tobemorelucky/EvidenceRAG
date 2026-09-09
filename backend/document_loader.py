@@ -7,7 +7,6 @@ import hashlib
 from typing import Dict, List
 
 from langchain_community.document_loaders import (
-    CSVLoader,
     Docx2txtLoader,
     PyPDFLoader,
     TextLoader,
@@ -17,10 +16,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 try:
+    from document_parsers.parser_registry import parser_registry
     from evidence_identity import build_document_id, build_page_id
     from table_parser import TableAwareParser
     from text_sanitizer import sanitize_text
 except ModuleNotFoundError:
+    from backend.document_parsers.parser_registry import parser_registry
     from backend.evidence_identity import build_document_id, build_page_id
     from backend.table_parser import TableAwareParser
     from backend.text_sanitizer import sanitize_text
@@ -149,16 +150,17 @@ class DocumentLoader:
                 except ImportError:
                     logger.warning("pypdfium2 unavailable; falling back to PyPDFLoader")
             return "PDF", PyPDFLoader(file_path)
-        if file_lower.endswith((".docx", ".doc")):
+        adapter = parser_registry.loader_for(file_path, filename)
+        if adapter is not None:
+            return adapter
+        if file_lower.endswith(".doc"):
             return "Word", Docx2txtLoader(file_path)
-        if file_lower.endswith((".xlsx", ".xls")):
+        if file_lower.endswith(".xls"):
             return "Excel", UnstructuredExcelLoader(file_path)
         if file_lower.endswith(".txt"):
             return "Text", TextLoader(file_path, autodetect_encoding=True)
         if file_lower.endswith(".md"):
             return "Markdown", TextLoader(file_path, autodetect_encoding=True)
-        if file_lower.endswith(".csv"):
-            return "CSV", CSVLoader(file_path, autodetect_encoding=True)
         raise ValueError(f"Unsupported file type: {filename}")
 
     @staticmethod
@@ -296,6 +298,9 @@ class DocumentLoader:
             for doc in raw_docs:
                 page_number = self._resolve_page_number(doc.metadata)
                 page_text = sanitize_text(doc.page_content).strip()
+                parser_backend = str(doc.metadata.get("parser_backend") or "legacy")
+                section = str(doc.metadata.get("section") or "")
+                location = str(doc.metadata.get("location") or f"page:{page_number}")
                 base_doc = {
                     "document_id": document_id,
                     "page_id": build_page_id(document_id, page_number),
@@ -303,7 +308,9 @@ class DocumentLoader:
                     "file_path": file_path,
                     "file_type": doc_type,
                     "page_number": page_number,
-                    "location": f"page:{page_number}",
+                    "location": location,
+                    "section": section,
+                    "parser_backend": parser_backend,
                     **self._financial_metadata(filename),
                 }
                 page_chunks = self._split_page_to_three_levels(
@@ -324,7 +331,9 @@ class DocumentLoader:
                         "file_type": doc_type,
                         "file_path": file_path,
                         "page_number": page_number,
-                        "location": f"page:{page_number}",
+                        "location": location,
+                        "section": section,
+                        "parser_backend": parser_backend,
                         "page_text": page_text,
                         "content_hash": self._content_hash(page_text),
                         **self._financial_metadata(filename),
@@ -361,7 +370,7 @@ class DocumentLoader:
                 file_lower.endswith(".pdf")
                 or file_lower.endswith((".docx", ".doc"))
                 or file_lower.endswith((".xlsx", ".xls"))
-                or file_lower.endswith((".txt", ".md", ".csv"))
+                or file_lower.endswith((".txt", ".md", ".csv", ".pptx"))
             ):
                 continue
 

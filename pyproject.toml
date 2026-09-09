@@ -28,6 +28,7 @@ dependencies = [
     "openpyxl",
     "tabulate",
     "msoffcrypto-tool",
+    "firecrawl-anydoc>=0.2.4,<0.3",
     "sqlalchemy>=2.0.36",
     "psycopg2-binary>=2.9.10",
     "redis>=5.2.1",
