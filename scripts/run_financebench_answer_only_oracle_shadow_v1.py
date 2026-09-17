@@ -9,9 +9,11 @@ saved gold evidence records.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import os
+import shutil
 import sys
 import time
 from collections import Counter
@@ -94,6 +96,33 @@ def atomic_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def prepare_output_dir(output_dir: Path, *, resume: bool) -> Path | None:
+    """Prepare a fresh run by default while retaining old experiment artifacts.
+
+    The original implementation always treated files in ``output_dir`` as a
+    checkpoint. That made an ordinary invocation silently reuse all successful
+    answers. Resuming is now opt-in; a fresh invocation archives the previous
+    top-level result files before any model call is made.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if resume:
+        return None
+    artifacts = [
+        output_dir / filename
+        for filename in ("results.jsonl", "judge_results.jsonl", "summary.json")
+        if (output_dir / filename).exists()
+    ]
+    if not artifacts:
+        return None
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    archive_dir = output_dir / "archive" / timestamp
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    for path in artifacts:
+        shutil.move(str(path), str(archive_dir / path.name))
+    return archive_dir
 
 
 def _artifact_records(path: Path) -> list[dict[str, Any]]:
@@ -466,7 +495,27 @@ def validate_results(rows: list[dict[str, str]], answers: list[dict[str, Any]]) 
         raise ValueError(f"Incomplete answer records: {', '.join(incomplete)}")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run FinanceBench answer-only evaluation with benchmark oracle evidence."
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse successful answer/judge checkpoints in the current output directory. "
+        "Without this flag every invocation starts a fresh run.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=OUTPUT,
+        help=f"Experiment output directory (default: {OUTPUT})",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     load_dotenv(ROOT / ".env", override=False)
     os.environ.update(
         {
@@ -477,7 +526,8 @@ def main() -> None:
             "JUDGE_MAX_COMPLETION_TOKENS": "512",
         }
     )
-    OUTPUT.mkdir(parents=True, exist_ok=True)
+    output_dir = args.output_dir.resolve()
+    archived_to = prepare_output_dir(output_dir, resume=args.resume)
     frozen = validate_frozen_final100()
     rows = load_dataset()
     if set(frozen["question_ids"]) != {row["financebench_id"] for row in rows}:
@@ -485,18 +535,22 @@ def main() -> None:
     attribution = load_attribution()
     print(
         f"[setup] questions=100 evidence=gold answer={ANSWER_MODEL} judge={JUDGE_MODEL} "
-        "retrieval=false jina=false query_rewrite=false",
+        f"retrieval=false jina=false query_rewrite=false cache_policy={'resume' if args.resume else 'fresh'}",
         flush=True,
     )
-    answers = run_answers(rows, OUTPUT / "results.jsonl", attribution)
+    if archived_to is not None:
+        print(f"[setup] previous results archived to: {archived_to}", flush=True)
+    answers = run_answers(rows, output_dir / "results.jsonl", attribution)
     validate_results(rows, answers)
-    judges = run_judges(rows, answers, OUTPUT / "judge_results.jsonl")
+    judges = run_judges(rows, answers, output_dir / "judge_results.jsonl")
     summary = build_summary(answers, judges, frozen)
-    atomic_json(OUTPUT / "summary.json", summary)
+    summary["cache_policy"] = "resume" if args.resume else "fresh"
+    summary["archived_previous_results"] = str(archived_to) if archived_to else None
+    atomic_json(output_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
-    print(f"Results: {OUTPUT / 'results.jsonl'}", flush=True)
-    print(f"Judge: {OUTPUT / 'judge_results.jsonl'}", flush=True)
-    print(f"Summary: {OUTPUT / 'summary.json'}", flush=True)
+    print(f"Results: {output_dir / 'results.jsonl'}", flush=True)
+    print(f"Judge: {output_dir / 'judge_results.jsonl'}", flush=True)
+    print(f"Summary: {output_dir / 'summary.json'}", flush=True)
 
 
 if __name__ == "__main__":

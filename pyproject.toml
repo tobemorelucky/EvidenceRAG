@@ -42,3 +42,7 @@ study = [
     "chromadb>=0.5.5",
     "bilibili-api-python>=17.0.0",
 ]
+ocr = [
+    "paddleocr>=3.0,<4",
+    "paddlepaddle>=3.2,<4",
+]

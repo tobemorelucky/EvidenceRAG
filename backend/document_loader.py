@@ -146,10 +146,12 @@ class DocumentLoader:
                 try:
                     import pypdfium2  # noqa: F401
 
-                    return "PDF", _PdfiumLoader(file_path)
+                    primary_loader = _PdfiumLoader(file_path)
+                    return "PDF", parser_registry.with_pdf_ocr_fallback(primary_loader, file_path, filename)
                 except ImportError:
                     logger.warning("pypdfium2 unavailable; falling back to PyPDFLoader")
-            return "PDF", PyPDFLoader(file_path)
+            primary_loader = PyPDFLoader(file_path)
+            return "PDF", parser_registry.with_pdf_ocr_fallback(primary_loader, file_path, filename)
         adapter = parser_registry.loader_for(file_path, filename)
         if adapter is not None:
             return adapter
@@ -371,6 +373,7 @@ class DocumentLoader:
                 or file_lower.endswith((".docx", ".doc"))
                 or file_lower.endswith((".xlsx", ".xls"))
                 or file_lower.endswith((".txt", ".md", ".csv", ".pptx"))
+                or file_lower.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"))
             ):
                 continue
 

@@ -11,6 +11,7 @@ from scripts.run_financebench_answer_only_oracle_shadow_v1 import (
     build_oracle_context,
     build_result_record,
     load_dataset,
+    prepare_output_dir,
     validate_frozen_final100,
     validate_results,
 )
@@ -104,3 +105,31 @@ def test_empty_gold_evidence_is_rejected():
     row["evidence"] = "[]"
     with pytest.raises(ValueError, match="Gold evidence is empty"):
         build_oracle_context(row)
+
+
+def test_fresh_run_archives_existing_checkpoints(tmp_path: Path):
+    output = tmp_path / "oracle"
+    output.mkdir()
+    (output / "results.jsonl").write_text('{"status":"ok"}\n', encoding="utf-8")
+    (output / "judge_results.jsonl").write_text('{"status":"ok"}\n', encoding="utf-8")
+    (output / "summary.json").write_text("{}\n", encoding="utf-8")
+
+    archive = prepare_output_dir(output, resume=False)
+
+    assert archive is not None
+    assert (archive / "results.jsonl").exists()
+    assert (archive / "judge_results.jsonl").exists()
+    assert (archive / "summary.json").exists()
+    assert not (output / "results.jsonl").exists()
+
+
+def test_resume_keeps_existing_checkpoints(tmp_path: Path):
+    output = tmp_path / "oracle"
+    output.mkdir()
+    result = output / "results.jsonl"
+    result.write_text('{"status":"ok"}\n', encoding="utf-8")
+
+    archive = prepare_output_dir(output, resume=True)
+
+    assert archive is None
+    assert result.exists()
